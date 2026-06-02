@@ -1,0 +1,96 @@
+version: '3'
+
+vars:
+  MODULE: github.com/CoverOnes/user
+  BUILD_DIR: ./build
+
+tasks:
+  default:
+    desc: "Run the full check suite"
+    deps: [check]
+
+  check:
+    desc: "Run lint + vet + test + build (CI gate)"
+    cmds:
+      - task: fmt
+      - task: vet
+      - task: lint
+      - task: test
+      - task: build
+
+  fmt:
+    desc: "Check gofmt formatting"
+    cmds:
+      - |
+        UNFORMATTED=$(gofmt -l .)
+        if [ -n "$UNFORMATTED" ]; then
+          echo "Unformatted files:"
+          echo "$UNFORMATTED"
+          exit 1
+        fi
+
+  vet:
+    desc: "Run go vet"
+    cmds:
+      - go vet ./...
+
+  lint:
+    desc: "Run golangci-lint (required; fails if not installed — CI installs it via curl)"
+    cmds:
+      - |
+        if ! command -v golangci-lint &>/dev/null; then
+          echo "ERROR: golangci-lint not found. Install via: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin" >&2
+          exit 1
+        fi
+        golangci-lint run ./...
+
+  test:
+    desc: "Run all tests (integration tests require Docker)"
+    cmds:
+      - go test -timeout 120s ./...
+
+  test-unit:
+    desc: "Run unit tests only (no Docker required)"
+    cmds:
+      - go test -short -timeout 60s ./...
+
+  test-integration:
+    desc: "Run integration tests (requires Docker)"
+    cmds:
+      - go test -run Integration -timeout 120s ./...
+
+  build:
+    desc: "Build the server binary"
+    cmds:
+      - go build -o {{.BUILD_DIR}}/server ./cmd/server
+
+  run:
+    desc: "Run the server locally (requires .env or env vars)"
+    cmds:
+      - go run ./cmd/server
+
+  clean:
+    desc: "Remove build artifacts"
+    cmds:
+      - rm -rf {{.BUILD_DIR}}
+
+  tidy:
+    desc: "Run go mod tidy"
+    cmds:
+      - go mod tidy
+
+  "db:gc":
+    desc: |
+      Purge expired / stale refresh_tokens rows (run periodically via cron or manually).
+      Deletes:
+        1. Tokens whose expires_at is in the past (fully expired).
+        2. Tokens that were used (used_at IS NOT NULL) more than 7 days ago
+           (7-day forensic grace window for reuse-detection audit trail).
+      Requires USER_POSTGRES_DSN to be set in the environment.
+    cmds:
+      - |
+        psql "$USER_POSTGRES_DSN" -v ON_ERROR_STOP=1 -c "
+          DELETE FROM refresh_tokens
+          WHERE expires_at < now()
+             OR (used_at IS NOT NULL AND used_at < now() - INTERVAL '7 days');
+        "

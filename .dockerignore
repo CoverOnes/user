@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials.json
+local.yaml
+build/
+README.md
