@@ -6,7 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"time"
+	"strconv"
+	"strings"
 
 	"github.com/CoverOnes/user/internal/store"
 	"github.com/google/uuid"
@@ -23,12 +24,19 @@ var subscribedChannels = []string{
 // Payloads above this limit are logged and silently dropped to prevent DoS.
 const maxPayloadBytes = 64 * 1024
 
-// eventEnvelope is the canonical Redis pub/sub payload (CONVENTIONS §14).
+// eventEnvelope is the canonical Redis pub/sub payload (CONVENTIONS §14) plus the
+// top-level "signature" field required by the EVENT HMAC CONTRACT.
+//
+// OccurredAt and Version are captured as json.RawMessage (the verbatim wire bytes)
+// rather than parsed Go types, so the consumer can recompute the HMAC signature
+// over the EXACT textual form the publisher signed — re-serializing a time.Time or
+// int could differ byte-for-byte from the publisher's encoding and break the MAC.
 type eventEnvelope struct {
 	EventID    uuid.UUID       `json:"eventId"`
-	OccurredAt time.Time       `json:"occurredAt"`
-	Version    int             `json:"version"`
+	OccurredAt json.RawMessage `json:"occurredAt"`
+	Version    json.RawMessage `json:"version"`
 	Data       json.RawMessage `json:"data"`
+	Signature  string          `json:"signature"`
 }
 
 // kycTierChangedData is the data payload for kyc.tier_changed events.
@@ -40,13 +48,21 @@ type kycTierChangedData struct {
 
 // Consumer subscribes to Redis event channels and applies local state updates.
 type Consumer struct {
-	rdb   *redis.Client
-	users store.UserStore
+	rdb    *redis.Client
+	users  store.UserStore
+	secret []byte // EVENT_HMAC_SECRET; events whose signature does not verify are dropped
 }
 
 // NewConsumer creates a Consumer. If rdb is nil the consumer is a no-op (dev mode).
-func NewConsumer(rdb *redis.Client, users store.UserStore) *Consumer {
-	return &Consumer{rdb: rdb, users: users}
+//
+// secret is the shared EVENT_HMAC_SECRET used to authenticate inbound events. Every
+// kyc.tier_changed event MUST carry a valid HMAC signature (see signature.go); an
+// event with a missing or mismatched signature is logged and dropped WITHOUT
+// applying the tier change, so a forged Redis publish cannot elevate a user's tier.
+// An empty secret (dev-only; config.validate rejects it outside development) causes
+// all signed events to fail verification and be dropped — fail-closed by design.
+func NewConsumer(rdb *redis.Client, users store.UserStore, secret string) *Consumer {
+	return &Consumer{rdb: rdb, users: users, secret: []byte(secret)}
 }
 
 // Run starts the subscription loop. Blocks until ctx is canceled.
@@ -130,6 +146,28 @@ func (c *Consumer) handleKYCTierChanged(ctx context.Context, payload string) {
 			"channel", "kyc.tier_changed",
 			"event_id", env.EventID,
 			"err", err,
+		)
+
+		return
+	}
+
+	// MESSAGE AUTHENTICATION (P0): recompute the HMAC over the received fields and
+	// reject any event whose signature is missing or does not verify in constant
+	// time. Without this a forged Redis publish could elevate any user to Tier2.
+	sigInput := signatureInput{
+		eventID:    env.EventID.String(),
+		occurredAt: unquoteJSONString(string(env.OccurredAt)),
+		version:    strings.TrimSpace(string(env.Version)),
+		userID:     data.UserID.String(),
+		newTier:    strconv.FormatInt(int64(data.NewTier), 10),
+	}
+	if !verifySignature(c.secret, &sigInput, env.Signature) {
+		slog.Warn(
+			"consumer: kyc.tier_changed signature verification failed; dropping event",
+			"channel", "kyc.tier_changed",
+			"event_id", env.EventID,
+			"user_id", data.UserID,
+			"has_signature", env.Signature != "",
 		)
 
 		return

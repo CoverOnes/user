@@ -290,6 +290,31 @@ func TestRegister_MissingEmail(t *testing.T) {
 	assert.Equal(t, "VALIDATION_ERROR", errBody["code"])
 }
 
+func TestRegister_CompanyNameTooLong(t *testing.T) {
+	r, _, _ := buildRouter(t)
+
+	longName := ""
+	for i := 0; i < 201; i++ {
+		longName += "x"
+	}
+
+	w := postJSON(t, r, "/v1/auth/register", map[string]any{
+		"email":       "biglongco@example.com",
+		"password":    "superSecurePassword123",
+		"displayName": "BigCo",
+		"accountType": "COMPANY",
+		"companyName": longName,
+	})
+
+	// Binding max=200 rejects with 400 VALIDATION_ERROR before the service runs.
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody := resp["error"].(map[string]any)
+	assert.Equal(t, "VALIDATION_ERROR", errBody["code"])
+}
+
 func TestLogin_HappyPath(t *testing.T) {
 	r, _, _ := buildRouter(t)
 

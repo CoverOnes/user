@@ -153,6 +153,69 @@ func TestLoad_PostgresSchema_LeadingDigitRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "USER_DB_SCHEMA")
 }
 
+func TestLoad_EventHMACSecret_DevOptional(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_ENV", "development",
+	)
+	os.Unsetenv("USER_EVENT_HMAC_SECRET") //nolint:errcheck // test cleanup
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.EventHMACSecret, "dev allows an empty event HMAC secret")
+}
+
+func TestLoad_EventHMACSecret_ProdRequired(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_ENV", "production",
+		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
+	)
+	os.Unsetenv("USER_EVENT_HMAC_SECRET") //nolint:errcheck // test cleanup
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_EVENT_HMAC_SECRET")
+}
+
+func TestLoad_EventHMACSecret_ProdTooShort(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_ENV", "production",
+		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
+		"USER_EVENT_HMAC_SECRET", "too-short",
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_EVENT_HMAC_SECRET")
+}
+
+func TestLoad_EventHMACSecret_ProdValid(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_ENV", "production",
+		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
+		"USER_EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
+	)
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, "this-is-a-32-byte-test-secret-xx", cfg.EventHMACSecret)
+}
+
 func TestLoad_DBConns_Defaults(t *testing.T) {
 	setEnv(
 		t,

@@ -9,6 +9,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// codeValidationError is the stable machine code for input-validation failures (400).
+const codeValidationError = "VALIDATION_ERROR"
+
 // ErrorResponse is the machine-readable error envelope.
 type ErrorResponse struct {
 	Error ErrorBody `json:"error"`
@@ -60,6 +63,9 @@ func translate(err error) (code string, status int, message string, details any)
 	case errors.Is(err, domain.ErrInvalidCredentials):
 		return "INVALID_CREDENTIALS", http.StatusUnauthorized, "invalid email or password", nil
 
+	case errors.Is(err, domain.ErrLoginRateLimited):
+		return "RATE_LIMITED", http.StatusTooManyRequests, "too many login attempts, please try again later", nil
+
 	case errors.Is(err, domain.ErrAccountSuspended):
 		return "ACCOUNT_SUSPENDED", http.StatusForbidden, "account is suspended", nil
 
@@ -82,10 +88,13 @@ func translate(err error) (code string, status int, message string, details any)
 		return "UNAUTHORIZED", http.StatusUnauthorized, "unauthorized", nil
 
 	case errors.Is(err, domain.ErrCompanyNameRequired):
-		return "VALIDATION_ERROR", http.StatusBadRequest, err.Error(), nil
+		return codeValidationError, http.StatusBadRequest, err.Error(), nil
+
+	case errors.Is(err, domain.ErrCompanyNameTooLong):
+		return codeValidationError, http.StatusBadRequest, err.Error(), nil
 
 	case errors.Is(err, domain.ErrValidation):
-		return "VALIDATION_ERROR", http.StatusBadRequest, err.Error(), nil
+		return codeValidationError, http.StatusBadRequest, err.Error(), nil
 
 	default:
 		slog.Error("unhandled internal error", "err", err)

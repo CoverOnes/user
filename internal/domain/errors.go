@@ -8,6 +8,7 @@ var (
 	ErrEmailTaken          = errors.New("email already taken")
 	ErrInvalidCredentials  = errors.New("invalid credentials")
 	ErrAccountSuspended    = errors.New("account suspended")
+	ErrLoginRateLimited    = errors.New("too many login attempts")
 	ErrWeakPassword        = errors.New("password too weak")
 	ErrInvalidRefresh      = errors.New("invalid refresh token")
 	ErrRefreshExpired      = errors.New("refresh token expired")
@@ -15,6 +16,7 @@ var (
 	ErrKYCTierRequired     = errors.New("kyc tier required")
 	ErrUnauthorized        = errors.New("unauthorized")
 	ErrCompanyNameRequired = errors.New("company name required for COMPANY account type")
+	ErrCompanyNameTooLong  = errors.New("company name must be at most 200 characters")
 	// ErrValidation is returned for input validation failures (maps to HTTP 400).
 	// Use ErrInvalidCredentials only for auth-specific failures (maps to HTTP 401).
 	ErrValidation = errors.New("validation error")

@@ -143,6 +143,64 @@ func NewIPRateLimiter(rdb *redis.Client, limit int, window time.Duration) *RateL
 	}
 }
 
+// EmailLoginLimiter applies a per-normalized-email sliding-window rate limit for
+// login attempts (credential-stuffing defense). Unlike the IP-keyed middleware
+// limiter it is invoked from the service layer once the email has been parsed, so
+// an attacker spraying one email across many IPs is still throttled.
+//
+// It FAILS SAFE: when Redis is unavailable or errors, Allow returns true so a Redis
+// outage cannot lock every account out of login (availability > strict throttling
+// for this control; the IP limiter and password check remain in force).
+type EmailLoginLimiter struct {
+	rdb    *redis.Client
+	script *redis.Script
+	limit  int
+	window time.Duration
+}
+
+// NewEmailLoginLimiter builds a per-email login limiter. A nil rdb disables the
+// control (Allow always returns true) — same dev-mode contract as the middleware.
+func NewEmailLoginLimiter(rdb *redis.Client, limit int, window time.Duration) *EmailLoginLimiter {
+	return &EmailLoginLimiter{
+		rdb:    rdb,
+		script: redis.NewScript(slidingWindowScript),
+		limit:  limit,
+		window: window,
+	}
+}
+
+// Allow reports whether a login attempt for the given normalized email is admitted.
+// On a nil Redis client or any Redis error it returns true (fail-safe).
+func (l *EmailLoginLimiter) Allow(ctx context.Context, normalizedEmail string) bool {
+	if l.rdb == nil {
+		return true
+	}
+
+	now := time.Now().UnixNano()
+	windowStart := now - l.window.Nanoseconds()
+	member := fmt.Sprintf("%d-%s", now, randMember())
+	key := fmt.Sprintf("rl:login:email:%s", normalizedEmail)
+
+	res, err := l.script.Run(
+		ctx,
+		l.rdb,
+		[]string{key},
+		now,
+		windowStart,
+		l.limit,
+		l.window.Nanoseconds(),
+		member,
+	).Int64()
+	if err != nil {
+		// Fail safe: a Redis outage must not lock users out of login.
+		slog.Warn("email login limiter redis error; failing open for availability", "err", err)
+
+		return true
+	}
+
+	return res >= 0
+}
+
 // NewAccountRateLimiter builds a limiter keyed by email (for login attempts).
 func NewAccountRateLimiter(rdb *redis.Client, limit int, window time.Duration) *RateLimiter {
 	r := rate.Limit(float64(limit) / window.Seconds())

@@ -18,6 +18,7 @@ import (
 	"github.com/CoverOnes/user/internal/events"
 	"github.com/CoverOnes/user/internal/handler"
 	"github.com/CoverOnes/user/internal/platform/logger"
+	"github.com/CoverOnes/user/internal/platform/middleware"
 	"github.com/CoverOnes/user/internal/service"
 	"github.com/CoverOnes/user/internal/store/postgres"
 	"github.com/redis/go-redis/v9"
@@ -143,19 +144,28 @@ func run() error {
 	txMgr := postgres.NewTxManager(pool)
 
 	// Service layer.
+	// Per-email login rate limit (credential-stuffing defense, P1): 5 attempts per
+	// 15 minutes per normalized email, in addition to the per-IP middleware limiter.
+	// Fails safe (allows) when Redis is unavailable.
+	emailLoginLimiter := middleware.NewEmailLoginLimiter(redisClient, 5, 15*time.Minute)
+
 	authSvc := service.NewAuthService(
 		userStore, companyStore, rtStore,
 		txMgr,
 		signer,
 		accessTTL,
 		cfg.RefreshTokenTTLHours,
-	)
+	).WithLoginRateLimiter(emailLoginLimiter)
 	profileSvc := service.NewProfileService(userStore)
 
 	// Redis event consumer — subscribes to kyc.tier_changed to keep users.kyc_tier fresh.
 	// Runs in a goroutine with a context derived from context.Background() so it is not
 	// canceled when HTTP request contexts expire (backend-security-design §5).
-	consumer := events.NewConsumer(redisClient, userStore)
+	// cfg.EventHMACSecret authenticates inbound events: a kyc.tier_changed event
+	// whose HMAC signature is missing or invalid is dropped (a forged Redis publish
+	// cannot elevate a user's KYC tier). config.validate() requires the secret
+	// outside development.
+	consumer := events.NewConsumer(redisClient, userStore, cfg.EventHMACSecret)
 
 	go consumer.Run(ctx)
 

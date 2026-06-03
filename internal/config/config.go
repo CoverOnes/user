@@ -15,6 +15,10 @@ import (
 // First character must be a letter or underscore (leading digits are invalid PG identifiers).
 var schemaNameRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
+// minEventHMACSecretLen is the minimum accepted length for USER_EVENT_HMAC_SECRET.
+// A 32-byte secret matches the SHA-256 block/output size and resists brute force.
+const minEventHMACSecretLen = 32
+
 // Config holds all configuration for the user service.
 type Config struct {
 	// Server
@@ -45,6 +49,11 @@ type Config struct {
 	JWTPrivateKey    string `mapstructure:"jwt_private_key"`     // base64 32-byte Ed25519 seed
 	JWTPrivateKeyPEM string `mapstructure:"jwt_private_key_pem"` // PKCS8 PEM alternative
 
+	// EventHMACSecret is the shared secret used to authenticate inbound Redis events
+	// (kyc.tier_changed). Must match the kyc publisher's secret. Required (≥32 chars)
+	// in non-development environments; an unsigned/forged event is dropped.
+	EventHMACSecret string `mapstructure:"event_hmac_secret"`
+
 	// Access token TTL in seconds (default 600)
 	AccessTokenTTLSec int `mapstructure:"access_token_ttl_sec"`
 
@@ -69,6 +78,7 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	// Explicit BindEnv for every key to guarantee resolution.
+	//nolint:gosec // G101: map values are environment-variable NAMES (e.g. USER_EVENT_HMAC_SECRET / USER_JWT_PRIVATE_KEY), not hardcoded credential values
 	bindings := map[string]string{
 		"port":                    "USER_PORT",
 		"postgres_dsn":            "USER_POSTGRES_DSN",
@@ -78,6 +88,7 @@ func Load() (*Config, error) {
 		"redis_url":               "USER_REDIS_URL",
 		"jwt_private_key":         "USER_JWT_PRIVATE_KEY",
 		"jwt_private_key_pem":     "USER_JWT_PRIVATE_KEY_PEM",
+		"event_hmac_secret":       "USER_EVENT_HMAC_SECRET",
 		"access_token_ttl_sec":    "USER_ACCESS_TOKEN_TTL_SEC",
 		"refresh_token_ttl_hours": "USER_REFRESH_TOKEN_TTL_HOURS",
 		"log_level":               "USER_LOG_LEVEL",
@@ -148,6 +159,18 @@ func (c *Config) validateCore() []string {
 	if strings.EqualFold(c.Env, "production") &&
 		c.JWTPrivateKey == "" && c.JWTPrivateKeyPEM == "" {
 		errs = append(errs, "USER_JWT_PRIVATE_KEY or USER_JWT_PRIVATE_KEY_PEM is required in production")
+	}
+
+	// P0: outside development, the event HMAC secret MUST be present and ≥32 chars.
+	// Without it, inbound kyc.tier_changed events cannot be authenticated and a
+	// forged Redis publish could elevate any user to Tier2. In development we allow
+	// an empty secret (the consumer then drops all signed events — fail-closed).
+	if !c.IsDev() {
+		if c.EventHMACSecret == "" {
+			errs = append(errs, "USER_EVENT_HMAC_SECRET is required outside development")
+		} else if len(c.EventHMACSecret) < minEventHMACSecretLen {
+			errs = append(errs, "USER_EVENT_HMAC_SECRET must be at least 32 characters")
+		}
 	}
 
 	return errs
