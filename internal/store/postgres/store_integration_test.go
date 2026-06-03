@@ -57,7 +57,7 @@ func startTestDB(t *testing.T) string {
 func runMigrations(t *testing.T, ctx context.Context, dsn, schema string) {
 	t.Helper()
 
-	pool, err := postgres.NewPool(ctx, dsn, schema)
+	pool, err := postgres.NewPool(ctx, dsn, schema, 0, 0) // 0 → defaults (10/2)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -98,7 +98,7 @@ func TestUserStore_Integration(t *testing.T) {
 	dsn := startTestDB(t)
 	runMigrations(t, ctx, dsn, "") // empty schema = public (test default)
 
-	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
+	pool, err := postgres.NewPool(ctx, dsn, "", 0, 0) // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -241,7 +241,7 @@ func TestPool_SchemaIsolation(t *testing.T) {
 	// and set search_path on every connection.
 	runMigrations(t, ctx, dsn, testSchema)
 
-	pool, err := postgres.NewPool(ctx, dsn, testSchema)
+	pool, err := postgres.NewPool(ctx, dsn, testSchema, 0, 0)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -276,7 +276,7 @@ func TestRefreshTokenStore_Integration(t *testing.T) {
 	dsn := startTestDB(t)
 	runMigrations(t, ctx, dsn, "") // empty schema = public (test default)
 
-	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
+	pool, err := postgres.NewPool(ctx, dsn, "", 0, 0) // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -388,4 +388,65 @@ func TestRefreshTokenStore_Integration(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "192.168.1.100", got.IPAddr.String())
 	})
+}
+
+// TestPool_ReservedWordSchema verifies that NewPool correctly handles a schema
+// name that is a PostgreSQL reserved word (e.g. "user").
+//
+// Before the fix, raw string concatenation in the SET search_path and CREATE SCHEMA
+// statements caused PG error 42601 (syntax_error) at runtime. The fix uses
+// pgx.Identifier.Sanitize() to produce a properly double-quoted identifier.
+func TestPool_ReservedWordSchema(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	// "user" is a PostgreSQL reserved word — raw concatenation would produce
+	//   SET search_path = user, public       → 42601 syntax error
+	//   CREATE SCHEMA IF NOT EXISTS user     → 42601 syntax error
+	// With quoting it becomes:
+	//   SET search_path = "user", public     → OK
+	//   CREATE SCHEMA IF NOT EXISTS "user"   → OK
+	const reservedSchema = "user"
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+
+	// NewPool must not error on a reserved-word schema name.
+	runMigrations(t, ctx, dsn, reservedSchema)
+
+	pool, err := postgres.NewPool(ctx, dsn, reservedSchema, 0, 0)
+	require.NoError(t, err, "NewPool must succeed with reserved-word schema %q", reservedSchema)
+
+	defer pool.Close()
+
+	// The schema must exist in pg_namespace.
+	var schemaExists bool
+
+	err = pool.QueryRow(
+		ctx,
+		"SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)",
+		reservedSchema,
+	).Scan(&schemaExists)
+	require.NoError(t, err)
+	assert.True(t, schemaExists, "schema %q must exist in information_schema.schemata", reservedSchema)
+
+	// The service's main table (users) must be in the "user" schema, not in public.
+	var count int
+
+	err = pool.QueryRow(
+		ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'users'",
+		reservedSchema,
+	).Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "users table must exist in the %q schema", reservedSchema)
+
+	// Verify that search_path is active: a bare table reference must resolve to
+	// the "user" schema, not to public.
+	var currentSchema string
+
+	err = pool.QueryRow(ctx, "SELECT current_schema()").Scan(&currentSchema)
+	require.NoError(t, err)
+	assert.Equal(t, reservedSchema, currentSchema, "current_schema() must return %q when search_path is set", reservedSchema)
 }

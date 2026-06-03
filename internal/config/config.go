@@ -29,6 +29,15 @@ type Config struct {
 	// Only alphanumeric characters and underscores are allowed ([a-zA-Z0-9_]+).
 	PostgresSchema string `mapstructure:"postgres_schema"`
 
+	// DBMaxConns is the maximum number of connections in the pgxpool (default 10).
+	// Set USER_DB_MAX_CONNS to a lower value when multiple services share a small
+	// Aiven plan to avoid exhausting the server's max_connections.
+	DBMaxConns int `mapstructure:"db_max_conns"`
+
+	// DBMinConns is the minimum number of idle connections in the pgxpool (default 2).
+	// Set USER_DB_MIN_CONNS to 0 or 1 to reduce idle connection overhead on shared plans.
+	DBMinConns int `mapstructure:"db_min_conns"`
+
 	// Redis
 	RedisURL string `mapstructure:"redis_url"`
 
@@ -64,6 +73,8 @@ func Load() (*Config, error) {
 		"port":                    "USER_PORT",
 		"postgres_dsn":            "USER_POSTGRES_DSN",
 		"postgres_schema":         "USER_DB_SCHEMA",
+		"db_max_conns":            "USER_DB_MAX_CONNS",
+		"db_min_conns":            "USER_DB_MIN_CONNS",
 		"redis_url":               "USER_REDIS_URL",
 		"jwt_private_key":         "USER_JWT_PRIVATE_KEY",
 		"jwt_private_key_pem":     "USER_JWT_PRIVATE_KEY_PEM",
@@ -84,6 +95,8 @@ func Load() (*Config, error) {
 	v.SetDefault("refresh_token_ttl_hours", 24)
 	v.SetDefault("log_level", "INFO")
 	v.SetDefault("env", "development")
+	v.SetDefault("db_max_conns", 10)
+	v.SetDefault("db_min_conns", 2)
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
@@ -98,6 +111,18 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	errs := c.validateCore()
+	errs = append(errs, c.validateDB()...)
+
+	if len(errs) > 0 {
+		return errors.New("config validation failed: " + strings.Join(errs, "; "))
+	}
+
+	return nil
+}
+
+// validateCore checks server, JWT, and token TTL fields.
+func (c *Config) validateCore() []string {
 	var errs []string
 
 	if c.PostgresDSN == "" {
@@ -125,15 +150,26 @@ func (c *Config) validate() error {
 		errs = append(errs, "USER_JWT_PRIVATE_KEY or USER_JWT_PRIVATE_KEY_PEM is required in production")
 	}
 
+	return errs
+}
+
+// validateDB checks Postgres schema and connection-pool sizing fields.
+func (c *Config) validateDB() []string {
+	var errs []string
+
 	if c.PostgresSchema != "" && !schemaNameRe.MatchString(c.PostgresSchema) {
 		errs = append(errs, "USER_DB_SCHEMA must start with a letter or underscore and contain only [a-zA-Z0-9_] characters")
 	}
 
-	if len(errs) > 0 {
-		return errors.New("config validation failed: " + strings.Join(errs, "; "))
+	if c.DBMaxConns < 0 || c.DBMaxConns > 1000 {
+		errs = append(errs, "USER_DB_MAX_CONNS must be 0-1000 (0 = use default of 10)")
 	}
 
-	return nil
+	if c.DBMinConns < 0 || c.DBMinConns > 1000 {
+		errs = append(errs, "USER_DB_MIN_CONNS must be 0-1000 (0 = use default of 2)")
+	}
+
+	return errs
 }
 
 // IsDev reports whether the service is running in development mode.

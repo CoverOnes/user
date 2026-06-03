@@ -82,7 +82,13 @@ func run() error {
 	// Postgres pool.
 	// cfg.PostgresSchema is "" by default (public schema); set USER_DB_SCHEMA
 	// to isolate this service within a shared Aiven database.
-	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema)
+	// cfg.DBMaxConns / cfg.DBMinConns default to 10 / 2 and can be tuned via
+	// USER_DB_MAX_CONNS / USER_DB_MIN_CONNS for shared Aiven plans.
+	// int→int32 narrowing is safe: config.validate() enforces 0-1000 bounds.
+	// G115 (integer overflow int→uint32) is excluded project-wide in .golangci.yml.
+	maxConns := int32(cfg.DBMaxConns)
+	minConns := int32(cfg.DBMinConns)
+	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema, maxConns, minConns)
 	if err != nil {
 		return fmt.Errorf("connect postgres: %w", err)
 	}
