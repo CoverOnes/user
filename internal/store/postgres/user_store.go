@@ -32,7 +32,8 @@ func (s *UserStore) Create(ctx context.Context, u *domain.User) error {
 		($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 	`
 
-	_, err := s.pool.Exec(ctx, q,
+	_, err := s.pool.Exec(
+		ctx, q,
 		u.ID, u.Email, u.PasswordHash, u.DisplayName, u.AvatarURL,
 		u.AccountType, u.KYCTier, u.CompanyID, u.Status, u.TokenVersion,
 		u.CreatedAt, u.UpdatedAt,
@@ -91,6 +92,50 @@ func (s *UserStore) UpdateProfile(ctx context.Context, id uuid.UUID, displayName
 	}
 
 	return nil
+}
+
+// UpdateKYCTier sets kyc_tier for the given user, bumping updated_at.
+// Called by the Redis consumer on kyc.tier_changed events.
+func (s *UserStore) UpdateKYCTier(ctx context.Context, id uuid.UUID, tier int16) error {
+	q := `
+	UPDATE users
+	SET kyc_tier = $2, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL
+	`
+
+	tag, err := s.pool.Exec(ctx, q, id, tier)
+	if err != nil {
+		return fmt.Errorf("update kyc_tier: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
+// BumpTokenVersion atomically increments token_version and returns the new value.
+// This forces all existing refresh tokens (which carry the previous version) to fail
+// the server-side version check on next use, effectively revoking every session.
+func (s *UserStore) BumpTokenVersion(ctx context.Context, id uuid.UUID) (int, error) {
+	q := `
+	UPDATE users
+	SET token_version = token_version + 1, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL
+	RETURNING token_version
+	`
+
+	var newVersion int
+	if err := s.pool.QueryRow(ctx, q, id).Scan(&newVersion); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, domain.ErrNotFound
+		}
+
+		return 0, fmt.Errorf("bump token_version: %w", err)
+	}
+
+	return newVersion, nil
 }
 
 func scanUser(row pgx.Row) (*domain.User, error) {

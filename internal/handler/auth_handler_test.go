@@ -76,6 +76,30 @@ func (f *fakeUserStore) UpdateProfile(_ context.Context, id uuid.UUID, displayNa
 	return domain.ErrNotFound
 }
 
+func (f *fakeUserStore) UpdateKYCTier(_ context.Context, id uuid.UUID, tier int16) error {
+	for _, u := range f.users {
+		if u.ID == id {
+			u.KYCTier = tier
+
+			return nil
+		}
+	}
+
+	return domain.ErrNotFound
+}
+
+func (f *fakeUserStore) BumpTokenVersion(_ context.Context, id uuid.UUID) (int, error) {
+	for _, u := range f.users {
+		if u.ID == id {
+			u.TokenVersion++
+
+			return u.TokenVersion, nil
+		}
+	}
+
+	return 0, domain.ErrNotFound
+}
+
 type fakeCompanyStore struct{}
 
 func (f *fakeCompanyStore) Create(_ context.Context, _ *domain.Company) error { return nil }

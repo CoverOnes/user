@@ -227,7 +227,8 @@ func (s *AuthService) Refresh(ctx context.Context, in RefreshInput) (*TokenPair,
 
 	// Reuse detection: used_at already set means token was already consumed.
 	if rt.UsedAt != nil || rt.RevokedAt != nil {
-		slog.Warn("refresh.reuse_detected",
+		slog.Warn(
+			"refresh.reuse_detected",
 			"userId", rt.UserID,
 			"familyId", rt.FamilyID,
 		)
@@ -248,7 +249,8 @@ func (s *AuthService) Refresh(ctx context.Context, in RefreshInput) (*TokenPair,
 	// Log device fingerprint anomaly (MVP: warn only, no step-up).
 	if in.DeviceFingerprint != nil && rt.DeviceFingerprint != nil &&
 		*in.DeviceFingerprint != *rt.DeviceFingerprint {
-		slog.Warn("refresh.device_fingerprint_mismatch",
+		slog.Warn(
+			"refresh.device_fingerprint_mismatch",
 			"userId", rt.UserID,
 			"familyId", rt.FamilyID,
 		)
@@ -273,7 +275,8 @@ func (s *AuthService) Refresh(ctx context.Context, in RefreshInput) (*TokenPair,
 	// increments users.token_version) is a pending follow-up — this enforcement
 	// path is wired and tested, but no endpoint increments the version yet.
 	if rt.TokenVersion != u.TokenVersion {
-		slog.Warn("refresh.token_version_mismatch",
+		slog.Warn(
+			"refresh.token_version_mismatch",
 			"userId", u.ID,
 			"storedVersion", rt.TokenVersion,
 			"userVersion", u.TokenVersion,
@@ -313,6 +316,20 @@ func (s *AuthService) Logout(ctx context.Context, rawToken string) error {
 	now := time.Now().UTC()
 
 	return s.refreshTokens.RevokeFamily(ctx, rt.FamilyID, now)
+}
+
+// LogoutAll bumps the user's token_version, which causes all currently-issued
+// refresh tokens to fail the server-side version check on next use.
+// The caller is responsible for ensuring userID is authenticated (derived from token sub).
+func (s *AuthService) LogoutAll(ctx context.Context, userID uuid.UUID) error {
+	_, err := s.users.BumpTokenVersion(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	slog.Info("auth.logout_all", "userId", userID)
+
+	return nil
 }
 
 func (s *AuthService) issueTokenPair(

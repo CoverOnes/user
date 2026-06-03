@@ -73,6 +73,9 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	me.GET("/profile", profH.Get)
 	// PUT /profile requires Tier >= 1.
 	me.PUT("/profile", middleware.RequireTier(1), profH.Update)
+	// Session management.
+	sessH := NewSessionHandler(cfg.Auth)
+	me.POST("/sessions/revoke-all", sessH.RevokeAll)
 
 	return r
 }
@@ -82,7 +85,8 @@ func accessLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
-		slog.Info("http",
+		slog.Info(
+			"http",
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,
 			"status", c.Writer.Status(),
