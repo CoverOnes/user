@@ -29,7 +29,8 @@ func startTestDB(t *testing.T) string {
 
 	ctx := context.Background()
 
-	ctr, err := tcpostgres.Run(ctx,
+	ctr, err := tcpostgres.Run(
+		ctx,
 		"postgres:17-alpine",
 		tcpostgres.WithDatabase("testdb"),
 		tcpostgres.WithUsername("testuser"),
@@ -52,10 +53,11 @@ func startTestDB(t *testing.T) string {
 
 // runMigrations applies the embedded *.up.sql migration files against the test DB (F15).
 // Using the real migration files ensures schema drift is caught immediately.
-func runMigrations(t *testing.T, ctx context.Context, dsn string) {
+// schema may be "" (public) or a custom schema name validated by config.
+func runMigrations(t *testing.T, ctx context.Context, dsn, schema string) {
 	t.Helper()
 
-	pool, err := postgres.NewPool(ctx, dsn)
+	pool, err := postgres.NewPool(ctx, dsn, schema)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -94,9 +96,9 @@ func TestUserStore_Integration(t *testing.T) {
 
 	ctx := context.Background()
 	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
+	runMigrations(t, ctx, dsn, "") // empty schema = public (test default)
 
-	pool, err := postgres.NewPool(ctx, dsn)
+	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -222,6 +224,48 @@ func TestUserStore_Integration(t *testing.T) {
 	})
 }
 
+// TestPool_SchemaIsolation verifies that when a non-empty schema is provided to NewPool,
+// CREATE SCHEMA IF NOT EXISTS is executed and all migrations land in that schema
+// (not in "public"). It checks information_schema.tables to assert table_schema.
+func TestPool_SchemaIsolation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	const testSchema = "dev_test_schema"
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+
+	// Build pool with the custom schema — this must CREATE SCHEMA IF NOT EXISTS
+	// and set search_path on every connection.
+	runMigrations(t, ctx, dsn, testSchema)
+
+	pool, err := postgres.NewPool(ctx, dsn, testSchema)
+	require.NoError(t, err)
+
+	defer pool.Close()
+
+	// Assert that the users table exists in the custom schema via information_schema.
+	var count int
+	err = pool.QueryRow(
+		ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'users'",
+		testSchema,
+	).Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "users table must exist in schema %q after migrations", testSchema)
+
+	// Also assert the table does NOT exist in public (isolation check).
+	var publicCount int
+	err = pool.QueryRow(
+		ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'users'",
+	).Scan(&publicCount)
+	require.NoError(t, err)
+	assert.Equal(t, 0, publicCount, "users table must NOT exist in public schema when using custom schema")
+}
+
 // TestRefreshTokenStore_Integration tests refresh token lifecycle against real Postgres.
 func TestRefreshTokenStore_Integration(t *testing.T) {
 	if testing.Short() {
@@ -230,9 +274,9 @@ func TestRefreshTokenStore_Integration(t *testing.T) {
 
 	ctx := context.Background()
 	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
+	runMigrations(t, ctx, dsn, "") // empty schema = public (test default)
 
-	pool, err := postgres.NewPool(ctx, dsn)
+	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()

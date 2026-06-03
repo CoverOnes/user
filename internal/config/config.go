@@ -4,10 +4,15 @@ package config
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/viper"
 )
+
+// schemaNameRe validates that a Postgres schema name only contains safe characters
+// to prevent SQL injection when the name is interpolated into CREATE SCHEMA.
+var schemaNameRe = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 // Config holds all configuration for the user service.
 type Config struct {
@@ -16,6 +21,12 @@ type Config struct {
 
 	// Postgres
 	PostgresDSN string `mapstructure:"postgres_dsn"`
+
+	// PostgresSchema is the optional Postgres schema to use (default: "" = public).
+	// Set to "user" when sharing one Aiven database across multiple services
+	// so each service is isolated by schema rather than by database.
+	// Only alphanumeric characters and underscores are allowed ([a-zA-Z0-9_]+).
+	PostgresSchema string `mapstructure:"postgres_schema"`
 
 	// Redis
 	RedisURL string `mapstructure:"redis_url"`
@@ -51,6 +62,7 @@ func Load() (*Config, error) {
 	bindings := map[string]string{
 		"port":                        "USER_PORT",
 		"postgres_dsn":                "USER_POSTGRES_DSN",
+		"postgres_schema":             "USER_DB_SCHEMA",
 		"redis_url":                   "USER_REDIS_URL",
 		"jwt_ed25519_private_key":     "USER_JWT_ED25519_PRIVATE_KEY",
 		"jwt_ed25519_private_key_pem": "USER_JWT_ED25519_PRIVATE_KEY_PEM",
@@ -110,6 +122,10 @@ func (c *Config) validate() error {
 	if strings.EqualFold(c.Env, "production") &&
 		c.JWTPrivateKey == "" && c.JWTPrivateKeyPEM == "" {
 		errs = append(errs, "USER_JWT_ED25519_PRIVATE_KEY or USER_JWT_ED25519_PRIVATE_KEY_PEM is required in production")
+	}
+
+	if c.PostgresSchema != "" && !schemaNameRe.MatchString(c.PostgresSchema) {
+		errs = append(errs, "USER_DB_SCHEMA must contain only [a-zA-Z0-9_] characters")
 	}
 
 	if len(errs) > 0 {
