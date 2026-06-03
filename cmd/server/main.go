@@ -15,6 +15,7 @@ import (
 
 	"github.com/CoverOnes/user/internal/auth/jwt"
 	"github.com/CoverOnes/user/internal/config"
+	"github.com/CoverOnes/user/internal/events"
 	"github.com/CoverOnes/user/internal/handler"
 	"github.com/CoverOnes/user/internal/platform/logger"
 	"github.com/CoverOnes/user/internal/service"
@@ -150,6 +151,13 @@ func run() error {
 		cfg.RefreshTokenTTLHours,
 	)
 	profileSvc := service.NewProfileService(userStore)
+
+	// Redis event consumer — subscribes to kyc.tier_changed to keep users.kyc_tier fresh.
+	// Runs in a goroutine with a context derived from context.Background() so it is not
+	// canceled when HTTP request contexts expire (backend-security-design §5).
+	consumer := events.NewConsumer(redisClient, userStore)
+
+	go consumer.Run(ctx)
 
 	// Router.
 	r := handler.NewRouter(handler.RouterConfig{

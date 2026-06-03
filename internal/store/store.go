@@ -16,6 +16,11 @@ type UserStore interface {
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error)
 	GetByEmail(ctx context.Context, email string) (*domain.User, error)
 	UpdateProfile(ctx context.Context, id uuid.UUID, displayName string, avatarURL *string) error
+	// UpdateKYCTier sets kyc_tier for the given user (called by the Redis consumer on kyc.tier_changed).
+	UpdateKYCTier(ctx context.Context, id uuid.UUID, tier int16) error
+	// BumpTokenVersion atomically increments token_version and returns the new value.
+	// Used by LogoutAll to invalidate all existing refresh tokens for a user.
+	BumpTokenVersion(ctx context.Context, id uuid.UUID) (int, error)
 }
 
 // CompanyStore defines DB operations for company records.

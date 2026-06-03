@@ -78,7 +78,8 @@ func (s *txUserStore) Create(ctx context.Context, u *domain.User) error {
 		($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 	`
 
-	_, err := s.tx.Exec(ctx, q,
+	_, err := s.tx.Exec(
+		ctx, q,
 		u.ID, u.Email, u.PasswordHash, u.DisplayName, u.AvatarURL,
 		u.AccountType, u.KYCTier, u.CompanyID, u.Status, u.TokenVersion,
 		u.CreatedAt, u.UpdatedAt,
@@ -136,6 +137,45 @@ func (s *txUserStore) UpdateProfile(ctx context.Context, id uuid.UUID, displayNa
 	return nil
 }
 
+func (s *txUserStore) UpdateKYCTier(ctx context.Context, id uuid.UUID, tier int16) error {
+	q := `
+	UPDATE users
+	SET kyc_tier = $2, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL
+	`
+
+	tag, err := s.tx.Exec(ctx, q, id, tier)
+	if err != nil {
+		return fmt.Errorf("update kyc_tier (tx): %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
+func (s *txUserStore) BumpTokenVersion(ctx context.Context, id uuid.UUID) (int, error) {
+	q := `
+	UPDATE users
+	SET token_version = token_version + 1, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL
+	RETURNING token_version
+	`
+
+	var newVersion int
+	if err := s.tx.QueryRow(ctx, q, id).Scan(&newVersion); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, domain.ErrNotFound
+		}
+
+		return 0, fmt.Errorf("bump token_version (tx): %w", err)
+	}
+
+	return newVersion, nil
+}
+
 // txCompanyStore is a CompanyStore that operates within a pgx.Tx.
 type txCompanyStore struct {
 	tx txExecer
@@ -148,7 +188,8 @@ func (s *txCompanyStore) Create(ctx context.Context, c *domain.Company) error {
 	VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`
 
-	_, err := s.tx.Exec(ctx, q,
+	_, err := s.tx.Exec(
+		ctx, q,
 		c.ID, c.Name, c.RegistrationNo, c.OwnerUserID,
 		c.Status, c.CreatedAt, c.UpdatedAt,
 	)
