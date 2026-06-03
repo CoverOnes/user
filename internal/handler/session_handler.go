@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/CoverOnes/user/internal/platform/httpx"
 	"github.com/CoverOnes/user/internal/platform/middleware"
@@ -37,10 +39,12 @@ func (h *SessionHandler) RevokeAll(c *gin.Context) {
 		return
 	}
 
-	// Run in a detached context so DB write is not canceled if the client disconnects —
-	// goroutine safety per backend-security-design §5 (request context must not govern
-	// side-effecting writes). We block here since the operation is fast.
-	if err := h.auth.LogoutAll(c.Request.Context(), userID); err != nil {
+	// Detached context so this security-critical revoke write completes even if the client
+	// disconnects mid-request (request cancellation must not abort a session-revocation —
+	// backend-security-design §5). Bounded by a short timeout so it cannot hang.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+	defer cancel()
+	if err := h.auth.LogoutAll(ctx, userID); err != nil {
 		slog.Warn("revoke_all: failed to bump token_version", "userId", userID, "err", err)
 		httpx.Err(c, err)
 
