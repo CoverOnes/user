@@ -152,3 +152,64 @@ func TestLoad_PostgresSchema_LeadingDigitRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "USER_DB_SCHEMA")
 }
+
+func TestLoad_DBConns_Defaults(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+	)
+
+	os.Unsetenv("USER_DB_MAX_CONNS") //nolint:errcheck // test cleanup
+	os.Unsetenv("USER_DB_MIN_CONNS") //nolint:errcheck // test cleanup
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, 10, cfg.DBMaxConns, "DBMaxConns default must be 10")
+	assert.Equal(t, 2, cfg.DBMinConns, "DBMinConns default must be 2")
+}
+
+func TestLoad_DBConns_Configurable(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_DB_MAX_CONNS", "5",
+		"USER_DB_MIN_CONNS", "1",
+	)
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, 5, cfg.DBMaxConns)
+	assert.Equal(t, 1, cfg.DBMinConns)
+}
+
+func TestLoad_DBConns_NegativeRejected(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_DB_MAX_CONNS", "-1",
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_DB_MAX_CONNS")
+}
+
+func TestLoad_DBConns_OverLimitRejected(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_DB_MIN_CONNS", "1001",
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_DB_MIN_CONNS")
+}
