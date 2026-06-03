@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -25,11 +27,63 @@ const fallbackBurst = 10
 // many unique source IPs an attacker rotates through (C2 — memory-DoS fix).
 const fallbackLRUCap = 100_000
 
-// RateLimiter is a Redis-backed fixed-window rate limiter with an in-process
+// slidingWindowScript implements a sliding-window rate limiter over a Redis
+// sorted set, evaluated atomically server-side.
+//
+// KEYS[1] = the per-caller sorted-set key
+// ARGV[1] = now            (unix-nanoseconds, the score of this request)
+// ARGV[2] = windowStart    (now - window, in unix-nanoseconds)
+// ARGV[3] = limit          (max requests permitted within the window)
+// ARGV[4] = windowNanos    (window length in nanoseconds, used for the key TTL)
+// ARGV[5] = member         (unique member id for this request)
+//
+// Semantics:
+//  1. ZREMRANGEBYSCORE evicts entries older than windowStart, so the set only
+//     ever holds requests inside the rolling window (unlike a fixed window, the
+//     boundary slides with every call — a paced burst across a calendar boundary
+//     can no longer double the effective rate).
+//  2. ZCARD counts the surviving in-window requests.
+//  3. If the count is already at/above the limit, return -1 WITHOUT adding the
+//     current request (so a rejected request neither extends the window nor is
+//     itself counted). The -1 sentinel is unambiguous: the Go caller treats any
+//     negative return as "denied".
+//  4. Otherwise ZADD this request and return the new (admitted) count.
+//
+// PEXPIRE bounds the key lifetime to one window past the last write, so idle
+// keys self-evict and memory stays O(active callers × limit).
+const slidingWindowScript = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local windowStart = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local windowNanos = tonumber(ARGV[4])
+local member = ARGV[5]
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
+local count = redis.call('ZCARD', key)
+
+if count >= limit then
+  redis.call('PEXPIRE', key, math.ceil(windowNanos / 1000000))
+  return -1
+end
+
+redis.call('ZADD', key, now, member)
+redis.call('PEXPIRE', key, math.ceil(windowNanos / 1000000))
+return count + 1
+`
+
+// RateLimiter is a Redis-backed sliding-window rate limiter with an in-process
 // token-bucket fallback that engages when Redis errors (F4 — fails SAFE, not open).
-// Note: the fixed-window vs sliding-window precision upgrade is a deferred follow-up.
+//
+// The sliding window is implemented with a per-caller Redis sorted set: each
+// request is a member scored by its arrival time, stale members outside the
+// rolling window are trimmed on every call, and the surviving cardinality is the
+// request count. This removes the fixed-window boundary-burst weakness where a
+// caller could issue `limit` requests at the tail of one window and `limit` more
+// at the head of the next — 2× the intended rate over a few milliseconds.
 type RateLimiter struct {
 	rdb      *redis.Client
+	script   *redis.Script
 	limit    int
 	window   time.Duration
 	keyFunc  func(c *gin.Context) string
@@ -79,6 +133,7 @@ func NewIPRateLimiter(rdb *redis.Client, limit int, window time.Duration) *RateL
 
 	return &RateLimiter{
 		rdb:    rdb,
+		script: redis.NewScript(slidingWindowScript),
 		limit:  limit,
 		window: window,
 		keyFunc: func(c *gin.Context) string {
@@ -94,6 +149,7 @@ func NewAccountRateLimiter(rdb *redis.Client, limit int, window time.Duration) *
 
 	return &RateLimiter{
 		rdb:    rdb,
+		script: redis.NewScript(slidingWindowScript),
 		limit:  limit,
 		window: window,
 		keyFunc: func(c *gin.Context) string {
@@ -125,7 +181,7 @@ func (rl *RateLimiter) Handler() gin.HandlerFunc {
 		key := rl.keyFunc(c)
 		ctx := c.Request.Context()
 
-		count, err := rl.increment(ctx, key)
+		allowed, err := rl.allowSlidingWindow(ctx, key)
 		if err != nil {
 			// Redis error — engage the in-process fallback limiter instead of failing open (F4).
 			slog.Warn("rate limiter redis error; applying in-process fallback limiter", "err", err)
@@ -139,7 +195,7 @@ func (rl *RateLimiter) Handler() gin.HandlerFunc {
 			return
 		}
 
-		if count > rl.limit {
+		if !allowed {
 			c.Abort()
 			httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
 			return
@@ -149,18 +205,44 @@ func (rl *RateLimiter) Handler() gin.HandlerFunc {
 	}
 }
 
-func (rl *RateLimiter) increment(ctx context.Context, key string) (int, error) {
-	pipe := rl.rdb.Pipeline()
-	incr := pipe.Incr(ctx, key)
-	// ExpireNX sets the TTL only when the key has no expiry yet (the first request
-	// in a window). Plain Expire would reset the window on every request, letting a
-	// paced attacker bypass the limit entirely (M-NEW-1 fixed-window correctness).
-	pipe.ExpireNX(ctx, key, rl.window)
+// allowSlidingWindow evaluates the sliding-window Lua script atomically on Redis
+// and reports whether the current request is admitted. A negative script result
+// (the -1 sentinel) means the rolling window is already saturated.
+func (rl *RateLimiter) allowSlidingWindow(ctx context.Context, key string) (bool, error) {
+	now := time.Now().UnixNano()
+	windowStart := now - rl.window.Nanoseconds()
 
-	_, err := pipe.Exec(ctx)
+	// A unique member per request: nanosecond timestamp + a random suffix so two
+	// requests arriving in the same nanosecond do not collide on the same ZSET member
+	// (a collision would silently undercount). crypto/rand keeps it non-guessable.
+	member := fmt.Sprintf("%d-%s", now, randMember())
+
+	res, err := rl.script.Run(
+		ctx,
+		rl.rdb,
+		[]string{key},
+		now,
+		windowStart,
+		rl.limit,
+		rl.window.Nanoseconds(),
+		member,
+	).Int64()
 	if err != nil {
-		return 0, err
+		return false, err
 	}
 
-	return int(incr.Val()), nil
+	return res >= 0, nil
+}
+
+// randMember returns a short hex string from a crypto-random source, used only to
+// disambiguate sorted-set members that share a timestamp. On the (practically
+// impossible) read error it falls back to a fixed suffix — correctness is not
+// security-critical here, only collision-avoidance.
+func randMember() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "x"
+	}
+
+	return hex.EncodeToString(b[:])
 }
