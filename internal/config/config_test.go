@@ -138,3 +138,17 @@ func TestLoad_PostgresSchema_Invalid(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "USER_DB_SCHEMA")
 }
+
+func TestLoad_PostgresSchema_LeadingDigitRejected(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_DB_SCHEMA", "1schema",
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_DB_SCHEMA")
+}
