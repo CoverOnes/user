@@ -24,6 +24,10 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
+// validTWID is a checksum-valid Taiwan national ID for register fixtures
+// (canonical example, NOT a real person's ID).
+const validTWID = "A123456789"
+
 // --- Fake stores for unit tests ---
 
 type fakeUserStore struct {
@@ -98,6 +102,18 @@ func (f *fakeUserStore) BumpTokenVersion(_ context.Context, id uuid.UUID) (int, 
 	}
 
 	return 0, domain.ErrNotFound
+}
+
+func (f *fakeUserStore) SetEmailVerified(_ context.Context, id uuid.UUID) error {
+	for _, u := range f.users {
+		if u.ID == id {
+			u.EmailVerified = true
+
+			return nil
+		}
+	}
+
+	return domain.ErrNotFound
 }
 
 type fakeCompanyStore struct{}
@@ -224,6 +240,8 @@ func TestRegister_HappyPath(t *testing.T) {
 		"password":    "superSecurePassword123",
 		"displayName": "Alice",
 		"accountType": "PERSONAL",
+		"legalName":   "Alice Wang",
+		"nationalId":  validTWID,
 	})
 
 	assert.Equal(t, http.StatusCreated, w.Code)
@@ -236,6 +254,11 @@ func TestRegister_HappyPath(t *testing.T) {
 	assert.Equal(t, "alice@example.com", user["email"])
 	assert.Equal(t, "PERSONAL", user["accountType"])
 	assert.Equal(t, float64(0), user["kycTier"])
+	// New register contract: PENDING_VERIFICATION + emailVerified=false, no tokens.
+	assert.Equal(t, "PENDING_VERIFICATION", user["status"])
+	assert.Equal(t, false, user["emailVerified"])
+	_, hasAccess := data["accessToken"]
+	assert.False(t, hasAccess, "register must not return an access token")
 }
 
 func TestRegister_EmailTaken(t *testing.T) {
@@ -246,6 +269,8 @@ func TestRegister_EmailTaken(t *testing.T) {
 		"password":    "superSecurePassword123",
 		"displayName": "Dup",
 		"accountType": "PERSONAL",
+		"legalName":   "Dup Wang",
+		"nationalId":  validTWID,
 	}
 
 	postJSON(t, r, "/v1/auth/register", body)      // first
@@ -267,6 +292,8 @@ func TestRegister_WeakPassword(t *testing.T) {
 		"password":    "short",
 		"displayName": "Weak",
 		"accountType": "PERSONAL",
+		"legalName":   "Weak Wang",
+		"nationalId":  validTWID,
 	})
 
 	// Binding min=12 returns 400 VALIDATION_ERROR before we even reach service.
@@ -303,6 +330,7 @@ func TestRegister_CompanyNameTooLong(t *testing.T) {
 		"password":    "superSecurePassword123",
 		"displayName": "BigCo",
 		"accountType": "COMPANY",
+		"legalName":   "Big Co Owner",
 		"companyName": longName,
 	})
 
@@ -324,6 +352,8 @@ func TestLogin_HappyPath(t *testing.T) {
 		"password":    "superSecurePassword123",
 		"displayName": "Bob",
 		"accountType": "PERSONAL",
+		"legalName":   "Bob Wang",
+		"nationalId":  validTWID,
 	})
 
 	w := postJSON(t, r, "/v1/auth/login", map[string]any{
@@ -349,6 +379,8 @@ func TestLogin_WrongPassword(t *testing.T) {
 		"password":    "superSecurePassword123",
 		"displayName": "Carol",
 		"accountType": "PERSONAL",
+		"legalName":   "Carol Wang",
+		"nationalId":  validTWID,
 	})
 
 	w := postJSON(t, r, "/v1/auth/login", map[string]any{
@@ -389,6 +421,8 @@ func TestRefresh_HappyPath(t *testing.T) {
 		"password":    "superSecurePassword123",
 		"displayName": "Dave",
 		"accountType": "PERSONAL",
+		"legalName":   "Dave Wang",
+		"nationalId":  validTWID,
 	})
 
 	loginW := postJSON(t, r, "/v1/auth/login", map[string]any{
@@ -424,6 +458,8 @@ func TestRefresh_ReuseDetected(t *testing.T) {
 		"password":    "superSecurePassword123",
 		"displayName": "Eve",
 		"accountType": "PERSONAL",
+		"legalName":   "Eve Wang",
+		"nationalId":  validTWID,
 	})
 
 	loginW := postJSON(t, r, "/v1/auth/login", map[string]any{
@@ -483,7 +519,7 @@ func TestGetMe_HappyPath(t *testing.T) {
 	}
 	require.NoError(t, userStore.Create(context.Background(), u))
 
-	token, err := signer.Issue(u.ID.String(), u.AccountType, u.KYCTier, u.TokenVersion)
+	token, err := signer.Issue(u.ID.String(), u.AccountType, u.KYCTier, u.TokenVersion, u.EmailVerified)
 	require.NoError(t, err)
 
 	w := getJSON(t, r, "/v1/me", "Bearer "+token)

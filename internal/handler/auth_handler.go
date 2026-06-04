@@ -32,10 +32,16 @@ type RegisterRequest struct {
 	Password    string `json:"password" binding:"required,min=12,max=128"`
 	DisplayName string `json:"displayName" binding:"required,max=80"`
 	AccountType string `json:"accountType" binding:"required"`
+	// LegalName is the user's real name — required for BOTH account types.
+	LegalName string `json:"legalName" binding:"required,max=100"`
+	// NationalID — required + checksum-validated for PERSONAL at the service layer;
+	// the binding only bounds length (max=10). Optional/ignored for COMPANY.
+	NationalID  string `json:"nationalId" binding:"max=10"`
 	CompanyName string `json:"companyName" binding:"max=200"`
 }
 
 // Register handles POST /v1/auth/register.
+// Returns 201 with the user object only (no tokens — register issues no tokens).
 func (h *AuthHandler) Register(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
 
@@ -50,6 +56,8 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		Password:    req.Password,
 		DisplayName: req.DisplayName,
 		AccountType: strings.ToUpper(req.AccountType),
+		LegalName:   req.LegalName,
+		NationalID:  req.NationalID,
 		CompanyName: req.CompanyName,
 	})
 	if err != nil {
@@ -60,14 +68,66 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	u := out.User
 	httpx.Created(c, gin.H{
 		"user": gin.H{
-			"id":          u.ID,
-			"email":       u.Email,
-			"displayName": u.DisplayName,
-			"accountType": u.AccountType,
-			"kycTier":     u.KYCTier,
-			"status":      u.Status,
+			"id":            u.ID,
+			"email":         u.Email,
+			"displayName":   u.DisplayName,
+			"accountType":   u.AccountType,
+			"kycTier":       u.KYCTier,
+			"status":        u.Status,
+			"emailVerified": u.EmailVerified,
 		},
 	})
+}
+
+// VerifyEmailRequest is the verify-email endpoint request body.
+type VerifyEmailRequest struct {
+	Token string `json:"token" binding:"required,max=512"`
+}
+
+// VerifyEmail handles POST /v1/auth/verify-email.
+// All failure modes return the single generic 400 INVALID_VERIFICATION_TOKEN.
+func (h *AuthHandler) VerifyEmail(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
+	var req VerifyEmailRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	if err := h.auth.VerifyEmail(c.Request.Context(), req.Token); err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, gin.H{"emailVerified": true})
+}
+
+// ResendVerificationRequest is the resend-verification endpoint request body.
+type ResendVerificationRequest struct {
+	Email string `json:"email" binding:"required,email,max=254"`
+}
+
+// resendVerificationMessage is the constant, enumeration-safe response message.
+const resendVerificationMessage = "If an account requires verification, an email has been sent."
+
+// ResendVerification handles POST /v1/auth/resend-verification.
+// ALWAYS returns 202 with a constant message regardless of account existence or
+// state (no enumeration). The actual send (if any) happens in the service.
+func (h *AuthHandler) ResendVerification(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
+	var req ResendVerificationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	// Fire-and-forget at the response level: the service swallows all outcomes so
+	// the response is identical whether or not anything was sent.
+	h.auth.ResendVerification(c.Request.Context(), req.Email)
+
+	c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"message": resendVerificationMessage}})
 }
 
 // LoginRequest is the login endpoint request body.

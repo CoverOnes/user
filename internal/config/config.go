@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"regexp"
@@ -18,6 +19,9 @@ var schemaNameRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 // minEventHMACSecretLen is the minimum accepted length for EVENT_HMAC_SECRET.
 // A 32-byte secret matches the SHA-256 block/output size and resists brute force.
 const minEventHMACSecretLen = 32
+
+// piiKeyBytes is the required decoded length of USER_PII_ENCRYPTION_KEY (AES-256).
+const piiKeyBytes = 32
 
 // Config holds all configuration for the user service.
 type Config struct {
@@ -62,6 +66,20 @@ type Config struct {
 	// Refresh token TTL in hours (default 24)
 	RefreshTokenTTLHours int `mapstructure:"refresh_token_ttl_hours"`
 
+	// PIIEncryptionKey is the base64-encoded AES-256 key (must decode to exactly
+	// 32 bytes) used to encrypt HIGH-sensitivity PII columns (legal_name_enc,
+	// national_id_enc). Sourced from USER_PII_ENCRYPTION_KEY. Required outside
+	// development (validateCore fail-fast); in dev a documented dev-default key is
+	// required so the encrypt path always runs (never plaintext, even in dev).
+	PIIEncryptionKey string `mapstructure:"pii_encryption_key"`
+
+	// SMTP settings for the verification mailer (USER_SMTP_*).
+	SMTPHost     string `mapstructure:"smtp_host"`
+	SMTPPort     int    `mapstructure:"smtp_port"`
+	SMTPUsername string `mapstructure:"smtp_username"`
+	SMTPPassword string `mapstructure:"smtp_password"`
+	SMTPFrom     string `mapstructure:"smtp_from"`
+
 	// Log level: DEBUG, INFO, WARN, ERROR
 	LogLevel string `mapstructure:"log_level"`
 
@@ -97,6 +115,12 @@ func Load() (*Config, error) {
 		"jwt_private_key":         "USER_JWT_PRIVATE_KEY",
 		"jwt_private_key_pem":     "USER_JWT_PRIVATE_KEY_PEM",
 		"event_hmac_secret":       "EVENT_HMAC_SECRET",
+		"pii_encryption_key":      "USER_PII_ENCRYPTION_KEY",
+		"smtp_host":               "USER_SMTP_HOST",
+		"smtp_port":               "USER_SMTP_PORT",
+		"smtp_username":           "USER_SMTP_USERNAME",
+		"smtp_password":           "USER_SMTP_PASSWORD",
+		"smtp_from":               "USER_SMTP_FROM",
 		"access_token_ttl_sec":    "USER_ACCESS_TOKEN_TTL_SEC",
 		"refresh_token_ttl_hours": "USER_REFRESH_TOKEN_TTL_HOURS",
 		"log_level":               "USER_LOG_LEVEL",
@@ -116,6 +140,7 @@ func Load() (*Config, error) {
 	v.SetDefault("env", "development")
 	v.SetDefault("db_max_conns", 10)
 	v.SetDefault("db_min_conns", 2)
+	v.SetDefault("smtp_port", 587)
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
@@ -179,6 +204,43 @@ func (c *Config) validateCore() []string {
 		} else if len(c.EventHMACSecret) < minEventHMACSecretLen {
 			errs = append(errs, "EVENT_HMAC_SECRET must be at least 32 characters")
 		}
+	}
+
+	errs = append(errs, c.validatePIIAndSMTP()...)
+
+	return errs
+}
+
+// validatePIIAndSMTP fail-fasts on the PII encryption key and SMTP settings.
+//
+// PII key (mirrors kyc config.go:151): the legal_name / national_id columns are
+// always encrypted — there is NO plaintext fallback, even in dev — so a usable
+// key is required in EVERY environment. Outside dev it must additionally decode to
+// exactly 32 bytes. In dev a documented dev-default key (see .env.example) keeps
+// the encrypt path exercised locally.
+//
+// SMTP: non-dev requires USER_SMTP_HOST so verification mail can actually be sent.
+func (c *Config) validatePIIAndSMTP() []string {
+	var errs []string
+
+	if c.PIIEncryptionKey == "" {
+		errs = append(errs,
+			"USER_PII_ENCRYPTION_KEY is required when USER_ENV != development "+
+				"(and a documented dev-default key is required in development): "+
+				"legal_name/national_id are encrypted with no plaintext fallback "+
+				"(generate with: openssl rand -base64 32)")
+	} else if !c.IsDev() {
+		// Non-dev: the key MUST decode to exactly 32 bytes (AES-256). In dev we skip
+		// the strict length check so a short documented dev key still boots.
+		key, decErr := base64.StdEncoding.DecodeString(c.PIIEncryptionKey)
+		if decErr != nil || len(key) != piiKeyBytes {
+			errs = append(errs,
+				fmt.Sprintf("USER_PII_ENCRYPTION_KEY must be base64 that decodes to exactly %d bytes", piiKeyBytes))
+		}
+	}
+
+	if !c.IsDev() && c.SMTPHost == "" {
+		errs = append(errs, "USER_SMTP_HOST is required when USER_ENV != development")
 	}
 
 	return errs

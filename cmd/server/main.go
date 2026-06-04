@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,8 +16,10 @@ import (
 
 	"github.com/CoverOnes/user/internal/auth/jwt"
 	"github.com/CoverOnes/user/internal/config"
+	"github.com/CoverOnes/user/internal/crypto/pii"
 	"github.com/CoverOnes/user/internal/events"
 	"github.com/CoverOnes/user/internal/handler"
+	"github.com/CoverOnes/user/internal/mailer"
 	"github.com/CoverOnes/user/internal/platform/logger"
 	"github.com/CoverOnes/user/internal/platform/middleware"
 	"github.com/CoverOnes/user/internal/service"
@@ -41,6 +44,24 @@ func main() {
 		slog.Error("server exited with error", "err", err)
 		os.Exit(1)
 	}
+}
+
+// newPIIEncryptor decodes the base64 PII key and builds an AES-256-GCM encryptor.
+// config.validate() already fail-fasts on a missing / wrong-length key outside
+// dev; this re-decodes to construct the cipher and surfaces any residual error.
+func newPIIEncryptor(keyB64 string) (*pii.Encryptor, error) {
+	key, err := base64.StdEncoding.DecodeString(keyB64)
+	if err != nil {
+		// Do not echo the key material in the error.
+		return nil, fmt.Errorf("decode USER_PII_ENCRYPTION_KEY base64: %w", err)
+	}
+
+	enc, err := pii.NewEncryptor(key)
+	if err != nil {
+		return nil, fmt.Errorf("build pii encryptor: %w", err)
+	}
+
+	return enc, nil
 }
 
 // runHealthCheck issues a GET to the local /healthz endpoint.
@@ -141,7 +162,37 @@ func run() error {
 	userStore := postgres.NewUserStore(pool)
 	companyStore := postgres.NewCompanyStore(pool)
 	rtStore := postgres.NewRefreshTokenStore(pool)
+	verificationStore := postgres.NewVerificationStore(pool)
 	txMgr := postgres.NewTxManager(pool)
+
+	// PII encryptor — config.validate() guarantees a usable key (32 bytes outside
+	// dev; a documented dev-default in dev). Decode + construct here so register
+	// always has the encrypt path.
+	encryptor, err := newPIIEncryptor(cfg.PIIEncryptionKey)
+	if err != nil {
+		return fmt.Errorf("init pii encryptor: %w", err)
+	}
+
+	// Verification mailer (SMTP). In dev without USER_SMTP_HOST the mailer is left
+	// nil — register still returns 201, it just skips the email (validate() requires
+	// the host outside dev).
+	var verificationMailer service.Mailer
+	if cfg.SMTPHost != "" {
+		m, mailerErr := mailer.NewSMTPMailer(&mailer.Config{
+			Host:     cfg.SMTPHost,
+			Port:     cfg.SMTPPort,
+			Username: cfg.SMTPUsername,
+			Password: cfg.SMTPPassword,
+			From:     cfg.SMTPFrom,
+		})
+		if mailerErr != nil {
+			return fmt.Errorf("init smtp mailer: %w", mailerErr)
+		}
+
+		verificationMailer = m
+	} else {
+		slog.Warn("USER_SMTP_HOST not set; verification emails will be skipped (dev only)")
+	}
 
 	// Service layer.
 	// Per-email login rate limit (credential-stuffing defense, P1): 5 attempts per
@@ -149,13 +200,18 @@ func run() error {
 	// Fails safe (allows) when Redis is unavailable.
 	emailLoginLimiter := middleware.NewEmailLoginLimiter(redisClient, 5, 15*time.Minute)
 
+	// Per-email resend-verification limit: 3 per hour (no enumeration; throttled
+	// callers are silently dropped). Fails safe (allows) when Redis is unavailable.
+	resendLimiter := middleware.NewEmailVerificationLimiter(redisClient, 3, time.Hour)
+
 	authSvc := service.NewAuthService(
 		userStore, companyStore, rtStore,
 		txMgr,
 		signer,
 		accessTTL,
 		cfg.RefreshTokenTTLHours,
-	).WithLoginRateLimiter(emailLoginLimiter)
+	).WithLoginRateLimiter(emailLoginLimiter).
+		WithVerification(verificationStore, encryptor, verificationMailer, resendLimiter)
 	profileSvc := service.NewProfileService(userStore)
 
 	// Redis event consumer — subscribes to kyc.tier_changed to keep users.kyc_tier fresh.

@@ -70,12 +70,45 @@ func RequireTier(minTier int16) gin.HandlerFunc {
 
 		if claims.KYCTier < minTier {
 			c.Abort()
-			httpx.ErrCode(c, http.StatusForbidden, "KYC_TIER_REQUIRED", "kyc verification required",
+			httpx.ErrCode(
+				c, http.StatusForbidden, "KYC_TIER_REQUIRED", "kyc verification required",
 				gin.H{
 					"requiredTier": minTier,
 					"currentTier":  claims.KYCTier,
 				},
 			)
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// RequireEmailVerified returns a middleware that rejects requests whose verified
+// JWT carries email_verified=false with 403 EMAIL_NOT_VERIFIED. It MUST be
+// chained AFTER Auth (it reads the claims Auth injected). Wire it on future
+// user-service write routes that require a verified email; the existing
+// PUT /v1/me/profile is intentionally NOT guarded (it stays usable while
+// unverified). All error responses route through httpx.ErrCode (F8).
+func RequireEmailVerified() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		raw, ok := c.Get(ctxKeyClaims)
+		if !ok {
+			c.Abort()
+			httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+			return
+		}
+
+		claims, ok := raw.(*jwt.Claims)
+		if !ok {
+			c.Abort()
+			httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+			return
+		}
+
+		if !claims.EmailVerified {
+			c.Abort()
+			httpx.ErrCode(c, http.StatusForbidden, "EMAIL_NOT_VERIFIED", "email verification required")
 			return
 		}
 

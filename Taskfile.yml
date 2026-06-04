@@ -94,3 +94,16 @@ tasks:
           WHERE expires_at < now()
              OR (used_at IS NOT NULL AND used_at < now() - INTERVAL '7 days');
         "
+
+  "db:gc:verification-tokens":
+    desc: |
+      Retention GC for email_verification_tokens (backend-security-design §1.3).
+      Deletes rows whose expires_at is older than 7 days, leaving a short forensic
+      grace window past expiry. Run periodically via cron or manually.
+      Requires USER_POSTGRES_DSN to be set in the environment.
+    cmds:
+      - |
+        psql "$USER_POSTGRES_DSN" -v ON_ERROR_STOP=1 -c "
+          DELETE FROM email_verification_tokens
+          WHERE expires_at < now() - INTERVAL '7 days';
+        "

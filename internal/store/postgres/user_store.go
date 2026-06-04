@@ -22,21 +22,30 @@ func NewUserStore(pool *pgxpool.Pool) *UserStore {
 	return &UserStore{pool: pool}
 }
 
-// Create inserts a new user row.
-func (s *UserStore) Create(ctx context.Context, u *domain.User) error {
-	q := `
+// userInsertSQL is the shared INSERT used by both the pool-backed UserStore and
+// the transactional txUserStore so the column list stays in lockstep.
+const userInsertSQL = `
 	INSERT INTO users
 		(id, email, password_hash, display_name, avatar_url, account_type,
-		 kyc_tier, company_id, status, token_version, created_at, updated_at)
+		 kyc_tier, company_id, status, email_verified,
+		 legal_name_enc, national_id_enc, token_version, created_at, updated_at)
 	VALUES
-		($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`
 
+// userSelectColumns is the shared SELECT column list consumed by scanUser.
+const userSelectColumns = `
+		id, email, password_hash, display_name, avatar_url, account_type,
+		kyc_tier, company_id, status, email_verified,
+		legal_name_enc, national_id_enc, token_version, deleted_at, created_at, updated_at`
+
+// Create inserts a new user row.
+func (s *UserStore) Create(ctx context.Context, u *domain.User) error {
 	_, err := s.pool.Exec(
-		ctx, q,
+		ctx, userInsertSQL,
 		u.ID, u.Email, u.PasswordHash, u.DisplayName, u.AvatarURL,
-		u.AccountType, u.KYCTier, u.CompanyID, u.Status, u.TokenVersion,
-		u.CreatedAt, u.UpdatedAt,
+		u.AccountType, u.KYCTier, u.CompanyID, u.Status, u.EmailVerified,
+		u.LegalNameEnc, u.NationalIDEnc, u.TokenVersion, u.CreatedAt, u.UpdatedAt,
 	)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -52,24 +61,14 @@ func (s *UserStore) Create(ctx context.Context, u *domain.User) error {
 
 // GetByID fetches a live (non-deleted) user by PK.
 func (s *UserStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
-	q := `
-	SELECT id, email, password_hash, display_name, avatar_url, account_type,
-	       kyc_tier, company_id, status, token_version, deleted_at, created_at, updated_at
-	FROM users
-	WHERE id = $1 AND deleted_at IS NULL
-	`
+	q := `SELECT ` + userSelectColumns + ` FROM users WHERE id = $1 AND deleted_at IS NULL`
 
 	return scanUser(s.pool.QueryRow(ctx, q, id))
 }
 
 // GetByEmail fetches a live user by email (case-insensitive via citext).
 func (s *UserStore) GetByEmail(ctx context.Context, email string) (*domain.User, error) {
-	q := `
-	SELECT id, email, password_hash, display_name, avatar_url, account_type,
-	       kyc_tier, company_id, status, token_version, deleted_at, created_at, updated_at
-	FROM users
-	WHERE email = $1 AND deleted_at IS NULL
-	`
+	q := `SELECT ` + userSelectColumns + ` FROM users WHERE email = $1 AND deleted_at IS NULL`
 
 	return scanUser(s.pool.QueryRow(ctx, q, email))
 }
@@ -138,11 +137,34 @@ func (s *UserStore) BumpTokenVersion(ctx context.Context, id uuid.UUID) (int, er
 	return newVersion, nil
 }
 
+// SetEmailVerified flips users.email_verified to true. Idempotent — re-running
+// on an already-verified row succeeds (row count 1); ErrNotFound only when no
+// live row matches.
+func (s *UserStore) SetEmailVerified(ctx context.Context, id uuid.UUID) error {
+	q := `
+	UPDATE users
+	SET email_verified = true, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL
+	`
+
+	tag, err := s.pool.Exec(ctx, q, id)
+	if err != nil {
+		return fmt.Errorf("set email_verified: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
 func scanUser(row pgx.Row) (*domain.User, error) {
 	var u domain.User
 	err := row.Scan(
 		&u.ID, &u.Email, &u.PasswordHash, &u.DisplayName, &u.AvatarURL,
-		&u.AccountType, &u.KYCTier, &u.CompanyID, &u.Status, &u.TokenVersion,
+		&u.AccountType, &u.KYCTier, &u.CompanyID, &u.Status, &u.EmailVerified,
+		&u.LegalNameEnc, &u.NationalIDEnc, &u.TokenVersion,
 		&u.DeletedAt, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if err != nil {

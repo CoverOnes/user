@@ -151,6 +151,8 @@ func TestRevokeAll_Integration_RefreshFailsAfterRevoke(t *testing.T) {
 		Password:    "SuperSecurePassword999",
 		DisplayName: "Revoke Integration",
 		AccountType: "PERSONAL",
+		LegalName:   "Revoke Integration",
+		NationalID:  "A123456789", // checksum-valid TW national ID fixture
 	})
 	require.NoError(t, err)
 

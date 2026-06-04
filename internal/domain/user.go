@@ -19,10 +19,19 @@ type User struct {
 	KYCTier      int16      `json:"kycTier"`
 	CompanyID    *uuid.UUID `json:"companyId"`
 	Status       string     `json:"status"`
-	TokenVersion int        `json:"-"`
-	DeletedAt    *time.Time `json:"deletedAt,omitempty"`
-	CreatedAt    time.Time  `json:"createdAt"`
-	UpdatedAt    time.Time  `json:"updatedAt"`
+	// EmailVerified reflects users.email_verified — whether the account has
+	// completed email verification. Lifted by POST /v1/auth/verify-email.
+	EmailVerified bool `json:"emailVerified"`
+	// LegalNameEnc / NationalIDEnc hold AES-256-GCM ciphertext of the user's
+	// HIGH-sensitivity PII. They are JSON-excluded so the plaintext (and even the
+	// ciphertext) never serializes into an API response. NationalIDEnc is nil for
+	// COMPANY accounts.
+	LegalNameEnc  []byte     `json:"-"`
+	NationalIDEnc []byte     `json:"-"`
+	TokenVersion  int        `json:"-"`
+	DeletedAt     *time.Time `json:"deletedAt,omitempty"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
 }
 
 // AccountType constants.
@@ -33,8 +42,9 @@ const (
 
 // UserStatus constants.
 const (
-	UserStatusActive    = "ACTIVE"
-	UserStatusSuspended = "SUSPENDED"
+	UserStatusActive              = "ACTIVE"
+	UserStatusSuspended           = "SUSPENDED"
+	UserStatusPendingVerification = "PENDING_VERIFICATION"
 )
 
 // ValidAccountTypes is the allowlist for account types.
@@ -45,8 +55,9 @@ var ValidAccountTypes = map[string]bool{
 
 // ValidUserStatuses is the allowlist for user statuses.
 var ValidUserStatuses = map[string]bool{
-	UserStatusActive:    true,
-	UserStatusSuspended: true,
+	UserStatusActive:              true,
+	UserStatusSuspended:           true,
+	UserStatusPendingVerification: true,
 }
 
 // RefreshToken represents a stored refresh token record.

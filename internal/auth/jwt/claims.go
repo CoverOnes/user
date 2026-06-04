@@ -24,4 +24,11 @@ type Claims struct {
 
 	// TokenVersion allows global revocation of all tokens when bumped.
 	TokenVersion int `json:"tokenVersion"`
+
+	// EmailVerified mirrors users.email_verified at token-issue time. Additive and
+	// backward-safe: tokens issued before this field existed simply decode it as
+	// false (the zero value). Downstream RequireEmailVerified gates on it; because
+	// Refresh reloads fresh user data, a just-verified user's NEXT access token
+	// carries email_verified=true within the access-token TTL.
+	EmailVerified bool `json:"email_verified"`
 }

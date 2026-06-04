@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/CoverOnes/user/internal/domain"
@@ -21,11 +22,12 @@ type fakeUserStore struct {
 	byEmail map[string]*domain.User
 
 	// error-injection hooks (nil = no error).
-	createErr        error
-	getByIDErr       error
-	getByEmailErr    error
-	updateProfileErr error
-	bumpVersionErr   error
+	createErr           error
+	getByIDErr          error
+	getByEmailErr       error
+	updateProfileErr    error
+	bumpVersionErr      error
+	setEmailVerifiedErr error
 }
 
 func newFakeUserStore() *fakeUserStore {
@@ -112,6 +114,19 @@ func (f *fakeUserStore) BumpTokenVersion(_ context.Context, id uuid.UUID) (int, 
 	u.TokenVersion++
 
 	return u.TokenVersion, nil
+}
+
+func (f *fakeUserStore) SetEmailVerified(_ context.Context, id uuid.UUID) error {
+	if f.setEmailVerifiedErr != nil {
+		return f.setEmailVerifiedErr
+	}
+	u, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	u.EmailVerified = true
+
+	return nil
 }
 
 // --- fakeCompanyStore ---
@@ -209,4 +224,120 @@ func (f *fakeRefreshTokenStore) familyRevoked(familyID uuid.UUID) bool {
 	}
 
 	return false
+}
+
+// --- fakeVerificationStore ---
+
+// fakeVerificationStore is an in-memory EmailVerificationTokenStore keyed by the
+// hex-encoded token hash, with per-method error injection.
+type fakeVerificationStore struct {
+	byHash map[string]*domain.EmailVerificationToken
+
+	createErr        error
+	getByHashErr     error
+	markConsumedErr  error
+	invalidateErr    error
+	invalidatedUsers []uuid.UUID
+}
+
+func newFakeVerificationStore() *fakeVerificationStore {
+	return &fakeVerificationStore{byHash: make(map[string]*domain.EmailVerificationToken)}
+}
+
+func (f *fakeVerificationStore) key(hash []byte) string { return string(hash) }
+
+func (f *fakeVerificationStore) Create(_ context.Context, t *domain.EmailVerificationToken) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
+	cp := *t
+	f.byHash[f.key(t.TokenHash)] = &cp
+
+	return nil
+}
+
+func (f *fakeVerificationStore) GetByHash(_ context.Context, tokenHash []byte) (*domain.EmailVerificationToken, error) {
+	if f.getByHashErr != nil {
+		return nil, f.getByHashErr
+	}
+	t, ok := f.byHash[f.key(tokenHash)]
+	if !ok {
+		return nil, domain.ErrInvalidVerificationToken
+	}
+
+	return t, nil
+}
+
+func (f *fakeVerificationStore) MarkConsumed(_ context.Context, id uuid.UUID, now time.Time) error {
+	if f.markConsumedErr != nil {
+		return f.markConsumedErr
+	}
+	for _, t := range f.byHash {
+		if t.ID == id {
+			if t.ConsumedAt != nil {
+				// Already consumed → single-use guard (no oracle).
+				return domain.ErrInvalidVerificationToken
+			}
+			c := now
+			t.ConsumedAt = &c
+
+			return nil
+		}
+	}
+
+	return domain.ErrInvalidVerificationToken
+}
+
+func (f *fakeVerificationStore) InvalidateForUser(_ context.Context, userID uuid.UUID, now time.Time) error {
+	f.invalidatedUsers = append(f.invalidatedUsers, userID)
+	if f.invalidateErr != nil {
+		return f.invalidateErr
+	}
+	for _, t := range f.byHash {
+		if t.UserID == userID && t.ConsumedAt == nil {
+			c := now
+			t.ConsumedAt = &c
+		}
+	}
+
+	return nil
+}
+
+// --- spyMailer ---
+
+// spyMailer records SendVerification calls so tests can assert send count +
+// recipient without touching SMTP.
+type spyMailer struct {
+	sendErr    error
+	sentTo     []string
+	sentTokens []string
+}
+
+func (m *spyMailer) SendVerification(_ context.Context, to, token string) error {
+	m.sentTo = append(m.sentTo, to)
+	m.sentTokens = append(m.sentTokens, token)
+
+	return m.sendErr
+}
+
+func (m *spyMailer) sendCount() int { return len(m.sentTo) }
+
+// --- noopEncryptor ---
+
+// noopEncryptor is a deterministic in-memory Encryptor for service tests: it
+// prefixes the plaintext so round-trips are verifiable without real AES.
+type noopEncryptor struct {
+	encryptErr error
+}
+
+func (e *noopEncryptor) Encrypt(plaintext string) ([]byte, error) {
+	if e.encryptErr != nil {
+		return nil, e.encryptErr
+	}
+
+	return append([]byte("enc:"), []byte(plaintext)...), nil
+}
+
+func (e *noopEncryptor) Decrypt(data []byte) (string, error) {
+	return strings.TrimPrefix(string(data), "enc:"), nil
 }

@@ -17,6 +17,13 @@ var (
 	ErrUnauthorized        = errors.New("unauthorized")
 	ErrCompanyNameRequired = errors.New("company name required for COMPANY account type")
 	ErrCompanyNameTooLong  = errors.New("company name must be at most 200 characters")
+	// ErrEmailNotVerified is returned by the RequireEmailVerified middleware when a
+	// verified JWT carries email_verified=false (maps to HTTP 403).
+	ErrEmailNotVerified = errors.New("email not verified")
+	// ErrInvalidVerificationToken is the single generic error for ALL verify-email
+	// failure modes (not-found / expired / already-consumed). One code, no oracle
+	// that would let a caller distinguish the cases.
+	ErrInvalidVerificationToken = errors.New("invalid verification token")
 	// ErrValidation is returned for input validation failures (maps to HTTP 400).
 	// Use ErrInvalidCredentials only for auth-specific failures (maps to HTTP 401).
 	ErrValidation = errors.New("validation error")

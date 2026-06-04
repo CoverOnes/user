@@ -75,7 +75,7 @@ func kidFromPub(pub ed25519.PublicKey) string {
 }
 
 // Issue signs a new access token for the given user attributes.
-func (s *Signer) Issue(userID, accountType string, kycTier int16, tokenVersion int) (string, error) {
+func (s *Signer) Issue(userID, accountType string, kycTier int16, tokenVersion int, emailVerified bool) (string, error) {
 	now := time.Now().UTC()
 	jti := uuid.New().String()
 
@@ -88,9 +88,10 @@ func (s *Signer) Issue(userID, accountType string, kycTier int16, tokenVersion i
 			ExpiresAt: jwt.NewNumericDate(now.Add(s.ttl)),
 			ID:        jti,
 		},
-		KYCTier:      kycTier,
-		AccountType:  accountType,
-		TokenVersion: tokenVersion,
+		KYCTier:       kycTier,
+		AccountType:   accountType,
+		TokenVersion:  tokenVersion,
+		EmailVerified: emailVerified,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
