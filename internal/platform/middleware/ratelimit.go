@@ -220,6 +220,105 @@ func (l *EmailLimiter) Allow(ctx context.Context, normalizedEmail string) bool {
 	return res >= 0
 }
 
+// SubjectLimiter applies a per-authenticated-user (JWT subject) sliding-window rate
+// limit to the TOTP CODE endpoints (confirm / verify / disable). It is wired as a Gin
+// middleware AFTER the Auth middleware so claims.Subject is available.
+//
+// It FAILS CLOSED — the OPPOSITE of the login EmailLimiter. The login limiter fails
+// OPEN because a Redis outage there would lock every account out (availability wins,
+// and the IP limiter + password check still gate the path). Here the threat is reversed:
+// these endpoints validate a 6-digit TOTP code, so an unbounded code-guessing window is
+// a brute-force oracle (CWE-307). If Redis is unavailable we MUST deny rather than open
+// that window — a brief outage that blocks legitimate MFA actions is strictly preferable
+// to silently removing the only throttle on TOTP brute-force.
+type SubjectLimiter struct {
+	rdb       *redis.Client
+	script    *redis.Script
+	limit     int
+	window    time.Duration
+	keyPrefix string
+}
+
+// NewMFACodeLimiter builds the per-subject fail-CLOSED limiter for the TOTP code
+// endpoints. A nil rdb means Redis is not configured (dev mode) — in that single case
+// the control is disabled (Handler passes through) to keep local development usable;
+// this is the dev-mode contract, NOT a fail-open on a Redis error.
+func NewMFACodeLimiter(rdb *redis.Client, limit int, window time.Duration) *SubjectLimiter {
+	return &SubjectLimiter{
+		rdb:       rdb,
+		script:    redis.NewScript(slidingWindowScript),
+		limit:     limit,
+		window:    window,
+		keyPrefix: "rl:mfa:",
+	}
+}
+
+// Handler returns the Gin middleware. It keys the sliding window on the JWT subject
+// (rl:mfa:<subject>). When Redis errors, it FAILS CLOSED with 429 (see type doc).
+func (l *SubjectLimiter) Handler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if l.rdb == nil {
+			// Dev mode: Redis not configured. Pass through (the endpoint is still behind
+			// Auth). This is the deliberate dev-mode exception, distinct from a Redis error.
+			c.Next()
+			return
+		}
+
+		claims, ok := ClaimsFromCtx(c)
+		if !ok || claims.Subject == "" {
+			// No authenticated subject to key on. Auth middleware should have already
+			// rejected this; fail closed defensively rather than skip the limiter.
+			c.Abort()
+			httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+			return
+		}
+
+		allowed, err := l.allow(c.Request.Context(), claims.Subject)
+		if err != nil {
+			// FAIL CLOSED: a Redis outage must DENY, not open the TOTP brute-force window
+			// (the opposite of the login EmailLimiter's fail-open). Better to block a
+			// legitimate MFA action during an outage than to remove the only throttle.
+			slog.Warn("mfa code limiter redis error; failing CLOSED to deny brute-force window", "err", err)
+			c.Abort()
+			httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
+			return
+		}
+
+		if !allowed {
+			c.Abort()
+			httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// allow evaluates the sliding-window script for the given subject. Unlike the
+// EmailLimiter, a Redis error is propagated (not swallowed) so the caller fails CLOSED.
+func (l *SubjectLimiter) allow(ctx context.Context, subject string) (bool, error) {
+	now := time.Now().UnixNano()
+	windowStart := now - l.window.Nanoseconds()
+	member := fmt.Sprintf("%d-%s", now, randMember())
+	key := l.keyPrefix + subject
+
+	res, err := l.script.Run(
+		ctx,
+		l.rdb,
+		[]string{key},
+		now,
+		windowStart,
+		l.limit,
+		l.window.Nanoseconds(),
+		member,
+	).Int64()
+	if err != nil {
+		return false, err
+	}
+
+	return res >= 0, nil
+}
+
 // NewAccountRateLimiter builds a limiter keyed by email (for login attempts).
 func NewAccountRateLimiter(rdb *redis.Client, limit int, window time.Duration) *RateLimiter {
 	r := rate.Limit(float64(limit) / window.Seconds())

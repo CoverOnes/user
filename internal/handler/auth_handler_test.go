@@ -116,6 +116,60 @@ func (f *fakeUserStore) SetEmailVerified(_ context.Context, id uuid.UUID) error 
 	return domain.ErrNotFound
 }
 
+func (f *fakeUserStore) SetPendingTOTPSecret(_ context.Context, id uuid.UUID, secretEnc []byte) error {
+	for _, u := range f.users {
+		if u.ID == id {
+			u.TOTPSecretEnc = secretEnc
+
+			return nil
+		}
+	}
+
+	return domain.ErrNotFound
+}
+
+func (f *fakeUserStore) EnableMFA(_ context.Context, id uuid.UUID, backupCodesEnc []byte, enrolledAt time.Time) error {
+	for _, u := range f.users {
+		if u.ID == id {
+			u.MFAEnabled = true
+			u.MFABackupCodesEnc = backupCodesEnc
+			u.MFAEnrolledAt = &enrolledAt
+
+			return nil
+		}
+	}
+
+	return domain.ErrNotFound
+}
+
+func (f *fakeUserStore) DisableMFA(_ context.Context, id uuid.UUID) error {
+	for _, u := range f.users {
+		if u.ID != id {
+			continue
+		}
+		u.MFAEnabled = false
+		u.TOTPSecretEnc = nil
+		u.MFABackupCodesEnc = nil
+		u.MFAEnrolledAt = nil
+
+		return nil
+	}
+
+	return domain.ErrNotFound
+}
+
+func (f *fakeUserStore) SetMFABackupCodes(_ context.Context, id uuid.UUID, backupCodesEnc []byte) error {
+	for _, u := range f.users {
+		if u.ID == id {
+			u.MFABackupCodesEnc = backupCodesEnc
+
+			return nil
+		}
+	}
+
+	return domain.ErrNotFound
+}
+
 type fakeCompanyStore struct{}
 
 func (f *fakeCompanyStore) Create(_ context.Context, _ *domain.Company) error { return nil }

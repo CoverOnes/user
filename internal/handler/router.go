@@ -18,6 +18,7 @@ import (
 type RouterConfig struct {
 	Auth    *service.AuthService
 	Profile *service.ProfileService
+	MFA     *service.MFAService
 	Signer  *jwt.Signer
 	Pool    *pgxpool.Pool
 	Redis   *redis.Client // may be nil in dev
@@ -78,6 +79,31 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// Session management.
 	sessH := NewSessionHandler(cfg.Auth)
 	me.POST("/sessions/revoke-all", sessH.RevokeAll)
+
+	// TOTP 2FA primitives (Increment 3). Protected by the same Auth middleware as
+	// the rest of /v1/me. NOT wired into login this wave — enroll/confirm/verify/
+	// disable only manage the user's own MFA state. Registered only when the MFA
+	// service is wired (it always is in main.go; the nil-guard keeps tests that build
+	// a minimal router from panicking).
+	if cfg.MFA != nil {
+		mfaH := NewMFAHandler(cfg.MFA)
+		totp := me.Group("/mfa/totp")
+
+		// Per-authenticated-user (JWT subject) brute-force limiter on the CODE endpoints
+		// (confirm / verify / disable). Budget 5 attempts/min/user keyed rl:mfa:<subject>.
+		// It FAILS CLOSED on a Redis outage — unlike the login limiter (which fails open
+		// for availability), an unbounded TOTP-code-guessing window is a brute-force
+		// oracle (CWE-307), so a Redis error must DENY rather than open it. Enroll is
+		// deliberately NOT limited here: it takes no code, so it is not a guessing surface.
+		mfaCodeRL := middleware.NewMFACodeLimiter(cfg.Redis, 5, time.Minute)
+
+		totp.POST("/enroll", mfaH.Enroll)
+		totp.POST("/confirm", mfaCodeRL.Handler(), mfaH.Confirm)
+		totp.POST("/verify", mfaCodeRL.Handler(), mfaH.Verify)
+		totp.POST("/disable", mfaCodeRL.Handler(), mfaH.Disable)
+		// DELETE alias for disable (same {code}-verified semantics + same code limiter).
+		totp.DELETE("", mfaCodeRL.Handler(), mfaH.Disable)
+	}
 
 	return r
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/CoverOnes/user/internal/domain"
 	"github.com/CoverOnes/user/internal/store"
@@ -173,6 +174,88 @@ func (s *txUserStore) SetEmailVerified(ctx context.Context, id uuid.UUID) error 
 	tag, err := s.tx.Exec(ctx, q, id)
 	if err != nil {
 		return fmt.Errorf("set email_verified (tx): %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
+func (s *txUserStore) SetPendingTOTPSecret(ctx context.Context, id uuid.UUID, secretEnc []byte) error {
+	q := `UPDATE users SET totp_secret_enc = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`
+
+	tag, err := s.tx.Exec(ctx, q, id, secretEnc)
+	if err != nil {
+		return fmt.Errorf("set pending totp secret (tx): %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
+// EnableMFA mirrors UserStore.EnableMFA: an ATOMIC + CONDITIONAL (mfa_enabled = false)
+// write that closes the TOCTOU window (CWE-367). The CTE separates not-found from
+// already-enabled so a second concurrent Confirm gets ErrMFAAlreadyEnabled rather than
+// silently overwriting the first backup-code set. See user_store.go for the full rationale.
+func (s *txUserStore) EnableMFA(ctx context.Context, id uuid.UUID, backupCodesEnc []byte, enrolledAt time.Time) error {
+	q := `
+	WITH target AS (
+		SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL
+	), upd AS (
+		UPDATE users
+		SET mfa_enabled = true, mfa_backup_codes_enc = $2, mfa_enrolled_at = $3, updated_at = now()
+		WHERE id = $1 AND deleted_at IS NULL AND mfa_enabled = false
+		RETURNING id
+	)
+	SELECT
+		(SELECT count(*) FROM target) AS existed,
+		(SELECT count(*) FROM upd)    AS updated`
+
+	var existed, updated int
+	if err := s.tx.QueryRow(ctx, q, id, backupCodesEnc, enrolledAt).Scan(&existed, &updated); err != nil {
+		return fmt.Errorf("enable mfa (tx): %w", err)
+	}
+
+	if existed == 0 {
+		return domain.ErrNotFound
+	}
+	if updated == 0 {
+		return domain.ErrMFAAlreadyEnabled
+	}
+
+	return nil
+}
+
+func (s *txUserStore) DisableMFA(ctx context.Context, id uuid.UUID) error {
+	q := `
+	UPDATE users
+	SET mfa_enabled = false, totp_secret_enc = NULL, mfa_backup_codes_enc = NULL,
+	    mfa_enrolled_at = NULL, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL`
+
+	tag, err := s.tx.Exec(ctx, q, id)
+	if err != nil {
+		return fmt.Errorf("disable mfa (tx): %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
+func (s *txUserStore) SetMFABackupCodes(ctx context.Context, id uuid.UUID, backupCodesEnc []byte) error {
+	q := `UPDATE users SET mfa_backup_codes_enc = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`
+
+	tag, err := s.tx.Exec(ctx, q, id, backupCodesEnc)
+	if err != nil {
+		return fmt.Errorf("set mfa backup codes (tx): %w", err)
 	}
 
 	if tag.RowsAffected() == 0 {

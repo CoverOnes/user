@@ -27,4 +27,17 @@ var (
 	// ErrValidation is returned for input validation failures (maps to HTTP 400).
 	// Use ErrInvalidCredentials only for auth-specific failures (maps to HTTP 401).
 	ErrValidation = errors.New("validation error")
+
+	// ErrMFANotEnrolled is returned when confirm/verify/disable is called but the
+	// user has no pending or active TOTP secret (maps to HTTP 400/409 as appropriate).
+	ErrMFANotEnrolled = errors.New("mfa not enrolled")
+
+	// ErrMFAAlreadyEnabled is returned when enroll is called for a user whose MFA is
+	// already enabled (re-enrolling must go through disable first; maps to HTTP 409).
+	ErrMFAAlreadyEnabled = errors.New("mfa already enabled")
+
+	// ErrInvalidTOTPCode is the single generic error for ALL TOTP confirm/verify/
+	// disable failures (wrong code / expired window). One code, no oracle that would
+	// let a caller distinguish the cases (maps to HTTP 400).
+	ErrInvalidTOTPCode = errors.New("invalid totp code")
 )
