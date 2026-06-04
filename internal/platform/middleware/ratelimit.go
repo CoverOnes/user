@@ -143,15 +143,17 @@ func NewIPRateLimiter(rdb *redis.Client, limit int, window time.Duration) *RateL
 	}
 }
 
-// EmailLoginLimiter applies a per-normalized-email sliding-window rate limit for
-// login attempts (credential-stuffing defense). Unlike the IP-keyed middleware
-// limiter it is invoked from the service layer once the email has been parsed, so
-// an attacker spraying one email across many IPs is still throttled.
+// EmailLimiter applies a per-normalized-email sliding-window rate limit. It serves
+// both the login path (credential-stuffing defense) and the resend-verification
+// path; the two use distinct Redis key namespaces (set by their constructors).
+// Unlike the IP-keyed middleware limiter it is invoked from the service layer once
+// the email has been parsed, so an attacker spraying one email across many IPs is
+// still throttled.
 //
 // It FAILS SAFE: when Redis is unavailable or errors, Allow returns true so a Redis
-// outage cannot lock every account out of login (availability > strict throttling
-// for this control; the IP limiter and password check remain in force).
-type EmailLoginLimiter struct {
+// outage cannot lock every account out (availability > strict throttling for this
+// control; the IP limiter and password check remain in force).
+type EmailLimiter struct {
 	rdb       *redis.Client
 	script    *redis.Script
 	limit     int
@@ -161,8 +163,8 @@ type EmailLoginLimiter struct {
 
 // NewEmailLoginLimiter builds a per-email login limiter. A nil rdb disables the
 // control (Allow always returns true) — same dev-mode contract as the middleware.
-func NewEmailLoginLimiter(rdb *redis.Client, limit int, window time.Duration) *EmailLoginLimiter {
-	return &EmailLoginLimiter{
+func NewEmailLoginLimiter(rdb *redis.Client, limit int, window time.Duration) *EmailLimiter {
+	return &EmailLimiter{
 		rdb:       rdb,
 		script:    redis.NewScript(slidingWindowScript),
 		limit:     limit,
@@ -176,8 +178,8 @@ func NewEmailLoginLimiter(rdb *redis.Client, limit int, window time.Duration) *E
 // uses a distinct Redis key namespace so resend throttling and login throttling are
 // independent. A nil rdb disables the control (Allow always returns true) — same
 // dev-mode contract.
-func NewEmailVerificationLimiter(rdb *redis.Client, limit int, window time.Duration) *EmailLoginLimiter {
-	return &EmailLoginLimiter{
+func NewEmailVerificationLimiter(rdb *redis.Client, limit int, window time.Duration) *EmailLimiter {
+	return &EmailLimiter{
 		rdb:       rdb,
 		script:    redis.NewScript(slidingWindowScript),
 		limit:     limit,
@@ -188,7 +190,7 @@ func NewEmailVerificationLimiter(rdb *redis.Client, limit int, window time.Durat
 
 // Allow reports whether an attempt for the given normalized email is admitted.
 // On a nil Redis client or any Redis error it returns true (fail-safe).
-func (l *EmailLoginLimiter) Allow(ctx context.Context, normalizedEmail string) bool {
+func (l *EmailLimiter) Allow(ctx context.Context, normalizedEmail string) bool {
 	if l.rdb == nil {
 		return true
 	}

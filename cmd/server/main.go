@@ -265,6 +265,10 @@ func run() error {
 		return fmt.Errorf("server shutdown: %w", shutdownErr)
 	}
 
+	// Drain any in-flight detached verification-email sends before exiting so a
+	// shutdown does not silently drop a send dispatched just before SIGTERM.
+	authSvc.WaitForPendingSends()
+
 	slog.Info("server stopped")
 
 	return nil

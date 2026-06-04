@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -88,6 +89,14 @@ type AuthService struct {
 	signer        *jwt.Signer
 	accessTTL     time.Duration
 	refreshTTLH   int
+
+	// sendWG tracks in-flight detached verification-email goroutines. The
+	// post-commit (Register) and resend sends run on a background context so all
+	// responses return in constant DB-only time — synchronous SMTP would make
+	// "exists+unverified" measurably slower than "unknown/verified" (timing
+	// enumeration oracle, FIX 2). WaitForPendingSends lets a graceful shutdown —
+	// and tests — block until every dispatched send has finished.
+	sendWG sync.WaitGroup
 }
 
 // NewAuthService creates an AuthService with injected dependencies.
@@ -163,10 +172,11 @@ type RegisterOutput struct {
 // Register creates a new PENDING_VERIFICATION user (real-name + email-verify
 // flow, Increment 1). In one DB transaction it inserts the user (with encrypted
 // legal name and, for PERSONAL, encrypted national ID), the company row (COMPANY),
-// and a HASHED verification token. AFTER the tx commits it sends the verification
-// email; an SMTP failure is logged (slog.Warn) and the call still returns the user
-// — the account exists and the user can resend. The user is NEVER rolled back on
-// email failure.
+// and a HASHED verification token. AFTER the tx commits it dispatches the
+// verification email on a DETACHED background goroutine; an SMTP failure is logged
+// (slog.Warn) and the call still returns the user — the account exists and the
+// user can resend. The user is NEVER rolled back on email failure, and the send
+// runs off the request path so the response time carries no SMTP-latency signal.
 //
 //nolint:gocritic // hugeParam: RegisterInput value-copy is intentional; pointer indirection at call sites would obscure ownership semantics
 func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*RegisterOutput, error) {
@@ -251,8 +261,17 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 		return nil, err
 	}
 
-	// AFTER commit: send the verification email. SMTP failure → warn + still 201.
-	s.sendVerificationEmail(ctx, u.Email, rawToken)
+	// AFTER commit: send the verification email on a DETACHED goroutine. The user
+	// is already persisted and committed above, so an SMTP failure cannot roll it
+	// back — Register returns the user (201) regardless. Detaching the send (rather
+	// than blocking) also keeps the response in constant DB-only time, matching the
+	// resend path and removing an SMTP-latency signal (FIX 2). The original request
+	// ctx may be canceled the moment Register returns, so the send uses a background
+	// context bounded by the mailer's own SendTimeout.
+	//
+	//nolint:contextcheck // intentional detach: the send goroutine MUST NOT inherit the
+	// request ctx (it is canceled when the handler returns) — backend-security-design §5.
+	s.dispatchVerificationEmail(u.Email, rawToken)
 
 	return &RegisterOutput{User: u}, nil
 }
@@ -336,8 +355,33 @@ func (s *AuthService) persistRegistration(
 	return nil
 }
 
-// sendVerificationEmail sends the verification email best-effort. A nil mailer or
-// an SMTP error is logged and swallowed — register still returns 201.
+// dispatchVerificationEmail sends the verification email on a DETACHED goroutine
+// so the caller (Register / ResendVerification) returns in constant DB-only time.
+// Blocking on the synchronous SMTP round-trip would make "exists+unverified"
+// responses measurably slower than "unknown/verified" ones — a latency
+// enumeration oracle (FIX 2). A background context is used (the request ctx is
+// canceled the instant the handler returns); the send is bounded by the mailer's
+// own SendTimeout, so it cannot leak a goroutine indefinitely. The in-flight send
+// is tracked on sendWG so graceful shutdown and tests can await completion.
+func (s *AuthService) dispatchVerificationEmail(email, rawToken string) {
+	if s.mailer == nil {
+		return
+	}
+
+	s.sendWG.Add(1)
+
+	go func() {
+		defer s.sendWG.Done()
+
+		// Detached: do NOT inherit the request context (it is canceled when the
+		// handler returns). The mailer bounds the send with its own SendTimeout.
+		s.sendVerificationEmail(context.Background(), email, rawToken)
+	}()
+}
+
+// sendVerificationEmail performs the synchronous best-effort send. A nil mailer or
+// an SMTP error is logged and swallowed — the user is already persisted, so the
+// account exists and the user can resend; we never roll back on email failure.
 func (s *AuthService) sendVerificationEmail(ctx context.Context, email, rawToken string) {
 	if s.mailer == nil {
 		return
@@ -345,8 +389,16 @@ func (s *AuthService) sendVerificationEmail(ctx context.Context, email, rawToken
 
 	if err := s.mailer.SendVerification(ctx, email, rawToken); err != nil {
 		// Do NOT roll back the user; the account is created and can resend.
-		slog.Warn("register: verification email send failed", "err", err)
+		slog.Warn("verification email send failed", "err", err)
 	}
+}
+
+// WaitForPendingSends blocks until all detached verification-email goroutines
+// dispatched so far have completed. It is used by graceful shutdown to avoid
+// dropping in-flight sends, and by tests to await an async send deterministically
+// (no time.Sleep). Safe to call concurrently with new dispatches.
+func (s *AuthService) WaitForPendingSends() {
+	s.sendWG.Wait()
 }
 
 // newCompany builds a Company domain object for the register flow.
@@ -533,7 +585,14 @@ func (s *AuthService) ResendVerification(ctx context.Context, email string) {
 		return
 	}
 
-	s.sendVerificationEmail(ctx, u.Email, rawToken)
+	// Detached send so EVERY resend response returns in constant DB-only time
+	// (FIX 2): a synchronous SMTP round-trip here would make this "exists+unverified"
+	// path measurably slower than the unknown/verified/rate-limited paths above,
+	// which all return without any SMTP call — a latency enumeration oracle.
+	//
+	//nolint:contextcheck // intentional detach: the send goroutine MUST NOT inherit the
+	// request ctx (it is canceled when the handler returns) — backend-security-design §5.
+	s.dispatchVerificationEmail(u.Email, rawToken)
 }
 
 // RefreshInput carries the refresh request.

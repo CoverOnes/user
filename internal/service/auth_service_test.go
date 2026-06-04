@@ -303,6 +303,56 @@ func TestAuthService_Register(t *testing.T) {
 	}
 }
 
+// TestAuthService_Register_VerificationEmailFailureStillPersists is the load-bearing
+// proof of the headline guarantee: a verification-email SMTP failure on the
+// post-commit send MUST NOT roll back the user. It wires a verification-capable
+// service whose mailer ALWAYS errors (spyMailer.sendErr injected) and asserts that
+// Register still returns NoError + a non-nil user AND that the user row is persisted
+// in the store. The send is detached (FIX 2), so we drain it via WaitForPendingSends
+// (no time.Sleep) and then confirm the failing mailer was in fact invoked — proving
+// the error was exercised on the real send path, not silently skipped. If Register
+// ever propagated the mailer error, require.NoError below would fail.
+func TestAuthService_Register_VerificationEmailFailureStillPersists(t *testing.T) {
+	t.Parallel()
+
+	users := newFakeUserStore()
+	verifications := newFakeVerificationStore()
+	mailer := &spyMailer{sendErr: errInjected} // every SendVerification returns this error
+
+	svc := newVerificationService(t, users, verifications, mailer, allowAllLimiter{})
+
+	out, err := svc.Register(context.Background(), service.RegisterInput{
+		Email:       "Persist@Example.com",
+		Password:    validPassword,
+		DisplayName: "Persist",
+		AccountType: domain.AccountTypePersonal,
+		LegalName:   "Persist Wang",
+		NationalID:  validTWNationalID,
+	})
+
+	// The SMTP failure must NOT propagate — Register still succeeds with the user.
+	require.NoError(t, err, "SMTP failure on post-commit send must not fail Register")
+	require.NotNil(t, out)
+	require.NotNil(t, out.User)
+
+	// The user row is persisted (committed before the email send) and queryable by
+	// the normalized email, proving the account exists despite the email failure.
+	persisted, getErr := users.GetByEmail(context.Background(), "persist@example.com")
+	require.NoError(t, getErr, "user must be persisted in the store")
+	require.NotNil(t, persisted)
+	assert.Equal(t, out.User.ID, persisted.ID)
+	assert.Equal(t, domain.UserStatusPendingVerification, persisted.Status)
+	assert.False(t, persisted.EmailVerified)
+
+	// A verification token row was committed alongside the user.
+	assert.Len(t, verifications.byHash, 1, "a verification token must be persisted")
+
+	// Drain the detached send (deterministic, no time.Sleep) and confirm the failing
+	// mailer was actually invoked — the injected error was exercised on the real path.
+	svc.WaitForPendingSends()
+	assert.Equal(t, 1, mailer.sendCount(), "the (failing) verification email must be attempted exactly once")
+}
+
 func TestAuthService_Login(t *testing.T) {
 	t.Parallel()
 
@@ -878,6 +928,10 @@ func TestAuthService_ResendVerification(t *testing.T) {
 		svc := newVerificationService(t, users, verifications, mailer, allowAllLimiter{})
 		svc.ResendVerification(context.Background(), "Resend@Example.com") // mixed case → normalized
 
+		// The send is detached (FIX 2) so resend responses are constant-time; await
+		// it deterministically (no time.Sleep) before asserting on the spy.
+		svc.WaitForPendingSends()
+
 		assert.Equal(t, 1, mailer.sendCount(), "exactly one verification email must be sent")
 		assert.Equal(t, "resend@example.com", mailer.sentTo[0])
 		assert.Contains(t, verifications.invalidatedUsers, u.ID, "prior outstanding tokens must be invalidated first")
@@ -892,6 +946,7 @@ func TestAuthService_ResendVerification(t *testing.T) {
 
 		svc := newVerificationService(t, users, verifications, mailer, allowAllLimiter{})
 		svc.ResendVerification(context.Background(), "ghost@example.com")
+		svc.WaitForPendingSends()
 
 		assert.Equal(t, 0, mailer.sendCount(), "no email for an unknown address")
 	})
@@ -907,6 +962,7 @@ func TestAuthService_ResendVerification(t *testing.T) {
 
 		svc := newVerificationService(t, users, verifications, mailer, allowAllLimiter{})
 		svc.ResendVerification(context.Background(), "done@example.com")
+		svc.WaitForPendingSends()
 
 		assert.Equal(t, 0, mailer.sendCount(), "verified accounts get no resend")
 	})
@@ -922,6 +978,7 @@ func TestAuthService_ResendVerification(t *testing.T) {
 
 		svc := newVerificationService(t, users, verifications, mailer, denyAllLimiter{})
 		svc.ResendVerification(context.Background(), "throttled@example.com")
+		svc.WaitForPendingSends()
 
 		assert.Equal(t, 0, mailer.sendCount(), "throttled caller gets no email")
 	})

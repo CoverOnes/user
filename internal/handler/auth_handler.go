@@ -127,7 +127,7 @@ func (h *AuthHandler) ResendVerification(c *gin.Context) {
 	// the response is identical whether or not anything was sent.
 	h.auth.ResendVerification(c.Request.Context(), req.Email)
 
-	c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"message": resendVerificationMessage}})
+	httpx.Accepted(c, gin.H{"message": resendVerificationMessage})
 }
 
 // LoginRequest is the login endpoint request body.
@@ -250,18 +250,14 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 		return
 	}
 
-	claims, ok := middleware.ClaimsFromCtx(c)
-	if !ok {
+	if _, ok := middleware.ClaimsFromCtx(c); !ok {
 		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
 		return
 	}
 
-	// Run logout in a detached context so DB write is not canceled if the
-	// client disconnects — goroutine uses context.Background() with its own
-	// timeout per backend-security-design §5.
-	// We block here since logout is fast and we want 204 to confirm.
-	_ = claims // subject available if needed for audit
-
+	// Logout runs synchronously on the request context: it is a single fast DB
+	// revoke and we want the 204 to confirm the revoke actually happened. The
+	// revoke is idempotent, so a client disconnect mid-write is harmless.
 	if err := h.auth.Logout(c.Request.Context(), req.RefreshToken); err != nil {
 		// Idempotent: even invalid tokens return 204.
 		slog.Warn("logout: could not revoke token", "err", err)

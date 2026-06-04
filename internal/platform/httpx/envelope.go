@@ -17,6 +17,11 @@ func Created(c *gin.Context, data any) {
 	c.JSON(http.StatusCreated, gin.H{"data": data})
 }
 
+// Accepted sends a 202 JSON response with data envelope.
+func Accepted(c *gin.Context, data any) {
+	c.JSON(http.StatusAccepted, gin.H{"data": data})
+}
+
 // NoContent sends a 204 response with no body.
 func NoContent(c *gin.Context) {
 	c.Status(http.StatusNoContent)
