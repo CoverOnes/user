@@ -226,6 +226,7 @@ func TestLoad_EventHMACSecret_ProdRequired(t *testing.T) {
 		"USER_ENV", "production",
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "",
+		"USER_GATEWAY_HMAC_SECRET", testGatewayHMACSecret,
 	)
 	setProdSecrets(t) // valid PII key + SMTP host so EVENT_HMAC is the field under test
 
@@ -243,6 +244,7 @@ func TestLoad_EventHMACSecret_ProdTooShort(t *testing.T) {
 		"USER_ENV", "production",
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "too-short",
+		"USER_GATEWAY_HMAC_SECRET", testGatewayHMACSecret,
 	)
 	setProdSecrets(t)
 
@@ -260,6 +262,7 @@ func TestLoad_EventHMACSecret_ProdValid(t *testing.T) {
 		"USER_ENV", "production",
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
+		"USER_GATEWAY_HMAC_SECRET", testGatewayHMACSecret,
 	)
 	setProdSecrets(t)
 
@@ -268,8 +271,12 @@ func TestLoad_EventHMACSecret_ProdValid(t *testing.T) {
 	assert.Equal(t, "this-is-a-32-byte-test-secret-xx", cfg.EventHMACSecret)
 }
 
+// testGatewayHMACSecret is a 32-char placeholder gateway HMAC secret used in tests — not real.
+const testGatewayHMACSecret = "0123456789abcdef0123456789abcdef"
+
 // setBaseProdEnv sets the common production-env base (DSN/port/log/env/JWT/HMAC)
 // WITHOUT the PII key or SMTP host, so each test can flip exactly those.
+// Includes USER_GATEWAY_HMAC_SECRET (§24.1 fail-closed: required in production).
 func setBaseProdEnv(t *testing.T) {
 	t.Helper()
 
@@ -281,6 +288,7 @@ func setBaseProdEnv(t *testing.T) {
 		"USER_ENV", "production",
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
+		"USER_GATEWAY_HMAC_SECRET", testGatewayHMACSecret,
 	)
 }
 
@@ -485,4 +493,95 @@ func TestLoad_TOTPIssuer_ColonRejected(t *testing.T) {
 	_, err := config.Load()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "USER_TOTP_ISSUER")
+}
+
+// TestLoad_GatewayHMAC verifies §24.1 fail-closed secret posture for USER_GATEWAY_HMAC_SECRET.
+func TestLoad_GatewayHMAC(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		secret    string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			// §24.1: dev may omit the secret (verification disabled).
+			name:    "dev with empty secret is allowed",
+			env:     "development",
+			secret:  "",
+			wantErr: false,
+		},
+		{
+			// §24.1: non-dev MUST have a ≥32-char secret — boot fails fast.
+			name:      "production without gateway secret fails (fail-closed)",
+			env:       "production",
+			secret:    "",
+			wantErr:   true,
+			errSubstr: "USER_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev",
+		},
+		{
+			// Even in dev a too-short secret is an error (catches typos).
+			name:      "dev with too-short secret is rejected",
+			env:       "development",
+			secret:    "tooshort",
+			wantErr:   true,
+			errSubstr: "USER_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters",
+		},
+		{
+			name:      "production with too-short secret is rejected",
+			env:       "production",
+			secret:    "tooshort",
+			wantErr:   true,
+			errSubstr: "USER_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev",
+		},
+		{
+			name:    "production with valid 32-char secret passes",
+			env:     "production",
+			secret:  testGatewayHMACSecret,
+			wantErr: false,
+		},
+		{
+			name:    "dev with valid 32-char secret passes",
+			env:     "development",
+			secret:  testGatewayHMACSecret,
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Non-dev tests need all production secrets set (PII key + SMTP + event HMAC);
+			// the gateway HMAC field under test is set explicitly after.
+			if tc.env == "production" {
+				setEnv(
+					t,
+					"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+					"USER_PORT", "8080",
+					"USER_LOG_LEVEL", "INFO",
+					"USER_ENV", tc.env,
+					"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
+					"EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
+				)
+				setProdSecrets(t)
+			} else {
+				setEnv(
+					t,
+					"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+					"USER_PORT", "8080",
+					"USER_LOG_LEVEL", "INFO",
+					"USER_ENV", tc.env,
+				)
+			}
+
+			t.Setenv("USER_GATEWAY_HMAC_SECRET", tc.secret)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

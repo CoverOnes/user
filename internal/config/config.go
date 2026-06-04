@@ -87,6 +87,14 @@ type Config struct {
 	// any) is trimmed at the mailer call site so the joined path is well-formed.
 	AppBaseURL string `mapstructure:"app_base_url"`
 
+	// GatewayHMACSecret is the shared secret used to verify the gateway-origin
+	// identity signature (conventions §24.1). It MUST equal the gateway's
+	// GATEWAY_HMAC_SECRET. Non-dev (production/staging) fails fast at boot if
+	// empty or shorter than 32 chars; development may omit it (verification
+	// disabled, mirroring the gateway which also disables signing in dev).
+	// Env: USER_GATEWAY_HMAC_SECRET
+	GatewayHMACSecret string `mapstructure:"gateway_hmac_secret"`
+
 	// MFAEnforced is the RESERVED flag for the future login-enforcement step
 	// (Increment 3+): when true, a later increment will require a TOTP challenge in
 	// the login flow for mfa-enabled users. It is sourced from USER_MFA_ENFORCED and
@@ -137,6 +145,7 @@ func Load() (*Config, error) {
 		"jwt_private_key":         "USER_JWT_PRIVATE_KEY",
 		"jwt_private_key_pem":     "USER_JWT_PRIVATE_KEY_PEM",
 		"event_hmac_secret":       "EVENT_HMAC_SECRET",
+		"gateway_hmac_secret":     "USER_GATEWAY_HMAC_SECRET",
 		"pii_encryption_key":      "USER_PII_ENCRYPTION_KEY",
 		"smtp_host":               "USER_SMTP_HOST",
 		"smtp_port":               "USER_SMTP_PORT",
@@ -236,6 +245,36 @@ func (c *Config) validateCore() []string {
 
 	errs = append(errs, c.validatePIIAndSMTP()...)
 	errs = append(errs, c.validateMFA()...)
+	errs = append(errs, c.validateGatewayHMAC()...)
+
+	return errs
+}
+
+// minGatewayHMACSecretLen is the minimum length of the gateway HMAC secret. It mirrors
+// the gateway's GATEWAY_HMAC_SECRET ≥32-char requirement (conventions §24.1).
+const minGatewayHMACSecretLen = 32
+
+// validateGatewayHMAC enforces the §24.1 fail-closed secret posture:
+//   - non-dev (production/staging): secret is REQUIRED and MUST be ≥32 chars —
+//     boot fails fast otherwise (mirrors the gateway which fails fast in non-dev).
+//   - dev: secret may be empty (verification disabled, mirroring the gateway's
+//     dev signing-skip); but if a secret IS provided it must still be ≥32 chars
+//     so a too-short dev secret never masquerades as a valid one.
+func (c *Config) validateGatewayHMAC() []string {
+	var errs []string
+
+	if !c.IsDev() {
+		if len(c.GatewayHMACSecret) < minGatewayHMACSecretLen {
+			errs = append(errs, "USER_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev environments")
+		}
+
+		return errs
+	}
+
+	// Dev: empty is allowed (verification disabled); non-empty must be ≥32.
+	if c.GatewayHMACSecret != "" && len(c.GatewayHMACSecret) < minGatewayHMACSecretLen {
+		errs = append(errs, "USER_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters")
+	}
 
 	return errs
 }
