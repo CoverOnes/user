@@ -2,7 +2,7 @@ module github.com/CoverOnes/user
 
 go 1.25.0
 
-toolchain go1.26.3
+toolchain go1.26.4
 
 require (
 	github.com/gin-gonic/gin v1.12.0
@@ -14,6 +14,8 @@ require (
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.36.0
+	github.com/testcontainers/testcontainers-go/modules/redis v0.36.0
+	github.com/wneessen/go-mail v0.7.3
 	golang.org/x/crypto v0.51.0
 	golang.org/x/time v0.12.0
 )
@@ -88,7 +90,6 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/testcontainers/testcontainers-go v0.36.0 // indirect
-	github.com/testcontainers/testcontainers-go/modules/redis v0.36.0 // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect

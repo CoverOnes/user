@@ -12,6 +12,11 @@ import (
 func setEnv(t *testing.T, pairs ...string) {
 	t.Helper()
 
+	// A usable PII key is required in EVERY environment (no plaintext fallback).
+	// Default it here so tests that don't care about the PII guard still load; tests
+	// targeting the PII guard override it explicitly AFTER calling setEnv.
+	t.Setenv("USER_PII_ENCRYPTION_KEY", "test-dev-default-pii-key")
+
 	for i := 0; i < len(pairs)-1; i += 2 {
 		t.Setenv(pairs[i], pairs[i+1])
 	}
@@ -170,6 +175,19 @@ func TestLoad_EventHMACSecret_DevOptional(t *testing.T) {
 	assert.Empty(t, cfg.EventHMACSecret, "dev allows an empty event HMAC secret")
 }
 
+// validPIIKeyB64 decodes to exactly 32 bytes (AES-256) — used by production-env
+// config tests so they exercise the field under test, not the PII guard.
+const validPIIKeyB64 = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
+// setProdSecrets sets the PII key + SMTP host that every production-env load now
+// requires, so a test can isolate the specific field it asserts on.
+func setProdSecrets(t *testing.T) {
+	t.Helper()
+
+	t.Setenv("USER_PII_ENCRYPTION_KEY", validPIIKeyB64)
+	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+}
+
 func TestLoad_EventHMACSecret_ProdRequired(t *testing.T) {
 	setEnv(
 		t,
@@ -180,6 +198,7 @@ func TestLoad_EventHMACSecret_ProdRequired(t *testing.T) {
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "",
 	)
+	setProdSecrets(t) // valid PII key + SMTP host so EVENT_HMAC is the field under test
 
 	_, err := config.Load()
 	require.Error(t, err)
@@ -196,6 +215,7 @@ func TestLoad_EventHMACSecret_ProdTooShort(t *testing.T) {
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "too-short",
 	)
+	setProdSecrets(t)
 
 	_, err := config.Load()
 	require.Error(t, err)
@@ -212,10 +232,108 @@ func TestLoad_EventHMACSecret_ProdValid(t *testing.T) {
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
 	)
+	setProdSecrets(t)
 
 	cfg, err := config.Load()
 	require.NoError(t, err)
 	assert.Equal(t, "this-is-a-32-byte-test-secret-xx", cfg.EventHMACSecret)
+}
+
+// setBaseProdEnv sets the common production-env base (DSN/port/log/env/JWT/HMAC)
+// WITHOUT the PII key or SMTP host, so each test can flip exactly those.
+func setBaseProdEnv(t *testing.T) {
+	t.Helper()
+
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_ENV", "production",
+		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
+		"EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
+	)
+}
+
+func TestLoad_PIIKey_DevRequiresKey(t *testing.T) {
+	// In dev a key is still required (no plaintext fallback) — but a short dev
+	// default is allowed (no strict 32-byte check).
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_ENV", "development",
+		"USER_PII_ENCRYPTION_KEY", "",
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_PII_ENCRYPTION_KEY")
+}
+
+func TestLoad_PIIKey_DevShortKeyAccepted(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_ENV", "development",
+		"USER_PII_ENCRYPTION_KEY", "dev-default-not-32-bytes",
+	)
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, "dev-default-not-32-bytes", cfg.PIIEncryptionKey)
+}
+
+func TestLoad_PIIKey_ProdMissingFails(t *testing.T) {
+	setBaseProdEnv(t)
+	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+	t.Setenv("USER_PII_ENCRYPTION_KEY", "")
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_PII_ENCRYPTION_KEY")
+}
+
+func TestLoad_PIIKey_ProdWrongLengthFails(t *testing.T) {
+	setBaseProdEnv(t)
+	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+	// Valid base64 but decodes to 16 bytes, not 32.
+	t.Setenv("USER_PII_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZg==")
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_PII_ENCRYPTION_KEY")
+}
+
+func TestLoad_PIIKey_ProdNotBase64Fails(t *testing.T) {
+	setBaseProdEnv(t)
+	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+	t.Setenv("USER_PII_ENCRYPTION_KEY", "not!valid!base64!!!")
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_PII_ENCRYPTION_KEY")
+}
+
+func TestLoad_SMTPHost_ProdRequired(t *testing.T) {
+	setBaseProdEnv(t)
+	t.Setenv("USER_PII_ENCRYPTION_KEY", validPIIKeyB64)
+	t.Setenv("USER_SMTP_HOST", "")
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_SMTP_HOST")
+}
+
+func TestLoad_ProdAllSecretsValid(t *testing.T) {
+	setBaseProdEnv(t)
+	t.Setenv("USER_PII_ENCRYPTION_KEY", validPIIKeyB64)
+	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, validPIIKeyB64, cfg.PIIEncryptionKey)
+	assert.Equal(t, "smtp.example.com", cfg.SMTPHost)
+	assert.Equal(t, 587, cfg.SMTPPort, "smtp port default must be 587")
 }
 
 func TestLoad_DBConns_Defaults(t *testing.T) {

@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"net/netip"
 	"strings"
@@ -19,6 +20,10 @@ import (
 )
 
 const validPassword = "superSecurePassword123" // ≥12 chars, meets complexity
+
+// validTWNationalID is a checksum-valid Taiwan national ID used in fixtures
+// (canonical example, matching the kyc test suite). NOT a real person's ID.
+const validTWNationalID = "A123456789"
 
 // newAuthService builds an AuthService over the supplied fakes with an ephemeral
 // signer. tx is nil so Register uses the sequential fallback path.
@@ -77,12 +82,17 @@ func TestAuthService_Register(t *testing.T) {
 				Password:    validPassword,
 				DisplayName: "Alice",
 				AccountType: domain.AccountTypePersonal,
+				LegalName:   "Alice Wang",
+				NationalID:  validTWNationalID,
 			},
 			assertOut: func(t *testing.T, out *service.RegisterOutput, c *fakeCompanyStore) {
 				require.NotNil(t, out)
 				// Email is lowercased + trimmed.
 				assert.Equal(t, "alice@example.com", out.User.Email)
 				assert.Empty(t, c.created, "personal account must not create a company")
+				// New status + email_verified contract.
+				assert.Equal(t, domain.UserStatusPendingVerification, out.User.Status)
+				assert.False(t, out.User.EmailVerified)
 			},
 		},
 		{
@@ -92,6 +102,7 @@ func TestAuthService_Register(t *testing.T) {
 				Password:    validPassword,
 				DisplayName: "Owner",
 				AccountType: domain.AccountTypeCompany,
+				LegalName:   "Owner Lin",
 				CompanyName: "Acme Inc",
 			},
 			assertOut: func(t *testing.T, out *service.RegisterOutput, c *fakeCompanyStore) {
@@ -129,8 +140,62 @@ func TestAuthService_Register(t *testing.T) {
 				Password:    "short",
 				DisplayName: "Weak",
 				AccountType: domain.AccountTypePersonal,
+				LegalName:   "Weak Wang",
+				NationalID:  validTWNationalID,
 			},
 			wantErr: domain.ErrWeakPassword,
+		},
+		{
+			name: "legal name required for personal",
+			in: service.RegisterInput{
+				Email:       "noname@example.com",
+				Password:    validPassword,
+				DisplayName: "NoName",
+				AccountType: domain.AccountTypePersonal,
+				LegalName:   "",
+				NationalID:  validTWNationalID,
+			},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name: "legal name required for company",
+			in: service.RegisterInput{
+				Email:       "co-noname@corp.com",
+				Password:    validPassword,
+				DisplayName: "CoNoName",
+				AccountType: domain.AccountTypeCompany,
+				CompanyName: "Acme",
+				LegalName:   "",
+			},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name: "personal national id checksum invalid rejected",
+			in: service.RegisterInput{
+				Email:       "badid@example.com",
+				Password:    validPassword,
+				DisplayName: "BadID",
+				AccountType: domain.AccountTypePersonal,
+				LegalName:   "Bad ID",
+				NationalID:  "A123456788", // valid structure, wrong check digit
+			},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name: "company ignores national id (optional)",
+			in: service.RegisterInput{
+				Email:       "co-noid@corp.com",
+				Password:    validPassword,
+				DisplayName: "CoNoID",
+				AccountType: domain.AccountTypeCompany,
+				CompanyName: "NoID Corp",
+				LegalName:   "Owner Chen",
+				NationalID:  "", // ignored for COMPANY
+			},
+			assertOut: func(t *testing.T, out *service.RegisterOutput, c *fakeCompanyStore) {
+				require.NotNil(t, out)
+				require.Len(t, c.created, 1)
+			},
 		},
 		{
 			name: "company name over 200 runes rejected (P1 DoS guard)",
@@ -139,6 +204,7 @@ func TestAuthService_Register(t *testing.T) {
 				Password:    validPassword,
 				DisplayName: "TooLong",
 				AccountType: domain.AccountTypeCompany,
+				LegalName:   "Too Long",
 				CompanyName: strings.Repeat("x", 201),
 			},
 			wantErr: domain.ErrCompanyNameTooLong,
@@ -150,6 +216,7 @@ func TestAuthService_Register(t *testing.T) {
 				Password:    validPassword,
 				DisplayName: "Boundary",
 				AccountType: domain.AccountTypeCompany,
+				LegalName:   "Boundary Co",
 				CompanyName: strings.Repeat("x", 200),
 			},
 			assertOut: func(t *testing.T, out *service.RegisterOutput, c *fakeCompanyStore) {
@@ -165,6 +232,7 @@ func TestAuthService_Register(t *testing.T) {
 				Password:    validPassword,
 				DisplayName: "Multibyte",
 				AccountType: domain.AccountTypeCompany,
+				LegalName:   "Multibyte Co",
 				// 200 runes of a 3-byte character = 600 bytes but only 200 runes.
 				CompanyName: strings.Repeat("公", 200),
 			},
@@ -180,6 +248,8 @@ func TestAuthService_Register(t *testing.T) {
 				Password:    validPassword,
 				DisplayName: "Dup",
 				AccountType: domain.AccountTypePersonal,
+				LegalName:   "Dup Wang",
+				NationalID:  validTWNationalID,
 			},
 			setup: func(u *fakeUserStore, _ *fakeCompanyStore) {
 				seedUser(t, u, "dup@example.com")
@@ -193,6 +263,7 @@ func TestAuthService_Register(t *testing.T) {
 				Password:    validPassword,
 				DisplayName: "CoFail",
 				AccountType: domain.AccountTypeCompany,
+				LegalName:   "Co Fail",
 				CompanyName: "Acme",
 			},
 			setup: func(_ *fakeUserStore, c *fakeCompanyStore) {
@@ -230,6 +301,56 @@ func TestAuthService_Register(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAuthService_Register_VerificationEmailFailureStillPersists is the load-bearing
+// proof of the headline guarantee: a verification-email SMTP failure on the
+// post-commit send MUST NOT roll back the user. It wires a verification-capable
+// service whose mailer ALWAYS errors (spyMailer.sendErr injected) and asserts that
+// Register still returns NoError + a non-nil user AND that the user row is persisted
+// in the store. The send is detached (FIX 2), so we drain it via WaitForPendingSends
+// (no time.Sleep) and then confirm the failing mailer was in fact invoked — proving
+// the error was exercised on the real send path, not silently skipped. If Register
+// ever propagated the mailer error, require.NoError below would fail.
+func TestAuthService_Register_VerificationEmailFailureStillPersists(t *testing.T) {
+	t.Parallel()
+
+	users := newFakeUserStore()
+	verifications := newFakeVerificationStore()
+	mailer := &spyMailer{sendErr: errInjected} // every SendVerification returns this error
+
+	svc := newVerificationService(t, users, verifications, mailer, allowAllLimiter{})
+
+	out, err := svc.Register(context.Background(), service.RegisterInput{
+		Email:       "Persist@Example.com",
+		Password:    validPassword,
+		DisplayName: "Persist",
+		AccountType: domain.AccountTypePersonal,
+		LegalName:   "Persist Wang",
+		NationalID:  validTWNationalID,
+	})
+
+	// The SMTP failure must NOT propagate — Register still succeeds with the user.
+	require.NoError(t, err, "SMTP failure on post-commit send must not fail Register")
+	require.NotNil(t, out)
+	require.NotNil(t, out.User)
+
+	// The user row is persisted (committed before the email send) and queryable by
+	// the normalized email, proving the account exists despite the email failure.
+	persisted, getErr := users.GetByEmail(context.Background(), "persist@example.com")
+	require.NoError(t, getErr, "user must be persisted in the store")
+	require.NotNil(t, persisted)
+	assert.Equal(t, out.User.ID, persisted.ID)
+	assert.Equal(t, domain.UserStatusPendingVerification, persisted.Status)
+	assert.False(t, persisted.EmailVerified)
+
+	// A verification token row was committed alongside the user.
+	assert.Len(t, verifications.byHash, 1, "a verification token must be persisted")
+
+	// Drain the detached send (deterministic, no time.Sleep) and confirm the failing
+	// mailer was actually invoked — the injected error was exercised on the real path.
+	svc.WaitForPendingSends()
+	assert.Equal(t, 1, mailer.sendCount(), "the (failing) verification email must be attempted exactly once")
 }
 
 func TestAuthService_Login(t *testing.T) {
@@ -654,5 +775,211 @@ func TestAuthService_LogoutAll(t *testing.T) {
 		err := svc.LogoutAll(context.Background(), uuid.New())
 		require.Error(t, err)
 		assert.True(t, errors.Is(err, errInjected))
+	})
+}
+
+// newVerificationService builds an AuthService wired with verification deps
+// (token store + encryptor + mailer spy + optional resend limiter).
+func newVerificationService(
+	t *testing.T,
+	users *fakeUserStore,
+	verifications *fakeVerificationStore,
+	mailer *spyMailer,
+	resend service.EmailRateLimiter,
+) *service.AuthService {
+	t.Helper()
+
+	signer, err := jwt.NewEphemeralSigner(10 * time.Minute)
+	require.NoError(t, err)
+
+	svc := service.NewAuthService(users, &fakeCompanyStore{}, newFakeRefreshTokenStore(), nil, signer, 10*time.Minute, 24)
+
+	return svc.WithVerification(verifications, &noopEncryptor{}, mailer, resend)
+}
+
+// seedVerificationToken hashes rawToken (SHA-256) and stores a token row for the
+// given user with the supplied expiry / consumed state.
+func seedVerificationToken(
+	t *testing.T,
+	verifications *fakeVerificationStore,
+	userID uuid.UUID,
+	rawToken string,
+	expiresAt time.Time,
+	consumedAt *time.Time,
+) {
+	t.Helper()
+
+	sum := sha256.Sum256([]byte(rawToken))
+	vt := &domain.EmailVerificationToken{
+		ID:         uuid.New(),
+		UserID:     userID,
+		TokenHash:  sum[:],
+		ExpiresAt:  expiresAt,
+		ConsumedAt: consumedAt,
+		CreatedAt:  time.Now().UTC(),
+	}
+	require.NoError(t, verifications.Create(context.Background(), vt))
+}
+
+func TestAuthService_VerifyEmail(t *testing.T) {
+	t.Parallel()
+
+	t.Run("happy path sets email_verified and consumes token", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		u := seedUser(t, users, "verify@example.com")
+		verifications := newFakeVerificationStore()
+		seedVerificationToken(t, verifications, u.ID, "raw-token-1", time.Now().UTC().Add(time.Hour), nil)
+
+		svc := newVerificationService(t, users, verifications, &spyMailer{}, nil)
+
+		require.NoError(t, svc.VerifyEmail(context.Background(), "raw-token-1"))
+		assert.True(t, users.byID[u.ID].EmailVerified, "user must be marked email_verified")
+	})
+
+	t.Run("single-use: second verify with same token fails", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		u := seedUser(t, users, "single@example.com")
+		verifications := newFakeVerificationStore()
+		seedVerificationToken(t, verifications, u.ID, "raw-token-2", time.Now().UTC().Add(time.Hour), nil)
+
+		svc := newVerificationService(t, users, verifications, &spyMailer{}, nil)
+
+		require.NoError(t, svc.VerifyEmail(context.Background(), "raw-token-2"))
+
+		err := svc.VerifyEmail(context.Background(), "raw-token-2")
+		require.ErrorIs(t, err, domain.ErrInvalidVerificationToken)
+	})
+
+	t.Run("expired token fails with generic error", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		u := seedUser(t, users, "expired@example.com")
+		verifications := newFakeVerificationStore()
+		seedVerificationToken(t, verifications, u.ID, "raw-token-3", time.Now().UTC().Add(-time.Hour), nil)
+
+		svc := newVerificationService(t, users, verifications, &spyMailer{}, nil)
+
+		err := svc.VerifyEmail(context.Background(), "raw-token-3")
+		require.ErrorIs(t, err, domain.ErrInvalidVerificationToken)
+		assert.False(t, users.byID[u.ID].EmailVerified, "expired token must not verify the user")
+	})
+
+	t.Run("already-consumed token fails with generic error", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		u := seedUser(t, users, "consumed@example.com")
+		verifications := newFakeVerificationStore()
+		consumed := time.Now().UTC().Add(-time.Minute)
+		seedVerificationToken(t, verifications, u.ID, "raw-token-4", time.Now().UTC().Add(time.Hour), &consumed)
+
+		svc := newVerificationService(t, users, verifications, &spyMailer{}, nil)
+
+		err := svc.VerifyEmail(context.Background(), "raw-token-4")
+		require.ErrorIs(t, err, domain.ErrInvalidVerificationToken)
+	})
+
+	t.Run("unknown token fails with same generic error (no oracle)", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		verifications := newFakeVerificationStore()
+		svc := newVerificationService(t, users, verifications, &spyMailer{}, nil)
+
+		err := svc.VerifyEmail(context.Background(), "never-issued")
+		require.ErrorIs(t, err, domain.ErrInvalidVerificationToken)
+	})
+
+	t.Run("empty token rejected", func(t *testing.T) {
+		t.Parallel()
+
+		svc := newVerificationService(t, newFakeUserStore(), newFakeVerificationStore(), &spyMailer{}, nil)
+		err := svc.VerifyEmail(context.Background(), "   ")
+		require.ErrorIs(t, err, domain.ErrInvalidVerificationToken)
+	})
+}
+
+// allowAllLimiter / denyAllLimiter exercise the resend rate-limit branches.
+type allowAllLimiter struct{}
+
+func (allowAllLimiter) Allow(_ context.Context, _ string) bool { return true }
+
+type denyAllLimiter struct{}
+
+func (denyAllLimiter) Allow(_ context.Context, _ string) bool { return false }
+
+func TestAuthService_ResendVerification(t *testing.T) {
+	t.Parallel()
+
+	t.Run("unverified user → 1 send + prior tokens invalidated", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		u := seedUser(t, users, "resend@example.com")
+		users.byID[u.ID].EmailVerified = false
+		verifications := newFakeVerificationStore()
+		mailer := &spyMailer{}
+
+		svc := newVerificationService(t, users, verifications, mailer, allowAllLimiter{})
+		svc.ResendVerification(context.Background(), "Resend@Example.com") // mixed case → normalized
+
+		// The send is detached (FIX 2) so resend responses are constant-time; await
+		// it deterministically (no time.Sleep) before asserting on the spy.
+		svc.WaitForPendingSends()
+
+		assert.Equal(t, 1, mailer.sendCount(), "exactly one verification email must be sent")
+		assert.Equal(t, "resend@example.com", mailer.sentTo[0])
+		assert.Contains(t, verifications.invalidatedUsers, u.ID, "prior outstanding tokens must be invalidated first")
+	})
+
+	t.Run("unknown email → 0 sends (no enumeration)", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		verifications := newFakeVerificationStore()
+		mailer := &spyMailer{}
+
+		svc := newVerificationService(t, users, verifications, mailer, allowAllLimiter{})
+		svc.ResendVerification(context.Background(), "ghost@example.com")
+		svc.WaitForPendingSends()
+
+		assert.Equal(t, 0, mailer.sendCount(), "no email for an unknown address")
+	})
+
+	t.Run("already-verified user → 0 sends", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		u := seedUser(t, users, "done@example.com")
+		users.byID[u.ID].EmailVerified = true
+		verifications := newFakeVerificationStore()
+		mailer := &spyMailer{}
+
+		svc := newVerificationService(t, users, verifications, mailer, allowAllLimiter{})
+		svc.ResendVerification(context.Background(), "done@example.com")
+		svc.WaitForPendingSends()
+
+		assert.Equal(t, 0, mailer.sendCount(), "verified accounts get no resend")
+	})
+
+	t.Run("rate-limited → 0 sends", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		u := seedUser(t, users, "throttled@example.com")
+		users.byID[u.ID].EmailVerified = false
+		verifications := newFakeVerificationStore()
+		mailer := &spyMailer{}
+
+		svc := newVerificationService(t, users, verifications, mailer, denyAllLimiter{})
+		svc.ResendVerification(context.Background(), "throttled@example.com")
+		svc.WaitForPendingSends()
+
+		assert.Equal(t, 0, mailer.sendCount(), "throttled caller gets no email")
 	})
 }

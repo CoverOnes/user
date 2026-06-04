@@ -23,7 +23,7 @@ func TestIssue_AndVerify_HappyPath(t *testing.T) {
 	signer := newTestSigner(t)
 	userID := uuid.New().String()
 
-	token, err := signer.Issue(userID, "PERSONAL", 0, 1)
+	token, err := signer.Issue(userID, "PERSONAL", 0, 1, true)
 	require.NoError(t, err)
 	assert.NotEmpty(t, token)
 
@@ -35,12 +35,13 @@ func TestIssue_AndVerify_HappyPath(t *testing.T) {
 	assert.Equal(t, int16(0), claims.KYCTier)
 	assert.Equal(t, "PERSONAL", claims.AccountType)
 	assert.Equal(t, 1, claims.TokenVersion)
+	assert.True(t, claims.EmailVerified, "email_verified claim must round-trip true")
 }
 
 func TestVerify_RejectsAlteredToken(t *testing.T) {
 	signer := newTestSigner(t)
 
-	token, err := signer.Issue(uuid.New().String(), "COMPANY", 2, 0)
+	token, err := signer.Issue(uuid.New().String(), "COMPANY", 2, 0, false)
 	require.NoError(t, err)
 
 	// Corrupt the signature by appending garbage.
@@ -54,7 +55,7 @@ func TestVerify_RejectsExpiredToken(t *testing.T) {
 	signer, err := jwt.NewEphemeralSigner(-1 * time.Second)
 	require.NoError(t, err)
 
-	token, err := signer.Issue(uuid.New().String(), "PERSONAL", 0, 0)
+	token, err := signer.Issue(uuid.New().String(), "PERSONAL", 0, 0, false)
 	require.NoError(t, err)
 
 	// Give leeway (60s) a chance to fail — wait for expiry beyond leeway.
@@ -106,7 +107,7 @@ func TestIssue_ClaimsHaveExpectedFields(t *testing.T) {
 	signer := newTestSigner(t)
 	userID := uuid.New().String()
 
-	token, err := signer.Issue(userID, "COMPANY", 2, 5)
+	token, err := signer.Issue(userID, "COMPANY", 2, 5, false)
 	require.NoError(t, err)
 
 	claims, err := signer.Verify(token)
@@ -119,4 +120,5 @@ func TestIssue_ClaimsHaveExpectedFields(t *testing.T) {
 	assert.Equal(t, int16(2), claims.KYCTier)
 	assert.Equal(t, "COMPANY", claims.AccountType)
 	assert.Equal(t, 5, claims.TokenVersion)
+	assert.False(t, claims.EmailVerified, "email_verified claim must round-trip false")
 }

@@ -143,35 +143,54 @@ func NewIPRateLimiter(rdb *redis.Client, limit int, window time.Duration) *RateL
 	}
 }
 
-// EmailLoginLimiter applies a per-normalized-email sliding-window rate limit for
-// login attempts (credential-stuffing defense). Unlike the IP-keyed middleware
-// limiter it is invoked from the service layer once the email has been parsed, so
-// an attacker spraying one email across many IPs is still throttled.
+// EmailLimiter applies a per-normalized-email sliding-window rate limit. It serves
+// both the login path (credential-stuffing defense) and the resend-verification
+// path; the two use distinct Redis key namespaces (set by their constructors).
+// Unlike the IP-keyed middleware limiter it is invoked from the service layer once
+// the email has been parsed, so an attacker spraying one email across many IPs is
+// still throttled.
 //
 // It FAILS SAFE: when Redis is unavailable or errors, Allow returns true so a Redis
-// outage cannot lock every account out of login (availability > strict throttling
-// for this control; the IP limiter and password check remain in force).
-type EmailLoginLimiter struct {
-	rdb    *redis.Client
-	script *redis.Script
-	limit  int
-	window time.Duration
+// outage cannot lock every account out (availability > strict throttling for this
+// control; the IP limiter and password check remain in force).
+type EmailLimiter struct {
+	rdb       *redis.Client
+	script    *redis.Script
+	limit     int
+	window    time.Duration
+	keyPrefix string
 }
 
 // NewEmailLoginLimiter builds a per-email login limiter. A nil rdb disables the
 // control (Allow always returns true) — same dev-mode contract as the middleware.
-func NewEmailLoginLimiter(rdb *redis.Client, limit int, window time.Duration) *EmailLoginLimiter {
-	return &EmailLoginLimiter{
-		rdb:    rdb,
-		script: redis.NewScript(slidingWindowScript),
-		limit:  limit,
-		window: window,
+func NewEmailLoginLimiter(rdb *redis.Client, limit int, window time.Duration) *EmailLimiter {
+	return &EmailLimiter{
+		rdb:       rdb,
+		script:    redis.NewScript(slidingWindowScript),
+		limit:     limit,
+		window:    window,
+		keyPrefix: "rl:login:email:",
 	}
 }
 
-// Allow reports whether a login attempt for the given normalized email is admitted.
+// NewEmailVerificationLimiter builds a per-email limiter for the resend-verification
+// endpoint (default 3/hour — set by the caller). It mirrors NewEmailLoginLimiter but
+// uses a distinct Redis key namespace so resend throttling and login throttling are
+// independent. A nil rdb disables the control (Allow always returns true) — same
+// dev-mode contract.
+func NewEmailVerificationLimiter(rdb *redis.Client, limit int, window time.Duration) *EmailLimiter {
+	return &EmailLimiter{
+		rdb:       rdb,
+		script:    redis.NewScript(slidingWindowScript),
+		limit:     limit,
+		window:    window,
+		keyPrefix: "rl:resend:email:",
+	}
+}
+
+// Allow reports whether an attempt for the given normalized email is admitted.
 // On a nil Redis client or any Redis error it returns true (fail-safe).
-func (l *EmailLoginLimiter) Allow(ctx context.Context, normalizedEmail string) bool {
+func (l *EmailLimiter) Allow(ctx context.Context, normalizedEmail string) bool {
 	if l.rdb == nil {
 		return true
 	}
@@ -179,7 +198,7 @@ func (l *EmailLoginLimiter) Allow(ctx context.Context, normalizedEmail string) b
 	now := time.Now().UnixNano()
 	windowStart := now - l.window.Nanoseconds()
 	member := fmt.Sprintf("%d-%s", now, randMember())
-	key := fmt.Sprintf("rl:login:email:%s", normalizedEmail)
+	key := l.keyPrefix + normalizedEmail
 
 	res, err := l.script.Run(
 		ctx,
@@ -192,8 +211,8 @@ func (l *EmailLoginLimiter) Allow(ctx context.Context, normalizedEmail string) b
 		member,
 	).Int64()
 	if err != nil {
-		// Fail safe: a Redis outage must not lock users out of login.
-		slog.Warn("email login limiter redis error; failing open for availability", "err", err)
+		// Fail safe: a Redis outage must not lock users out.
+		slog.Warn("email limiter redis error; failing open for availability", "err", err, "keyPrefix", l.keyPrefix)
 
 		return true
 	}

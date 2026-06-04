@@ -82,7 +82,7 @@ func TestRevokeAll_HappyPath(t *testing.T) {
 	}
 	require.NoError(t, userStore.Create(context.Background(), u))
 
-	token, err := signer.Issue(u.ID.String(), u.AccountType, u.KYCTier, u.TokenVersion)
+	token, err := signer.Issue(u.ID.String(), u.AccountType, u.KYCTier, u.TokenVersion, u.EmailVerified)
 	require.NoError(t, err)
 
 	w := postWithAuth(t, r, "/v1/me/sessions/revoke-all", token)
