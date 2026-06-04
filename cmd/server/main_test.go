@@ -22,9 +22,11 @@ func TestDevLogMailer_SendVerification(t *testing.T) {
 			want:       []string{"verify_url", "http://dev.coverones.test:5500/verify-email?token=raw-token"},
 		},
 		{
+			// M1 security fix: raw token must NOT appear in logs — it is redacted.
+			// verify_token key is present but value is [REDACTED].
 			name:       "logs token recovery path when app base URL is absent",
 			appBaseURL: "",
-			want:       []string{"verify_token", "raw-token", "set USER_APP_BASE_URL to log a clickable verification link"},
+			want:       []string{"verify_token=[REDACTED]", "set USER_APP_BASE_URL to log a clickable verification link"},
 		},
 	}
 

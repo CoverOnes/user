@@ -173,6 +173,26 @@ func (c *Consumer) handleKYCTierChanged(ctx context.Context, payload string) {
 		return
 	}
 
+	// M2 bounds-check: newTier must be 0–3 (Tier0=unverified … Tier3=highest).
+	// Drop and log events outside this range to prevent an out-of-range value
+	// from corrupting the DB column (e.g. a negative tier bypassing UI checks).
+	const (
+		minKYCTier int16 = 0
+		maxKYCTier int16 = 3
+	)
+
+	if data.NewTier < minKYCTier || data.NewTier > maxKYCTier {
+		slog.Warn(
+			"consumer: kyc.tier_changed newTier out of bounds; dropping event",
+			"channel", "kyc.tier_changed",
+			"event_id", env.EventID,
+			"user_id", data.UserID,
+			"new_tier", data.NewTier,
+		)
+
+		return
+	}
+
 	if err := c.users.UpdateKYCTier(ctx, data.UserID, data.NewTier); err != nil {
 		slog.Warn(
 			"consumer: failed to update kyc_tier; skipping",

@@ -266,8 +266,9 @@ func seedTestUser(t *testing.T, ctx context.Context, userStore *postgres.UserSto
 }
 
 // startConsumerStack spins up Postgres + Redis containers, applies migrations, starts
-// the consumer with the given secret, and returns the connected Redis client and store.
-func startConsumerStack(t *testing.T, secret string) (*redis.Client, *postgres.UserStore) {
+// the consumer authenticated with testHMACSecret, and returns the connected Redis
+// client and store. All tests in this file use the same shared test secret.
+func startConsumerStack(t *testing.T) (*redis.Client, *postgres.UserStore) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -288,7 +289,7 @@ func startConsumerStack(t *testing.T, secret string) (*redis.Client, *postgres.U
 
 	userStore := postgres.NewUserStore(pool)
 
-	consumer := events.NewConsumer(rdb, userStore, secret)
+	consumer := events.NewConsumer(rdb, userStore, testHMACSecret)
 
 	consumerCtx, consumerCancel := context.WithCancel(context.Background())
 	t.Cleanup(consumerCancel)
@@ -307,7 +308,7 @@ func TestConsumer_KYCTierChanged_BadPayload(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	rdb, userStore := startConsumerStack(t, testHMACSecret)
+	rdb, userStore := startConsumerStack(t)
 
 	u := seedTestUser(t, ctx, userStore, "badpayload@example.test")
 
@@ -336,7 +337,7 @@ func TestConsumer_ForgedSignature_Rejected(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	rdb, userStore := startConsumerStack(t, testHMACSecret)
+	rdb, userStore := startConsumerStack(t)
 
 	u := seedTestUser(t, ctx, userStore, "forged@example.test")
 
@@ -359,7 +360,7 @@ func TestConsumer_MissingSignature_Rejected(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	rdb, userStore := startConsumerStack(t, testHMACSecret)
+	rdb, userStore := startConsumerStack(t)
 
 	u := seedTestUser(t, ctx, userStore, "nosig@example.test")
 
@@ -371,6 +372,44 @@ func TestConsumer_MissingSignature_Rejected(t *testing.T) {
 	got, err := userStore.GetByID(ctx, u.ID)
 	require.NoError(t, err)
 	assert.Equal(t, int16(0), got.KYCTier, "missing-signature event must NOT change kyc_tier")
+}
+
+// TestConsumer_OutOfBoundsTier_Dropped verifies that events carrying a newTier
+// outside [0, 3] are dropped without updating the DB (M2 bounds-check fix).
+func TestConsumer_OutOfBoundsTier_Dropped(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	rdb, userStore := startConsumerStack(t)
+
+	tests := []struct {
+		name    string
+		newTier int16
+	}{
+		{name: "negative tier", newTier: -1},
+		{name: "tier above max", newTier: 4},
+		{name: "very large tier", newTier: 100},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			u := seedTestUser(t, ctx, userStore, fmt.Sprintf("oob-%d@example.test", tc.newTier))
+
+			// Build a correctly-signed envelope with the out-of-bounds tier.
+			envelope := signedEnvelope(t, u.ID, 0, tc.newTier, true, "")
+			require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", envelope).Err())
+
+			// Give consumer time to receive and process.
+			time.Sleep(500 * time.Millisecond)
+
+			// Tier must remain 0 — the event should have been dropped.
+			got, err := userStore.GetByID(ctx, u.ID)
+			require.NoError(t, err)
+			assert.Equal(t, int16(0), got.KYCTier, "out-of-bounds newTier must not be applied")
+		})
+	}
 }
 
 // NOTE: the valid-signature happy path (correctly-signed event IS applied) is covered
