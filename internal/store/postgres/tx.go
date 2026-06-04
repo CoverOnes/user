@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/CoverOnes/user/internal/domain"
 	"github.com/CoverOnes/user/internal/store"
@@ -173,6 +174,73 @@ func (s *txUserStore) SetEmailVerified(ctx context.Context, id uuid.UUID) error 
 	tag, err := s.tx.Exec(ctx, q, id)
 	if err != nil {
 		return fmt.Errorf("set email_verified (tx): %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
+func (s *txUserStore) SetPendingTOTPSecret(ctx context.Context, id uuid.UUID, secretEnc []byte) error {
+	q := `UPDATE users SET totp_secret_enc = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`
+
+	tag, err := s.tx.Exec(ctx, q, id, secretEnc)
+	if err != nil {
+		return fmt.Errorf("set pending totp secret (tx): %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
+func (s *txUserStore) EnableMFA(ctx context.Context, id uuid.UUID, backupCodesEnc []byte, enrolledAt time.Time) error {
+	q := `
+	UPDATE users
+	SET mfa_enabled = true, mfa_backup_codes_enc = $2, mfa_enrolled_at = $3, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL`
+
+	tag, err := s.tx.Exec(ctx, q, id, backupCodesEnc, enrolledAt)
+	if err != nil {
+		return fmt.Errorf("enable mfa (tx): %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
+func (s *txUserStore) DisableMFA(ctx context.Context, id uuid.UUID) error {
+	q := `
+	UPDATE users
+	SET mfa_enabled = false, totp_secret_enc = NULL, mfa_backup_codes_enc = NULL,
+	    mfa_enrolled_at = NULL, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL`
+
+	tag, err := s.tx.Exec(ctx, q, id)
+	if err != nil {
+		return fmt.Errorf("disable mfa (tx): %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
+func (s *txUserStore) SetMFABackupCodes(ctx context.Context, id uuid.UUID, backupCodesEnc []byte) error {
+	q := `UPDATE users SET mfa_backup_codes_enc = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`
+
+	tag, err := s.tx.Exec(ctx, q, id, backupCodesEnc)
+	if err != nil {
+		return fmt.Errorf("set mfa backup codes (tx): %w", err)
 	}
 
 	if tag.RowsAffected() == 0 {

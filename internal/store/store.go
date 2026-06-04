@@ -25,6 +25,26 @@ type UserStore interface {
 	// SetEmailVerified sets users.email_verified = true for the given user.
 	// Idempotent; returns ErrNotFound if no live row matches.
 	SetEmailVerified(ctx context.Context, id uuid.UUID) error
+
+	// SetPendingTOTPSecret stores the (encrypted) PENDING TOTP secret for enroll,
+	// WITHOUT enabling MFA. Overwrites any prior pending/active secret so a re-enroll
+	// supersedes the previous one. Returns ErrNotFound if no live row matches.
+	SetPendingTOTPSecret(ctx context.Context, id uuid.UUID, secretEnc []byte) error
+
+	// EnableMFA flips mfa_enabled = true, stores the (encrypted) backup codes, and
+	// stamps mfa_enrolled_at. Called by confirm AFTER the code is verified against the
+	// pending secret. Returns ErrNotFound if no live row matches.
+	EnableMFA(ctx context.Context, id uuid.UUID, backupCodesEnc []byte, enrolledAt time.Time) error
+
+	// DisableMFA clears mfa_enabled, totp_secret_enc, mfa_backup_codes_enc and
+	// mfa_enrolled_at in one statement. Called by disable AFTER a current code is
+	// verified. Returns ErrNotFound if no live row matches.
+	DisableMFA(ctx context.Context, id uuid.UUID) error
+
+	// SetMFABackupCodes overwrites only the (encrypted) backup codes for an
+	// mfa-enabled user (e.g. when a backup code is consumed and the remaining set is
+	// re-persisted). Returns ErrNotFound if no live row matches.
+	SetMFABackupCodes(ctx context.Context, id uuid.UUID, backupCodesEnc []byte) error
 }
 
 // EmailVerificationTokenStore defines DB operations for single-use email

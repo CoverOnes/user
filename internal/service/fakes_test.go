@@ -28,6 +28,10 @@ type fakeUserStore struct {
 	updateProfileErr    error
 	bumpVersionErr      error
 	setEmailVerifiedErr error
+	setPendingSecretErr error
+	enableMFAErr        error
+	disableMFAErr       error
+	setBackupCodesErr   error
 }
 
 func newFakeUserStore() *fakeUserStore {
@@ -125,6 +129,63 @@ func (f *fakeUserStore) SetEmailVerified(_ context.Context, id uuid.UUID) error 
 		return domain.ErrNotFound
 	}
 	u.EmailVerified = true
+
+	return nil
+}
+
+func (f *fakeUserStore) SetPendingTOTPSecret(_ context.Context, id uuid.UUID, secretEnc []byte) error {
+	if f.setPendingSecretErr != nil {
+		return f.setPendingSecretErr
+	}
+	u, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	u.TOTPSecretEnc = secretEnc
+
+	return nil
+}
+
+func (f *fakeUserStore) EnableMFA(_ context.Context, id uuid.UUID, backupCodesEnc []byte, enrolledAt time.Time) error {
+	if f.enableMFAErr != nil {
+		return f.enableMFAErr
+	}
+	u, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	u.MFAEnabled = true
+	u.MFABackupCodesEnc = backupCodesEnc
+	u.MFAEnrolledAt = &enrolledAt
+
+	return nil
+}
+
+func (f *fakeUserStore) DisableMFA(_ context.Context, id uuid.UUID) error {
+	if f.disableMFAErr != nil {
+		return f.disableMFAErr
+	}
+	u, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	u.MFAEnabled = false
+	u.TOTPSecretEnc = nil
+	u.MFABackupCodesEnc = nil
+	u.MFAEnrolledAt = nil
+
+	return nil
+}
+
+func (f *fakeUserStore) SetMFABackupCodes(_ context.Context, id uuid.UUID, backupCodesEnc []byte) error {
+	if f.setBackupCodesErr != nil {
+		return f.setBackupCodesErr
+	}
+	u, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	u.MFABackupCodesEnc = backupCodesEnc
 
 	return nil
 }

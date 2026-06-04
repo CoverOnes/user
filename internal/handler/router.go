@@ -18,6 +18,7 @@ import (
 type RouterConfig struct {
 	Auth    *service.AuthService
 	Profile *service.ProfileService
+	MFA     *service.MFAService
 	Signer  *jwt.Signer
 	Pool    *pgxpool.Pool
 	Redis   *redis.Client // may be nil in dev
@@ -78,6 +79,22 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// Session management.
 	sessH := NewSessionHandler(cfg.Auth)
 	me.POST("/sessions/revoke-all", sessH.RevokeAll)
+
+	// TOTP 2FA primitives (Increment 3). Protected by the same Auth middleware as
+	// the rest of /v1/me. NOT wired into login this wave — enroll/confirm/verify/
+	// disable only manage the user's own MFA state. Registered only when the MFA
+	// service is wired (it always is in main.go; the nil-guard keeps tests that build
+	// a minimal router from panicking).
+	if cfg.MFA != nil {
+		mfaH := NewMFAHandler(cfg.MFA)
+		totp := me.Group("/mfa/totp")
+		totp.POST("/enroll", mfaH.Enroll)
+		totp.POST("/confirm", mfaH.Confirm)
+		totp.POST("/verify", mfaH.Verify)
+		totp.POST("/disable", mfaH.Disable)
+		// DELETE alias for disable (same {code}-verified semantics).
+		totp.DELETE("", mfaH.Disable)
+	}
 
 	return r
 }

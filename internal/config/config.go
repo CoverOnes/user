@@ -87,6 +87,21 @@ type Config struct {
 	// any) is trimmed at the mailer call site so the joined path is well-formed.
 	AppBaseURL string `mapstructure:"app_base_url"`
 
+	// MFAEnforced is the RESERVED flag for the future login-enforcement step
+	// (Increment 3+): when true, a later increment will require a TOTP challenge in
+	// the login flow for mfa-enabled users. It is sourced from USER_MFA_ENFORCED and
+	// defaults to false. NOTHING acts on it in the current increment — login is
+	// deliberately left unchanged; this field only carries the configured value so
+	// the enforcement step can read it without a config change.
+	MFAEnforced bool `mapstructure:"mfa_enforced"`
+
+	// TOTPIssuer is the issuer label embedded in the otpauth:// provisioning URI and
+	// shown by authenticator apps (e.g. Google Authenticator). Sourced from
+	// USER_TOTP_ISSUER; defaults to "CoverOnes". Must be non-empty and must NOT
+	// contain a colon (the otpauth label uses "<issuer>:<account>" so a colon in the
+	// issuer would corrupt the label).
+	TOTPIssuer string `mapstructure:"totp_issuer"`
+
 	// Log level: DEBUG, INFO, WARN, ERROR
 	LogLevel string `mapstructure:"log_level"`
 
@@ -131,6 +146,8 @@ func Load() (*Config, error) {
 		"app_base_url":            "USER_APP_BASE_URL",
 		"access_token_ttl_sec":    "USER_ACCESS_TOKEN_TTL_SEC",
 		"refresh_token_ttl_hours": "USER_REFRESH_TOKEN_TTL_HOURS",
+		"mfa_enforced":            "USER_MFA_ENFORCED",
+		"totp_issuer":             "USER_TOTP_ISSUER",
 		"log_level":               "USER_LOG_LEVEL",
 		"env":                     "USER_ENV",
 	}
@@ -150,6 +167,8 @@ func Load() (*Config, error) {
 	v.SetDefault("db_min_conns", 2)
 	v.SetDefault("smtp_port", 587)
 	v.SetDefault("app_base_url", "http://localhost:5500")
+	v.SetDefault("mfa_enforced", false)
+	v.SetDefault("totp_issuer", "CoverOnes")
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
@@ -216,6 +235,23 @@ func (c *Config) validateCore() []string {
 	}
 
 	errs = append(errs, c.validatePIIAndSMTP()...)
+	errs = append(errs, c.validateMFA()...)
+
+	return errs
+}
+
+// validateMFA checks the TOTP 2FA settings. The issuer is embedded into the otpauth
+// "<issuer>:<account>" label, so an empty issuer or one containing a colon would
+// corrupt the provisioning URI parsed by authenticator apps. MFAEnforced is a plain
+// bool (no validation needed) and is intentionally NOT acted on this increment.
+func (c *Config) validateMFA() []string {
+	var errs []string
+
+	if strings.TrimSpace(c.TOTPIssuer) == "" {
+		errs = append(errs, "USER_TOTP_ISSUER must not be empty")
+	} else if strings.Contains(c.TOTPIssuer, ":") {
+		errs = append(errs, "USER_TOTP_ISSUER must not contain a colon")
+	}
 
 	return errs
 }

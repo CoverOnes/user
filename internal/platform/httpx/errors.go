@@ -73,6 +73,10 @@ var fixedErrorMappings = []errMapping{
 	// Single generic code for verify-email not-found / expired / already-consumed — no oracle.
 	{domain.ErrInvalidVerificationToken, "INVALID_VERIFICATION_TOKEN", http.StatusBadRequest, "invalid or expired verification token"},
 	{domain.ErrEmailNotVerified, "EMAIL_NOT_VERIFIED", http.StatusForbidden, "email verification required"},
+	// TOTP 2FA (Increment 3). One generic INVALID_TOTP_CODE for all wrong-code paths (no oracle).
+	{domain.ErrInvalidTOTPCode, "INVALID_TOTP_CODE", http.StatusBadRequest, "invalid totp code"},
+	{domain.ErrMFANotEnrolled, "MFA_NOT_ENROLLED", http.StatusConflict, "mfa is not enrolled"},
+	{domain.ErrMFAAlreadyEnabled, "MFA_ALREADY_ENABLED", http.StatusConflict, "mfa is already enabled"},
 }
 
 // passthroughValidationErrors are validation sentinels whose own Error() text is

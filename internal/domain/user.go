@@ -26,8 +26,24 @@ type User struct {
 	// HIGH-sensitivity PII. They are JSON-excluded so the plaintext (and even the
 	// ciphertext) never serializes into an API response. NationalIDEnc is nil for
 	// COMPANY accounts.
-	LegalNameEnc  []byte     `json:"-"`
-	NationalIDEnc []byte     `json:"-"`
+	LegalNameEnc  []byte `json:"-"`
+	NationalIDEnc []byte `json:"-"`
+	// MFAEnabled reports whether TOTP 2FA has been confirmed-and-enabled (Inc3).
+	// false while a TOTP secret is merely pending (enrolled but not confirmed).
+	// Login does NOT consult this flag in Increment 3 — enforcement is deferred.
+	MFAEnabled bool `json:"mfaEnabled"`
+	// TOTPSecretEnc is the AES-256-GCM ciphertext of the user's base32 TOTP secret.
+	// It is written (PENDING) at enroll and verified at confirm/verify; the plaintext
+	// secret is returned to the client ONCE at enroll (for the QR / manual entry) and
+	// NEVER again. JSON-excluded so the ciphertext never serializes into a response.
+	TOTPSecretEnc []byte `json:"-"`
+	// MFABackupCodesEnc is the AES-256-GCM ciphertext of a JSON array of SHA-256
+	// hashes of the user's one-time backup codes. The raw codes are returned ONCE at
+	// confirm and never persisted in the clear. JSON-excluded.
+	MFABackupCodesEnc []byte `json:"-"`
+	// MFAEnrolledAt is when MFA was confirmed-and-enabled (set at confirm, cleared at
+	// disable). nil while MFA is not enabled.
+	MFAEnrolledAt *time.Time `json:"mfaEnrolledAt,omitempty"`
 	TokenVersion  int        `json:"-"`
 	DeletedAt     *time.Time `json:"deletedAt,omitempty"`
 	CreatedAt     time.Time  `json:"createdAt"`

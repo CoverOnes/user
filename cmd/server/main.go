@@ -215,6 +215,13 @@ func run() error {
 		WithVerification(verificationStore, encryptor, verificationMailer, resendLimiter)
 	profileSvc := service.NewProfileService(userStore)
 
+	// MFA (TOTP 2FA) service — Increment 3 primitives. Reuses the SAME PII encryptor
+	// so the TOTP secret + backup codes are AES-256-GCM at rest. cfg.MFAEnforced is
+	// intentionally NOT read here: login is unchanged this wave (enforcement is a
+	// later, flag-gated increment) and the MFA service only manages enroll/confirm/
+	// verify/disable state.
+	mfaSvc := service.NewMFAService(userStore, encryptor, cfg.TOTPIssuer)
+
 	// Redis event consumer — subscribes to kyc.tier_changed to keep users.kyc_tier fresh.
 	// Runs in a goroutine with a context derived from context.Background() so it is not
 	// canceled when HTTP request contexts expire (backend-security-design §5).
@@ -230,6 +237,7 @@ func run() error {
 	r := handler.NewRouter(handler.RouterConfig{
 		Auth:    authSvc,
 		Profile: profileSvc,
+		MFA:     mfaSvc,
 		Signer:  signer,
 		Pool:    pool,
 		Redis:   redisClient,

@@ -425,3 +425,64 @@ func TestLoad_DBConns_OverLimitRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "USER_DB_MIN_CONNS")
 }
+
+func TestLoad_MFA_Defaults(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+	)
+
+	os.Unsetenv("USER_TOTP_ISSUER")  //nolint:errcheck // test cleanup
+	os.Unsetenv("USER_MFA_ENFORCED") //nolint:errcheck // test cleanup
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, "CoverOnes", cfg.TOTPIssuer, "USER_TOTP_ISSUER must default to CoverOnes")
+	assert.False(t, cfg.MFAEnforced, "USER_MFA_ENFORCED must default to false")
+}
+
+func TestLoad_MFA_Configurable(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_TOTP_ISSUER", "MyApp",
+		"USER_MFA_ENFORCED", "true",
+	)
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, "MyApp", cfg.TOTPIssuer)
+	assert.True(t, cfg.MFAEnforced)
+}
+
+func TestLoad_TOTPIssuer_EmptyRejected(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_TOTP_ISSUER", "   ",
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_TOTP_ISSUER")
+}
+
+func TestLoad_TOTPIssuer_ColonRejected(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_TOTP_ISSUER", "Cover:Ones",
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_TOTP_ISSUER")
+}
