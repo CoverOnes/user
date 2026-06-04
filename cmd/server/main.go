@@ -179,11 +179,12 @@ func run() error {
 	var verificationMailer service.Mailer
 	if cfg.SMTPHost != "" {
 		m, mailerErr := mailer.NewSMTPMailer(&mailer.Config{
-			Host:     cfg.SMTPHost,
-			Port:     cfg.SMTPPort,
-			Username: cfg.SMTPUsername,
-			Password: cfg.SMTPPassword,
-			From:     cfg.SMTPFrom,
+			Host:       cfg.SMTPHost,
+			Port:       cfg.SMTPPort,
+			Username:   cfg.SMTPUsername,
+			Password:   cfg.SMTPPassword,
+			From:       cfg.SMTPFrom,
+			AppBaseURL: cfg.AppBaseURL,
 		})
 		if mailerErr != nil {
 			return fmt.Errorf("init smtp mailer: %w", mailerErr)

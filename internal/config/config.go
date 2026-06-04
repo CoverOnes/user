@@ -80,6 +80,13 @@ type Config struct {
 	SMTPPassword string `mapstructure:"smtp_password"`
 	SMTPFrom     string `mapstructure:"smtp_from"`
 
+	// AppBaseURL is the public frontend base URL used to build the clickable
+	// email-verification link (<AppBaseURL>/verify-email?token=<token>) in the
+	// verification mail. Sourced from USER_APP_BASE_URL; defaults to the dev
+	// frontend origin (http://localhost:5500) when unset. The trailing slash (if
+	// any) is trimmed at the mailer call site so the joined path is well-formed.
+	AppBaseURL string `mapstructure:"app_base_url"`
+
 	// Log level: DEBUG, INFO, WARN, ERROR
 	LogLevel string `mapstructure:"log_level"`
 
@@ -121,6 +128,7 @@ func Load() (*Config, error) {
 		"smtp_username":           "USER_SMTP_USERNAME",
 		"smtp_password":           "USER_SMTP_PASSWORD",
 		"smtp_from":               "USER_SMTP_FROM",
+		"app_base_url":            "USER_APP_BASE_URL",
 		"access_token_ttl_sec":    "USER_ACCESS_TOKEN_TTL_SEC",
 		"refresh_token_ttl_hours": "USER_REFRESH_TOKEN_TTL_HOURS",
 		"log_level":               "USER_LOG_LEVEL",
@@ -141,6 +149,7 @@ func Load() (*Config, error) {
 	v.SetDefault("db_max_conns", 10)
 	v.SetDefault("db_min_conns", 2)
 	v.SetDefault("smtp_port", 587)
+	v.SetDefault("app_base_url", "http://localhost:5500")
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {

@@ -102,6 +102,35 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, "", cfg.PostgresSchema)
 }
 
+func TestLoad_AppBaseURL_DefaultsToDevOrigin(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+	)
+
+	os.Unsetenv("USER_APP_BASE_URL") //nolint:errcheck // test cleanup
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, "http://localhost:5500", cfg.AppBaseURL, "USER_APP_BASE_URL must default to the dev frontend origin")
+}
+
+func TestLoad_AppBaseURL_Configurable(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_PORT", "8080",
+		"USER_LOG_LEVEL", "INFO",
+		"USER_APP_BASE_URL", "https://app.coverones.com",
+	)
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, "https://app.coverones.com", cfg.AppBaseURL)
+}
+
 func TestLoad_PostgresSchema_Valid(t *testing.T) {
 	setEnv(
 		t,
