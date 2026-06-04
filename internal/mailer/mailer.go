@@ -5,6 +5,9 @@ package mailer
 import (
 	"context"
 	"fmt"
+	"html"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/wneessen/go-mail"
@@ -28,11 +31,20 @@ type Config struct {
 	Username string
 	Password string
 	From     string
+	// AppBaseURL is the public frontend base URL used to build the clickable
+	// verification link (<AppBaseURL>/verify-email?token=<token>) presented as the
+	// primary call-to-action in the verification email. Any trailing slash is
+	// trimmed before joining the path. Falls back to defaultAppBaseURL when empty.
+	AppBaseURL string
 	// SendTimeout bounds a single send. Zero falls back to defaultSendTimeout.
 	SendTimeout time.Duration
 }
 
 const defaultSendTimeout = 10 * time.Second
+
+// defaultAppBaseURL is the dev frontend origin used when AppBaseURL is empty so
+// the verification link is always well-formed even in a bare local setup.
+const defaultAppBaseURL = "http://localhost:5500"
 
 // SMTPMailer is the production Mailer backed by an SMTP server.
 type SMTPMailer struct {
@@ -47,6 +59,10 @@ func NewSMTPMailer(cfg *Config) (*SMTPMailer, error) {
 	c := *cfg
 	if c.SendTimeout <= 0 {
 		c.SendTimeout = defaultSendTimeout
+	}
+
+	if strings.TrimSpace(c.AppBaseURL) == "" {
+		c.AppBaseURL = defaultAppBaseURL
 	}
 
 	opts := []mail.Option{
@@ -87,8 +103,14 @@ func (m *SMTPMailer) SendVerification(ctx context.Context, to, token string) err
 		return fmt.Errorf("mailer: set recipient: %w", err)
 	}
 
+	textBody, htmlBody := m.RenderVerification(token)
+
 	msg.Subject("Verify your CoverOnes account")
-	msg.SetBodyString(mail.TypeTextPlain, verificationBody(token))
+	// Primary call-to-action is the clickable verify URL. The plain-text part is
+	// the canonical body; the HTML part renders the same URL as an anchor so a
+	// non-technical recipient can click it directly.
+	msg.SetBodyString(mail.TypeTextPlain, textBody)
+	msg.AddAlternativeString(mail.TypeTextHTML, htmlBody)
 
 	// Bound the send by ctx + the configured timeout so a hung SMTP server cannot
 	// block the caller's goroutine indefinitely.
@@ -102,16 +124,65 @@ func (m *SMTPMailer) SendVerification(ctx context.Context, to, token string) err
 	return nil
 }
 
-// verificationBody renders the plaintext email body. The token is single-use and
-// short-lived; it is included so the recipient can complete verification.
-func verificationBody(token string) string {
+// RenderVerification renders the verification email bodies (plain-text and HTML)
+// for the given token using the mailer's configured AppBaseURL. It is the single
+// source of the email content — SendVerification calls it directly — so a test
+// can assert the rendered body without standing up SMTP. Both parts present the
+// clickable <AppBaseURL>/verify-email?token=<token> link as the primary CTA.
+func (m *SMTPMailer) RenderVerification(token string) (textBody, htmlBody string) {
+	verifyURL := verificationURL(m.cfg.AppBaseURL, token)
+
+	return verificationBody(verifyURL, token), verificationBodyHTML(verifyURL, token)
+}
+
+// verificationURL builds the clickable verification link
+// <baseURL>/verify-email?token=<token>. The trailing slash on baseURL (if any)
+// is trimmed so the joined path is well-formed. The token is the existing
+// system-generated base64url value (no user input) but is still query-escaped so
+// any reserved characters survive transit intact.
+func verificationURL(baseURL, token string) string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+
+	return fmt.Sprintf("%s/verify-email?token=%s", base, url.QueryEscape(token))
+}
+
+// verificationBody renders the plaintext email body. The clickable verifyURL is
+// the primary call-to-action; the raw token is kept as a secondary fallback for
+// recipients who cannot follow the link. The token is single-use and short-lived.
+func verificationBody(verifyURL, token string) string {
 	return fmt.Sprintf(
 		"Welcome to CoverOnes!\n\n"+
-			"Please verify your email address by submitting the token below to the\n"+
-			"verify-email endpoint (POST /v1/auth/verify-email).\n\n"+
-			"Verification token:\n%s\n\n"+
-			"This token is single-use and expires soon. If you did not create this\n"+
+			"Please verify your email address by opening the link below:\n\n"+
+			"%s\n\n"+
+			"If the link does not work, you can verify manually by submitting this\n"+
+			"token to the verify-email endpoint (POST /v1/auth/verify-email):\n\n"+
+			"%s\n\n"+
+			"This link is single-use and expires soon. If you did not create this\n"+
 			"account you can safely ignore this message.\n",
+		verifyURL,
 		token,
+	)
+}
+
+// verificationBodyHTML renders the HTML alternative part. The verify URL is an
+// anchor (primary CTA); the raw token is shown as a secondary fallback. Both the
+// URL and token are HTML-escaped before interpolation — they are system-generated
+// here, but escaping keeps the markup well-formed and injection-proof regardless.
+func verificationBodyHTML(verifyURL, token string) string {
+	escURL := html.EscapeString(verifyURL)
+	escToken := html.EscapeString(token)
+
+	return fmt.Sprintf(
+		"<p>Welcome to CoverOnes!</p>"+
+			"<p>Please verify your email address by clicking the button below:</p>"+
+			"<p><a href=\"%s\">Verify my email</a></p>"+
+			"<p>If the button does not work, copy this link into your browser:<br>%s</p>"+
+			"<p>Alternatively, submit this token to the verify-email endpoint "+
+			"(POST /v1/auth/verify-email):<br><code>%s</code></p>"+
+			"<p>This link is single-use and expires soon. If you did not create this "+
+			"account you can safely ignore this message.</p>",
+		escURL,
+		escURL,
+		escToken,
 	)
 }

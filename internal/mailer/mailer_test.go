@@ -1,6 +1,7 @@
 package mailer_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -62,6 +63,71 @@ func TestNewSMTPMailer(t *testing.T) {
 
 			require.NoError(t, err)
 			assert.NotNil(t, m)
+		})
+	}
+}
+
+// TestRenderVerification_ContainsClickableURL is load-bearing for the Inc1 MAJOR
+// finding: the /register/verify-sent screen promises a clickable link, so the
+// rendered email MUST contain <AppBaseURL>/verify-email?token=<token> as the
+// primary CTA in BOTH the plain-text and HTML parts. The test would fail if the
+// URL were dropped or built from the wrong base.
+func TestRenderVerification_ContainsClickableURL(t *testing.T) {
+	t.Parallel()
+
+	const token = "abc123_DEF-456" // representative base64url token (no padding chars)
+
+	tests := []struct {
+		name    string
+		baseURL string
+		wantURL string
+	}{
+		{
+			name:    "default dev base URL when unset",
+			baseURL: "",
+			wantURL: "http://localhost:5500/verify-email?token=abc123_DEF-456",
+		},
+		{
+			name:    "custom base URL",
+			baseURL: "https://app.coverones.com",
+			wantURL: "https://app.coverones.com/verify-email?token=abc123_DEF-456",
+		},
+		{
+			name:    "trailing slash on base URL is trimmed",
+			baseURL: "https://app.coverones.com/",
+			wantURL: "https://app.coverones.com/verify-email?token=abc123_DEF-456",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := mailer.Config{
+				Host: "smtp.example.com", Port: 587, From: "no-reply@example.com",
+				AppBaseURL: tc.baseURL,
+			}
+			m, err := mailer.NewSMTPMailer(&cfg)
+			require.NoError(t, err)
+
+			textBody, htmlBody := m.RenderVerification(token)
+
+			// Primary CTA URL present in BOTH parts.
+			assert.Contains(t, textBody, tc.wantURL, "plain-text body must contain the clickable verify URL")
+			assert.Contains(t, htmlBody, tc.wantURL, "html body must contain the clickable verify URL")
+
+			// HTML part exposes the URL as a clickable anchor.
+			assert.Contains(t, htmlBody, `href="`+tc.wantURL+`"`, "html body must link the verify URL as an anchor")
+
+			// Raw token retained only as a secondary fallback line.
+			assert.Contains(t, textBody, token, "plain-text body keeps the raw token as fallback")
+
+			// The URL is the PRIMARY instruction: it appears before the fallback token
+			// mention in the plain-text body.
+			urlIdx := strings.Index(textBody, tc.wantURL)
+			tokenLineIdx := strings.LastIndex(textBody, token)
+			require.GreaterOrEqual(t, urlIdx, 0)
+			assert.Less(t, urlIdx, tokenLineIdx, "verify URL must be presented before the fallback token")
 		})
 	}
 }

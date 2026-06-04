@@ -218,11 +218,16 @@ func postJSON(t *testing.T, r http.Handler, path string, body any) *httptest.Res
 	return w
 }
 
-func getJSON(t *testing.T, r http.Handler, path, authHeader string) *httptest.ResponseRecorder {
+// getMe issues an authenticated GET against /v1/me (the only path these handler
+// tests exercise via this helper). authHeader is the full Authorization value
+// ("Bearer <token>", or "" to omit it).
+func getMe(t *testing.T, r http.Handler, authHeader string) *httptest.ResponseRecorder {
 	t.Helper()
 
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, http.NoBody)
-	req.Header.Set("Authorization", authHeader)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/me", http.NoBody)
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -522,7 +527,7 @@ func TestGetMe_HappyPath(t *testing.T) {
 	token, err := signer.Issue(u.ID.String(), u.AccountType, u.KYCTier, u.TokenVersion, u.EmailVerified)
 	require.NoError(t, err)
 
-	w := getJSON(t, r, "/v1/me", "Bearer "+token)
+	w := getMe(t, r, "Bearer "+token)
 
 	assert.Equal(t, http.StatusOK, w.Code)
 
@@ -532,16 +537,69 @@ func TestGetMe_HappyPath(t *testing.T) {
 	assert.Equal(t, "frank@example.com", data["email"])
 }
 
+// TestGetMe_EmailVerifiedReflectsDB is load-bearing for the Inc1 web-app gate:
+// the frontend hydrates the logged-in user from GET /v1/me and clears the
+// "請先驗證 email" banner only when emailVerified is truthy. This test fails if the
+// field is dropped from the response map (key absent) OR if it stops reflecting
+// the stored users.email_verified value.
+func TestGetMe_EmailVerifiedReflectsDB(t *testing.T) {
+	tests := []struct {
+		name          string
+		emailVerified bool
+		status        string
+	}{
+		{name: "verified user → true", emailVerified: true, status: "ACTIVE"},
+		{name: "unverified user → false", emailVerified: false, status: "PENDING_VERIFICATION"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r, signer, userStore := buildRouter(t)
+
+			now := time.Now().UTC()
+			u := &domain.User{
+				ID:            uuid.New(),
+				Email:         "verify-state@example.com",
+				DisplayName:   "Vera",
+				AccountType:   "PERSONAL",
+				KYCTier:       0,
+				Status:        tc.status,
+				EmailVerified: tc.emailVerified,
+				CreatedAt:     now,
+				UpdatedAt:     now,
+			}
+			require.NoError(t, userStore.Create(context.Background(), u))
+
+			token, err := signer.Issue(u.ID.String(), u.AccountType, u.KYCTier, u.TokenVersion, u.EmailVerified)
+			require.NoError(t, err)
+
+			w := getMe(t, r, "Bearer "+token)
+			require.Equal(t, http.StatusOK, w.Code)
+
+			var resp map[string]any
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			data, ok := resp["data"].(map[string]any)
+			require.True(t, ok, "response must carry a data object")
+
+			// The key MUST be present (load-bearing: a missing key would make the
+			// frontend treat emailVerified as undefined→falsy and never clear the gate).
+			got, present := data["emailVerified"]
+			require.True(t, present, "GET /v1/me response must include emailVerified")
+			assert.Equal(t, tc.emailVerified, got, "emailVerified must reflect the stored DB value")
+		})
+	}
+}
+
 func TestGetMe_Unauthorized(t *testing.T) {
 	r, _, _ := buildRouter(t)
 
-	w := getJSON(t, r, "/v1/me", "")
+	w := getMe(t, r, "")
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 func TestGetMe_InvalidToken(t *testing.T) {
 	r, _, _ := buildRouter(t)
 
-	w := getJSON(t, r, "/v1/me", "Bearer not.a.jwt")
+	w := getMe(t, r, "Bearer not.a.jwt")
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }

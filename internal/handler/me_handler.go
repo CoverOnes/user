@@ -41,14 +41,15 @@ func (h *MeHandler) Get(c *gin.Context) {
 	}
 
 	httpx.OK(c, gin.H{
-		"id":          u.ID,
-		"email":       u.Email,
-		"displayName": u.DisplayName,
-		"avatarUrl":   u.AvatarURL,
-		"accountType": u.AccountType,
-		"kycTier":     u.KYCTier,
-		"status":      u.Status,
-		"companyId":   u.CompanyID,
-		"createdAt":   u.CreatedAt,
+		"id":            u.ID,
+		"email":         u.Email,
+		"displayName":   u.DisplayName,
+		"avatarUrl":     u.AvatarURL,
+		"accountType":   u.AccountType,
+		"kycTier":       u.KYCTier,
+		"status":        u.Status,
+		"companyId":     u.CompanyID,
+		"emailVerified": u.EmailVerified,
+		"createdAt":     u.CreatedAt,
 	})
 }
