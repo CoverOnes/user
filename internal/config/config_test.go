@@ -160,8 +160,10 @@ func TestLoad_EventHMACSecret_DevOptional(t *testing.T) {
 		"USER_PORT", "8080",
 		"USER_LOG_LEVEL", "INFO",
 		"USER_ENV", "development",
+		// Shared, un-prefixed name; empty value exercises the dev-optional path
+		// while t.Setenv guarantees restoration after the test.
+		"EVENT_HMAC_SECRET", "",
 	)
-	os.Unsetenv("USER_EVENT_HMAC_SECRET") //nolint:errcheck // test cleanup
 
 	cfg, err := config.Load()
 	require.NoError(t, err)
@@ -176,12 +178,12 @@ func TestLoad_EventHMACSecret_ProdRequired(t *testing.T) {
 		"USER_LOG_LEVEL", "INFO",
 		"USER_ENV", "production",
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
+		"EVENT_HMAC_SECRET", "",
 	)
-	os.Unsetenv("USER_EVENT_HMAC_SECRET") //nolint:errcheck // test cleanup
 
 	_, err := config.Load()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "USER_EVENT_HMAC_SECRET")
+	assert.Contains(t, err.Error(), "EVENT_HMAC_SECRET")
 }
 
 func TestLoad_EventHMACSecret_ProdTooShort(t *testing.T) {
@@ -192,12 +194,12 @@ func TestLoad_EventHMACSecret_ProdTooShort(t *testing.T) {
 		"USER_LOG_LEVEL", "INFO",
 		"USER_ENV", "production",
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
-		"USER_EVENT_HMAC_SECRET", "too-short",
+		"EVENT_HMAC_SECRET", "too-short",
 	)
 
 	_, err := config.Load()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "USER_EVENT_HMAC_SECRET")
+	assert.Contains(t, err.Error(), "EVENT_HMAC_SECRET")
 }
 
 func TestLoad_EventHMACSecret_ProdValid(t *testing.T) {
@@ -208,7 +210,7 @@ func TestLoad_EventHMACSecret_ProdValid(t *testing.T) {
 		"USER_LOG_LEVEL", "INFO",
 		"USER_ENV", "production",
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
-		"USER_EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
+		"EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
 	)
 
 	cfg, err := config.Load()

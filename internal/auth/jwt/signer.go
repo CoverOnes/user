@@ -55,7 +55,7 @@ func NewEphemeralSigner(ttl time.Duration) (*Signer, error) {
 		return nil, fmt.Errorf("generate ed25519 key: %w", err)
 	}
 
-	slog.Warn("EPHEMERAL ED25519 KEY in use — tokens will not survive restart; set USER_JWT_ED25519_PRIVATE_KEY for production")
+	slog.Warn("EPHEMERAL ED25519 KEY in use — tokens will not survive restart; set USER_JWT_PRIVATE_KEY for production")
 
 	return &Signer{
 		privateKey: priv,
@@ -107,7 +107,8 @@ func (s *Signer) Issue(userID, accountType string, kycTier int16, tokenVersion i
 // Verify parses and validates a JWT string, returning the embedded claims.
 // It rejects alg=none and any non-EdDSA algorithm.
 func (s *Signer) Verify(tokenStr string) (*Claims, error) {
-	token, err := jwt.ParseWithClaims(tokenStr, &Claims{},
+	token, err := jwt.ParseWithClaims(
+		tokenStr, &Claims{},
 		func(t *jwt.Token) (any, error) {
 			return s.publicKey, nil
 		},
