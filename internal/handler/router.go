@@ -88,12 +88,21 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	if cfg.MFA != nil {
 		mfaH := NewMFAHandler(cfg.MFA)
 		totp := me.Group("/mfa/totp")
+
+		// Per-authenticated-user (JWT subject) brute-force limiter on the CODE endpoints
+		// (confirm / verify / disable). Budget 5 attempts/min/user keyed rl:mfa:<subject>.
+		// It FAILS CLOSED on a Redis outage — unlike the login limiter (which fails open
+		// for availability), an unbounded TOTP-code-guessing window is a brute-force
+		// oracle (CWE-307), so a Redis error must DENY rather than open it. Enroll is
+		// deliberately NOT limited here: it takes no code, so it is not a guessing surface.
+		mfaCodeRL := middleware.NewMFACodeLimiter(cfg.Redis, 5, time.Minute)
+
 		totp.POST("/enroll", mfaH.Enroll)
-		totp.POST("/confirm", mfaH.Confirm)
-		totp.POST("/verify", mfaH.Verify)
-		totp.POST("/disable", mfaH.Disable)
-		// DELETE alias for disable (same {code}-verified semantics).
-		totp.DELETE("", mfaH.Disable)
+		totp.POST("/confirm", mfaCodeRL.Handler(), mfaH.Confirm)
+		totp.POST("/verify", mfaCodeRL.Handler(), mfaH.Verify)
+		totp.POST("/disable", mfaCodeRL.Handler(), mfaH.Disable)
+		// DELETE alias for disable (same {code}-verified semantics + same code limiter).
+		totp.DELETE("", mfaCodeRL.Handler(), mfaH.Disable)
 	}
 
 	return r

@@ -187,20 +187,45 @@ func (s *UserStore) SetPendingTOTPSecret(ctx context.Context, id uuid.UUID, secr
 // EnableMFA flips mfa_enabled=true, stores the encrypted backup codes, and stamps
 // mfa_enrolled_at. The pending secret already in totp_secret_enc becomes the active
 // secret. Called by confirm only after the submitted code verified.
+//
+// The UPDATE is ATOMIC + CONDITIONAL (mfa_enabled = false): it closes the TOCTOU window
+// (CWE-367) where two concurrent Confirm calls both pass the service-layer
+// GetByID→!MFAEnabled check and each writes a fresh backup-code set. Only ONE UPDATE can
+// observe mfa_enabled = false, so only one backup-code set is ever persisted.
+//
+// A CTE distinguishes the three outcomes from a single round-trip:
+//   - no row exists (unknown / soft-deleted user)  → ErrNotFound
+//   - row exists but mfa_enabled was already true   → ErrMFAAlreadyEnabled
+//   - row updated                                    → nil
+//
+// `target` selects the live row (or none); `upd` performs the guarded write and reports
+// which ids it touched. We then read existed vs updated to pick the precise error.
 func (s *UserStore) EnableMFA(ctx context.Context, id uuid.UUID, backupCodesEnc []byte, enrolledAt time.Time) error {
 	q := `
-	UPDATE users
-	SET mfa_enabled = true, mfa_backup_codes_enc = $2, mfa_enrolled_at = $3, updated_at = now()
-	WHERE id = $1 AND deleted_at IS NULL
+	WITH target AS (
+		SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL
+	), upd AS (
+		UPDATE users
+		SET mfa_enabled = true, mfa_backup_codes_enc = $2, mfa_enrolled_at = $3, updated_at = now()
+		WHERE id = $1 AND deleted_at IS NULL AND mfa_enabled = false
+		RETURNING id
+	)
+	SELECT
+		(SELECT count(*) FROM target) AS existed,
+		(SELECT count(*) FROM upd)    AS updated
 	`
 
-	tag, err := s.pool.Exec(ctx, q, id, backupCodesEnc, enrolledAt)
-	if err != nil {
+	var existed, updated int
+	if err := s.pool.QueryRow(ctx, q, id, backupCodesEnc, enrolledAt).Scan(&existed, &updated); err != nil {
 		return fmt.Errorf("enable mfa: %w", err)
 	}
 
-	if tag.RowsAffected() == 0 {
+	if existed == 0 {
 		return domain.ErrNotFound
+	}
+	if updated == 0 {
+		// Row exists but the guard (mfa_enabled = false) failed → already enabled.
+		return domain.ErrMFAAlreadyEnabled
 	}
 
 	return nil

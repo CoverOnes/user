@@ -7,8 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CoverOnes/user/internal/auth/jwt"
+	"github.com/CoverOnes/user/internal/domain"
 	"github.com/CoverOnes/user/internal/platform/middleware"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -219,4 +222,110 @@ func TestRateLimiter_SlidingWindow_BoundaryBurst(t *testing.T) {
 	time.Sleep(window) // total elapsed now ≈ 2s + 1.1s ≫ window since the first burst
 	assert.Equal(t, http.StatusOK, doPing(t, r),
 		"after the original burst ages out, a fresh request should pass")
+}
+
+// buildMFACodeLimiterRouter wires a GET /code endpoint behind Auth + the per-subject MFA
+// code limiter so tests drive the real middleware path. It returns the router plus a
+// signed token for the given subject so requests carry authentic JWT claims (the limiter
+// keys on claims.Subject).
+func buildMFACodeLimiterRouter(t *testing.T, rl *middleware.SubjectLimiter, subject string) (router *gin.Engine, token string) {
+	t.Helper()
+
+	signer, err := jwt.NewEphemeralSigner(10 * time.Minute)
+	require.NoError(t, err)
+
+	token, err = signer.Issue(subject, domain.AccountTypePersonal, 0, 0, false)
+	require.NoError(t, err)
+
+	router = gin.New()
+	g := router.Group("/code")
+	g.Use(middleware.Auth(signer))
+	g.Use(rl.Handler())
+	g.GET("", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	return router, token
+}
+
+func doCode(t *testing.T, r http.Handler, token string) int {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/code", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	return w.Code
+}
+
+// TestMFACodeLimiter_PerSubjectSixthAttempt429 proves the per-authenticated-user budget:
+// with limit 5 the first five code attempts within the window pass and the SIXTH for the
+// same JWT subject is rejected with 429 (CWE-307 brute-force throttle). A DIFFERENT
+// subject keeps its own independent budget.
+func TestMFACodeLimiter_PerSubjectSixthAttempt429(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping Redis integration test in short mode")
+	}
+
+	const (
+		limit  = 5
+		window = 2 * time.Second
+	)
+
+	rdb := startTestRedis(t)
+	rl := middleware.NewMFACodeLimiter(rdb, limit, window)
+
+	subject := uuid.NewString()
+	r, token := buildMFACodeLimiterRouter(t, rl, subject)
+
+	// First `limit` (5) attempts for this user pass.
+	for i := 0; i < limit; i++ {
+		require.Equal(t, http.StatusOK, doCode(t, r, token), "attempt %d within budget should pass", i+1)
+	}
+
+	// The 6th attempt within the window is rejected.
+	require.Equal(t, http.StatusTooManyRequests, doCode(t, r, token), "6th code attempt within a minute must be 429")
+
+	// A different subject has its own budget (per-user keying, not global).
+	rOther, otherToken := buildMFACodeLimiterRouter(t, rl, uuid.NewString())
+	assert.Equal(t, http.StatusOK, doCode(t, rOther, otherToken), "a different user must have an independent budget")
+
+	// After the window elapses the original user is admitted again.
+	time.Sleep(window + 200*time.Millisecond)
+	assert.Equal(t, http.StatusOK, doCode(t, r, token), "after the window elapses, attempts should pass again")
+}
+
+// TestMFACodeLimiter_FailsClosedOnRedisError proves the fail-CLOSED contract (the
+// OPPOSITE of the login EmailLimiter): when the Redis client errors, the limiter DENIES
+// (429) rather than opening the brute-force window. The error is forced by closing the
+// client before the request so script.Run returns a connection error.
+func TestMFACodeLimiter_FailsClosedOnRedisError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping Redis integration test in short mode")
+	}
+
+	rdb := startTestRedis(t)
+	// Close the client so every subsequent script.Run errors (simulated Redis outage).
+	require.NoError(t, rdb.Close())
+
+	rl := middleware.NewMFACodeLimiter(rdb, 5, time.Minute)
+	r, token := buildMFACodeLimiterRouter(t, rl, uuid.NewString())
+
+	// A Redis error MUST deny (fail closed), unlike the login limiter which fails open.
+	assert.Equal(t, http.StatusTooManyRequests, doCode(t, r, token),
+		"a Redis outage must DENY the TOTP code endpoint (fail closed), not open the brute-force window")
+}
+
+// TestMFACodeLimiter_NilRedisPassThrough proves the dev-mode contract: a nil Redis
+// client disables the control (pass through) so local development without Redis is
+// usable. This is distinct from a Redis ERROR, which fails closed.
+func TestMFACodeLimiter_NilRedisPassThrough(t *testing.T) {
+	t.Parallel()
+
+	rl := middleware.NewMFACodeLimiter(nil, 5, time.Minute)
+	r, token := buildMFACodeLimiterRouter(t, rl, uuid.NewString())
+
+	// With nil Redis (dev mode) every attempt passes — the limiter is disabled, not failing closed.
+	for i := 0; i < 8; i++ {
+		assert.Equal(t, http.StatusOK, doCode(t, r, token), "nil-Redis (dev mode) attempt %d should pass", i+1)
+	}
 }

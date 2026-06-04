@@ -176,6 +176,24 @@ func TestMFAService_Confirm(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("code outside the skew window (now-90s, ±3 steps) is rejected", func(t *testing.T) {
+		// Guards against a future widening of totpSkewSteps slipping through CI. 90s ago
+		// is ±3 thirty-second steps — well outside the ±1 (±30s) Skew window — so the code
+		// MUST be rejected. If someone widens the skew, this test fails loudly. The
+		// accepted-edge (now-30s, ±1) is covered by the test above.
+		svc, users, id := newMFAFixture(t)
+
+		out, err := svc.Enroll(context.Background(), id)
+		require.NoError(t, err)
+
+		code := generateValidCode(t, out.Secret, time.Now().Add(-90*time.Second))
+		_, err = svc.Confirm(context.Background(), id, code)
+		assert.ErrorIs(t, err, domain.ErrInvalidTOTPCode)
+
+		u, _ := users.GetByID(context.Background(), id)
+		assert.False(t, u.MFAEnabled, "a code outside the skew window must not enable MFA")
+	})
+
 	t.Run("wrong code is rejected without enabling MFA", func(t *testing.T) {
 		svc, users, id := newMFAFixture(t)
 
@@ -211,6 +229,38 @@ func TestMFAService_Confirm(t *testing.T) {
 		// store still reflects enabled state
 		u, _ := users.GetByID(context.Background(), id)
 		assert.True(t, u.MFAEnabled)
+	})
+
+	t.Run("second sequential confirm keeps the first backup-code set (TOCTOU)", func(t *testing.T) {
+		// Regression for CWE-367: even though the service GetByID→!MFAEnabled fast-path
+		// could be raced, the atomic EnableMFA is the real guard. A second Confirm must
+		// return ErrMFAAlreadyEnabled AND leave the FIRST confirm's persisted backup
+		// codes untouched (the loser's fresh-but-unpersisted set is discarded).
+		svc, users, id := newMFAFixture(t)
+		out, err := svc.Enroll(context.Background(), id)
+		require.NoError(t, err)
+
+		code := generateValidCode(t, out.Secret, time.Now())
+		first, err := svc.Confirm(context.Background(), id, code)
+		require.NoError(t, err)
+		require.Len(t, first.BackupCodes, 10)
+
+		// Capture exactly what was persisted by the first (winning) confirm.
+		u, err := users.GetByID(context.Background(), id)
+		require.NoError(t, err)
+		persistedAfterFirst := append([]byte(nil), u.MFABackupCodesEnc...)
+		require.NotEmpty(t, persistedAfterFirst)
+
+		// Second confirm → rejected, and it must NOT return a fresh code set.
+		second, err := svc.Confirm(context.Background(), id, code)
+		assert.ErrorIs(t, err, domain.ErrMFAAlreadyEnabled)
+		assert.Nil(t, second, "rejected confirm must not return a backup-code set")
+
+		// The persisted backup codes are still the first set — not overwritten.
+		u, err = users.GetByID(context.Background(), id)
+		require.NoError(t, err)
+		assert.Equal(t, persistedAfterFirst, u.MFABackupCodesEnc,
+			"the first confirm's backup codes must remain the persisted set")
 	})
 }
 

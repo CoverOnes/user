@@ -198,19 +198,34 @@ func (s *txUserStore) SetPendingTOTPSecret(ctx context.Context, id uuid.UUID, se
 	return nil
 }
 
+// EnableMFA mirrors UserStore.EnableMFA: an ATOMIC + CONDITIONAL (mfa_enabled = false)
+// write that closes the TOCTOU window (CWE-367). The CTE separates not-found from
+// already-enabled so a second concurrent Confirm gets ErrMFAAlreadyEnabled rather than
+// silently overwriting the first backup-code set. See user_store.go for the full rationale.
 func (s *txUserStore) EnableMFA(ctx context.Context, id uuid.UUID, backupCodesEnc []byte, enrolledAt time.Time) error {
 	q := `
-	UPDATE users
-	SET mfa_enabled = true, mfa_backup_codes_enc = $2, mfa_enrolled_at = $3, updated_at = now()
-	WHERE id = $1 AND deleted_at IS NULL`
+	WITH target AS (
+		SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL
+	), upd AS (
+		UPDATE users
+		SET mfa_enabled = true, mfa_backup_codes_enc = $2, mfa_enrolled_at = $3, updated_at = now()
+		WHERE id = $1 AND deleted_at IS NULL AND mfa_enabled = false
+		RETURNING id
+	)
+	SELECT
+		(SELECT count(*) FROM target) AS existed,
+		(SELECT count(*) FROM upd)    AS updated`
 
-	tag, err := s.tx.Exec(ctx, q, id, backupCodesEnc, enrolledAt)
-	if err != nil {
+	var existed, updated int
+	if err := s.tx.QueryRow(ctx, q, id, backupCodesEnc, enrolledAt).Scan(&existed, &updated); err != nil {
 		return fmt.Errorf("enable mfa (tx): %w", err)
 	}
 
-	if tag.RowsAffected() == 0 {
+	if existed == 0 {
 		return domain.ErrNotFound
+	}
+	if updated == 0 {
+		return domain.ErrMFAAlreadyEnabled
 	}
 
 	return nil

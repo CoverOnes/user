@@ -152,6 +152,10 @@ func (s *MFAService) Confirm(ctx context.Context, userID uuid.UUID, code string)
 		return nil, err
 	}
 
+	// Fast-path reject. This is NOT the security boundary against the
+	// confirm-twice race (CWE-367): two concurrent calls can both read MFAEnabled=false
+	// here. The authoritative guard is the ATOMIC conditional UPDATE in EnableMFA below,
+	// which returns ErrMFAAlreadyEnabled to the loser of the race.
 	if u.MFAEnabled {
 		return nil, domain.ErrMFAAlreadyEnabled
 	}
@@ -183,6 +187,10 @@ func (s *MFAService) Confirm(ctx context.Context, userID uuid.UUID, code string)
 		return nil, fmt.Errorf("encrypt backup codes: %w", err)
 	}
 
+	// EnableMFA is the atomic guard: if a concurrent Confirm already enabled MFA, this
+	// returns ErrMFAAlreadyEnabled and we must NOT return the freshly-minted (but never
+	// persisted) backup codes — doing so would hand the caller a code set that can never
+	// be used, while the first caller's persisted set is the real one.
 	if err := s.users.EnableMFA(ctx, userID, codesEnc, s.now().UTC()); err != nil {
 		return nil, err
 	}

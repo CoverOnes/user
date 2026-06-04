@@ -150,6 +150,34 @@ func TestUserStore_MFA_Integration(t *testing.T) {
 		assert.JSONEq(t, `["b","c"]`, dec)
 	})
 
+	t.Run("second EnableMFA is rejected and keeps the first backup codes (TOCTOU)", func(t *testing.T) {
+		// Regression for CWE-367 against REAL Postgres: the conditional
+		// (WHERE mfa_enabled = false) UPDATE must let only ONE EnableMFA win. The second
+		// call returns ErrMFAAlreadyEnabled and must NOT overwrite the first code set.
+		u := seedActiveUser(t, ctx, us, "mfa-toctou@integration.test")
+		secretEnc, err := enc.Encrypt("TOCTOUSECRETTOCTOUSECRETTOCTOU12")
+		require.NoError(t, err)
+		require.NoError(t, us.SetPendingTOTPSecret(ctx, u.ID, secretEnc))
+
+		firstCodes, err := enc.Encrypt(`["first-1","first-2"]`)
+		require.NoError(t, err)
+		require.NoError(t, us.EnableMFA(ctx, u.ID, firstCodes, time.Now().UTC()))
+
+		// A second EnableMFA (the race loser) must be rejected, NOT silently overwrite.
+		secondCodes, err := enc.Encrypt(`["second-1","second-2"]`)
+		require.NoError(t, err)
+		err = us.EnableMFA(ctx, u.ID, secondCodes, time.Now().UTC())
+		assert.ErrorIs(t, err, domain.ErrMFAAlreadyEnabled)
+
+		// The persisted backup codes are still the FIRST set.
+		got, err := us.GetByID(ctx, u.ID)
+		require.NoError(t, err)
+		assert.True(t, got.MFAEnabled)
+		dec, err := enc.Decrypt(got.MFABackupCodesEnc)
+		require.NoError(t, err)
+		assert.JSONEq(t, `["first-1","first-2"]`, dec, "the first confirm's codes must survive")
+	})
+
 	t.Run("disable clears every MFA column", func(t *testing.T) {
 		u := seedActiveUser(t, ctx, us, "mfa-disable@integration.test")
 		secretEnc, _ := enc.Encrypt("DISABLEMEDISABLEMEDISABLEME12345")

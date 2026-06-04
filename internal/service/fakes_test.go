@@ -154,6 +154,12 @@ func (f *fakeUserStore) EnableMFA(_ context.Context, id uuid.UUID, backupCodesEn
 	if !ok {
 		return domain.ErrNotFound
 	}
+	// Mirror the store's ATOMIC conditional UPDATE (WHERE mfa_enabled = false): a second
+	// EnableMFA on an already-enabled row is rejected and does NOT overwrite the persisted
+	// backup codes, so the loser of a confirm-twice race gets ErrMFAAlreadyEnabled.
+	if u.MFAEnabled {
+		return domain.ErrMFAAlreadyEnabled
+	}
 	u.MFAEnabled = true
 	u.MFABackupCodesEnc = backupCodesEnc
 	u.MFAEnrolledAt = &enrolledAt
