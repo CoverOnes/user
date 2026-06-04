@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/CoverOnes/user/internal/auth/jwt"
 	"github.com/CoverOnes/user/internal/auth/password"
@@ -18,10 +19,23 @@ import (
 	"github.com/google/uuid"
 )
 
+// maxCompanyNameRunes bounds the company name length (rune count) to match the
+// handler's binding (max=200) and cap the worst-case ~1 MB-string DoS (P1).
+const maxCompanyNameRunes = 200
+
 // Transactioner is implemented by store backends that support DB transactions.
 // The AuthService uses it only for Register where user+company must be atomic.
 type Transactioner interface {
 	WithTx(ctx context.Context, fn func(ctx context.Context, users store.UserStore, companies store.CompanyStore) error) error
+}
+
+// LoginRateLimiter throttles login attempts per normalized email (credential-stuffing
+// defense, in addition to the IP-level middleware limiter). Implementations MUST fail
+// safe — returning true when the backing store is unavailable so a Redis outage cannot
+// lock every account out of login.
+type LoginRateLimiter interface {
+	// Allow reports whether a login attempt for the given normalized email is admitted.
+	Allow(ctx context.Context, normalizedEmail string) bool
 }
 
 // AuthService handles authentication business logic.
@@ -29,7 +43,8 @@ type AuthService struct {
 	users         store.UserStore
 	companies     store.CompanyStore
 	refreshTokens store.RefreshTokenStore
-	tx            Transactioner // may be nil for stores that don't support tx
+	tx            Transactioner    // may be nil for stores that don't support tx
+	loginLimiter  LoginRateLimiter // may be nil (per-email login throttling disabled)
 	signer        *jwt.Signer
 	accessTTL     time.Duration
 	refreshTTLH   int
@@ -55,6 +70,16 @@ func NewAuthService(
 		accessTTL:     accessTTL,
 		refreshTTLH:   refreshTTLHours,
 	}
+}
+
+// WithLoginRateLimiter installs a per-email login rate limiter and returns the
+// service for chaining. Passing nil (or never calling this) leaves per-email
+// throttling disabled. Kept separate from the constructor so existing call sites
+// and tests are unaffected.
+func (s *AuthService) WithLoginRateLimiter(l LoginRateLimiter) *AuthService {
+	s.loginLimiter = l
+
+	return s
 }
 
 // RegisterInput carries the validated registration request.
@@ -84,6 +109,14 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 
 	if in.AccountType == domain.AccountTypeCompany && strings.TrimSpace(in.CompanyName) == "" {
 		return nil, domain.ErrCompanyNameRequired
+	}
+
+	// Defense-in-depth rune-length guard (P1): the handler binding caps companyName at
+	// max=200, but the service is reachable independently (tests / internal callers),
+	// so enforce the same bound here. utf8.RuneCountInString counts user-visible runes,
+	// not bytes, so multi-byte names are measured fairly. Caps the ~1 MB-string DoS.
+	if utf8.RuneCountInString(in.CompanyName) > maxCompanyNameRunes {
+		return nil, domain.ErrCompanyNameTooLong
 	}
 
 	// Password complexity.
@@ -176,7 +209,16 @@ type TokenPair struct {
 
 // Login verifies credentials and issues a new token family.
 func (s *AuthService) Login(ctx context.Context, in LoginInput) (*TokenPair, error) {
-	u, err := s.users.GetByEmail(ctx, strings.ToLower(strings.TrimSpace(in.Email)))
+	normalizedEmail := strings.ToLower(strings.TrimSpace(in.Email))
+
+	// Per-email login rate limit (credential-stuffing defense, P1). Checked before the
+	// DB lookup and the (expensive) argon2 verification so a spray attack is throttled
+	// early. The limiter fails safe (allows) when Redis is unavailable.
+	if s.loginLimiter != nil && !s.loginLimiter.Allow(ctx, normalizedEmail) {
+		return nil, domain.ErrLoginRateLimited
+	}
+
+	u, err := s.users.GetByEmail(ctx, normalizedEmail)
 	if err != nil {
 		// Map not-found to invalid-credentials to prevent user enumeration.
 		if errors.Is(err, domain.ErrNotFound) {
@@ -186,13 +228,18 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*TokenPair, err
 		return nil, err
 	}
 
-	if u.Status == domain.UserStatusSuspended {
-		return nil, domain.ErrAccountSuspended
-	}
-
+	// Verify the password BEFORE revealing account status (enumeration mitigation, P1).
+	// An attacker who does not know the password must receive the same generic
+	// INVALID_CREDENTIALS as for a wrong password / unknown email, so they cannot probe
+	// which accounts exist and are suspended. Only a caller who proves knowledge of the
+	// correct password is told the account is suspended (legitimate-user UX preserved).
 	ok, err := password.Verify(in.Password, u.PasswordHash)
 	if err != nil || !ok {
 		return nil, domain.ErrInvalidCredentials
+	}
+
+	if u.Status == domain.UserStatusSuspended {
+		return nil, domain.ErrAccountSuspended
 	}
 
 	return s.issueTokenPair(ctx, u, nil, uuid.New(), in.DeviceFingerprint, in.IPAddr, in.UserAgent)

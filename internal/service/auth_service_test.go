@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,6 +133,47 @@ func TestAuthService_Register(t *testing.T) {
 			wantErr: domain.ErrWeakPassword,
 		},
 		{
+			name: "company name over 200 runes rejected (P1 DoS guard)",
+			in: service.RegisterInput{
+				Email:       "toolong@corp.com",
+				Password:    validPassword,
+				DisplayName: "TooLong",
+				AccountType: domain.AccountTypeCompany,
+				CompanyName: strings.Repeat("x", 201),
+			},
+			wantErr: domain.ErrCompanyNameTooLong,
+		},
+		{
+			name: "company name exactly 200 runes accepted (boundary)",
+			in: service.RegisterInput{
+				Email:       "boundary@corp.com",
+				Password:    validPassword,
+				DisplayName: "Boundary",
+				AccountType: domain.AccountTypeCompany,
+				CompanyName: strings.Repeat("x", 200),
+			},
+			assertOut: func(t *testing.T, out *service.RegisterOutput, c *fakeCompanyStore) {
+				require.NotNil(t, out)
+				require.Len(t, c.created, 1)
+				assert.Equal(t, 200, len(c.created[0].Name))
+			},
+		},
+		{
+			name: "company name 200 multibyte runes accepted (rune not byte count)",
+			in: service.RegisterInput{
+				Email:       "multibyte@corp.com",
+				Password:    validPassword,
+				DisplayName: "Multibyte",
+				AccountType: domain.AccountTypeCompany,
+				// 200 runes of a 3-byte character = 600 bytes but only 200 runes.
+				CompanyName: strings.Repeat("公", 200),
+			},
+			assertOut: func(t *testing.T, out *service.RegisterOutput, c *fakeCompanyStore) {
+				require.NotNil(t, out)
+				require.Len(t, c.created, 1)
+			},
+		},
+		{
 			name: "duplicate email surfaces store error",
 			in: service.RegisterInput{
 				Email:       "dup@example.com",
@@ -222,7 +264,7 @@ func TestAuthService_Login(t *testing.T) {
 			wantErr: domain.ErrInvalidCredentials,
 		},
 		{
-			name:  "suspended account rejected",
+			name:  "suspended account with correct password reveals suspension",
 			email: "suspended@example.com",
 			pass:  validPassword,
 			setup: func(u *fakeUserStore) {
@@ -231,6 +273,20 @@ func TestAuthService_Login(t *testing.T) {
 				u.put(usr)
 			},
 			wantErr: domain.ErrAccountSuspended,
+		},
+		{
+			// Enumeration mitigation (P1): a suspended account probed with the WRONG
+			// password must return the SAME generic INVALID_CREDENTIALS as any other
+			// failed login, so an attacker cannot discover which accounts are suspended.
+			name:  "suspended account with wrong password hides suspension (no enumeration)",
+			email: "suspended-wrong@example.com",
+			pass:  "totallyWrongPassword!",
+			setup: func(u *fakeUserStore) {
+				usr := seedUser(t, u, "suspended-wrong@example.com")
+				usr.Status = domain.UserStatusSuspended
+				u.put(usr)
+			},
+			wantErr: domain.ErrInvalidCredentials,
 		},
 		{
 			name:    "store error other than not-found is propagated",
@@ -273,6 +329,103 @@ func TestAuthService_Login(t *testing.T) {
 			assert.Len(t, rts.tokens, 1, "login must persist exactly one refresh token")
 		})
 	}
+}
+
+// fakeLoginLimiter is a controllable LoginRateLimiter for unit tests. It records the
+// emails it was asked about and returns the configured verdict.
+type fakeLoginLimiter struct {
+	allow bool
+	seen  []string
+}
+
+func (f *fakeLoginLimiter) Allow(_ context.Context, normalizedEmail string) bool {
+	f.seen = append(f.seen, normalizedEmail)
+
+	return f.allow
+}
+
+func TestAuthService_Login_PerEmailRateLimit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		allow       bool
+		wantErr     error
+		wantOK      bool
+		wantChecked bool
+	}{
+		{
+			name:        "limiter allows -> login succeeds",
+			allow:       true,
+			wantOK:      true,
+			wantChecked: true,
+		},
+		{
+			name:        "limiter denies -> rate limited before password check",
+			allow:       false,
+			wantErr:     domain.ErrLoginRateLimited,
+			wantChecked: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			users := newFakeUserStore()
+			rts := newFakeRefreshTokenStore()
+			seedUser(t, users, "limited@example.com")
+
+			limiter := &fakeLoginLimiter{allow: tc.allow}
+			svc := newAuthService(t, users, &fakeCompanyStore{}, rts).WithLoginRateLimiter(limiter)
+
+			pair, err := svc.Login(context.Background(), service.LoginInput{
+				Email:    "Limited@Example.com", // mixed case to prove normalization
+				Password: validPassword,
+				IPAddr:   netip.MustParseAddr("203.0.113.9"),
+			})
+
+			if tc.wantChecked {
+				require.Len(t, limiter.seen, 1)
+				assert.Equal(t, "limited@example.com", limiter.seen[0], "limiter must be keyed by normalized email")
+			}
+
+			if tc.wantErr != nil {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, tc.wantErr)
+				assert.Nil(t, pair)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, pair)
+			assert.NotEmpty(t, pair.AccessToken)
+		})
+	}
+}
+
+func TestAuthService_Login_RateLimitDeniedSkipsDBAndPassword(t *testing.T) {
+	t.Parallel()
+
+	// No user is seeded and getByEmailErr is set: if the limiter denied correctly,
+	// the service returns ErrLoginRateLimited WITHOUT touching the store, so the
+	// injected store error is never surfaced.
+	users := newFakeUserStore()
+	users.getByEmailErr = errInjected
+	rts := newFakeRefreshTokenStore()
+
+	limiter := &fakeLoginLimiter{allow: false}
+	svc := newAuthService(t, users, &fakeCompanyStore{}, rts).WithLoginRateLimiter(limiter)
+
+	_, err := svc.Login(context.Background(), service.LoginInput{
+		Email:    "spray@example.com",
+		Password: "whatever",
+		IPAddr:   netip.MustParseAddr("203.0.113.10"),
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, domain.ErrLoginRateLimited)
+	assert.NotErrorIs(t, err, errInjected, "rate-limit denial must short-circuit before the store call")
 }
 
 // loginAndGetToken runs a successful login and returns the raw refresh token plus

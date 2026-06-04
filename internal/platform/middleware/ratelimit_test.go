@@ -123,6 +123,50 @@ func TestRateLimiter_SlidingWindow_BasicLimit(t *testing.T) {
 	assert.Equal(t, http.StatusOK, doPing(t, r), "after window elapses, request should pass again")
 }
 
+// TestEmailLoginLimiter_NilRedisFailsOpen proves the per-email login limiter allows
+// every attempt when Redis is not configured (dev mode) — it must never lock users
+// out because the backing store is absent.
+func TestEmailLoginLimiter_NilRedisFailsOpen(t *testing.T) {
+	t.Parallel()
+
+	lim := middleware.NewEmailLoginLimiter(nil, 3, time.Minute)
+	for i := 0; i < 10; i++ {
+		assert.True(t, lim.Allow(context.Background(), "user@example.com"),
+			"nil-Redis limiter must allow attempt %d", i+1)
+	}
+}
+
+// TestEmailLoginLimiter_PerEmailLimit verifies that exactly `limit` attempts per
+// normalized email are admitted within the window and the next is denied, while a
+// DIFFERENT email is throttled independently (keys are per-email).
+func TestEmailLoginLimiter_PerEmailLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping Redis integration test in short mode")
+	}
+
+	const (
+		limit  = 3
+		window = 2 * time.Second
+	)
+
+	rdb := startTestRedis(t)
+	lim := middleware.NewEmailLoginLimiter(rdb, limit, window)
+	ctx := context.Background()
+
+	// First `limit` attempts for victim@example.com pass; the next is denied.
+	for i := 0; i < limit; i++ {
+		require.True(t, lim.Allow(ctx, "victim@example.com"), "attempt %d within limit should pass", i+1)
+	}
+	require.False(t, lim.Allow(ctx, "victim@example.com"), "attempt over limit must be denied")
+
+	// A different email is unaffected (independent key).
+	assert.True(t, lim.Allow(ctx, "other@example.com"), "a different email must have its own budget")
+
+	// After the window elapses the victim email is admitted again.
+	time.Sleep(window + 200*time.Millisecond)
+	assert.True(t, lim.Allow(ctx, "victim@example.com"), "after the window elapses, attempts should pass again")
+}
+
 // TestRateLimiter_SlidingWindow_BoundaryBurst is the decisive test that the fixed
 // window has been replaced by a true sliding window.
 //

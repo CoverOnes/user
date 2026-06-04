@@ -2,10 +2,14 @@ package events_test
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +28,62 @@ import (
 
 // testPasswordHash is a structurally-valid but inert argon2id hash for test fixtures.
 const testPasswordHash = "$argon2id$v=19$m=65536,t=3,p=2$abc$def" //nolint:gosec // G101: test fixture, not a real credential
+
+// testHMACSecret is the shared event-authentication secret used across consumer tests.
+const testHMACSecret = "this-is-a-32-byte-test-secret-xx" //nolint:gosec // G101: test fixture, not a real credential
+
+// contractSignature recomputes the EVENT HMAC CONTRACT signature exactly as the
+// kyc publisher must (and as the consumer verifies): lowercase hex of
+// HMAC-SHA256(secret, eventId|occurredAt|version|userId|newTier).
+func contractSignature(secret, eventID, occurredAt, version, userID, newTier string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	canonical := strings.Join([]string{eventID, occurredAt, version, userID, newTier}, "|")
+	_, _ = mac.Write([]byte(canonical))
+
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// signedEnvelope builds a kyc.tier_changed envelope JSON. When sign is true it
+// attaches a valid contract signature; when false the signature field is set to the
+// provided forgedSig (use "" to simulate a missing signature).
+func signedEnvelope(t *testing.T, userID uuid.UUID, oldTier, newTier int16, sign bool, forgedSig string) string {
+	t.Helper()
+
+	eventID := uuid.New()
+	// Fix the occurredAt textual form so signing and the wire bytes agree exactly.
+	occurredAt := time.Now().UTC().Format(time.RFC3339Nano)
+	const version = "1"
+
+	sig := forgedSig
+	if sign {
+		sig = contractSignature(
+			testHMACSecret,
+			eventID.String(),
+			occurredAt,
+			version,
+			userID.String(),
+			strconv.FormatInt(int64(newTier), 10),
+		)
+	}
+
+	data, err := json.Marshal(map[string]any{
+		"userId":  userID,
+		"oldTier": oldTier,
+		"newTier": newTier,
+	})
+	require.NoError(t, err)
+
+	envelope, err := json.Marshal(map[string]any{
+		"eventId":    eventID,
+		"occurredAt": occurredAt,
+		"version":    1,
+		"data":       json.RawMessage(data),
+		"signature":  sig,
+	})
+	require.NoError(t, err)
+
+	return string(envelope)
+}
 
 // startTestPostgres spins up a real Postgres container via testcontainers.
 func startTestPostgres(t *testing.T) string {
@@ -108,26 +168,12 @@ func runMigrations(t *testing.T, ctx context.Context, dsn string) {
 	}
 }
 
-// publishKYCTierChanged publishes a kyc.tier_changed event to Redis.
+// publishKYCTierChanged publishes a correctly-signed kyc.tier_changed event to Redis.
 func publishKYCTierChanged(t *testing.T, ctx context.Context, rdb *redis.Client, userID uuid.UUID, oldTier, newTier int16) {
 	t.Helper()
 
-	data, err := json.Marshal(map[string]any{
-		"userId":  userID,
-		"oldTier": oldTier,
-		"newTier": newTier,
-	})
-	require.NoError(t, err)
-
-	envelope, err := json.Marshal(map[string]any{
-		"eventId":    uuid.New(),
-		"occurredAt": time.Now().UTC(),
-		"version":    1,
-		"data":       json.RawMessage(data),
-	})
-	require.NoError(t, err)
-
-	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", string(envelope)).Err())
+	envelope := signedEnvelope(t, userID, oldTier, newTier, true, "")
+	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", envelope).Err())
 }
 
 // TestConsumer_KYCTierChanged verifies that publishing kyc.tier_changed updates users.kyc_tier.
@@ -174,7 +220,7 @@ func TestConsumer_KYCTierChanged(t *testing.T) {
 	require.NoError(t, userStore.Create(ctx, u))
 
 	// Start consumer in background.
-	consumer := events.NewConsumer(rdb, userStore)
+	consumer := events.NewConsumer(rdb, userStore, testHMACSecret)
 
 	consumerCtx, consumerCancel := context.WithCancel(context.Background())
 	defer consumerCancel()
@@ -184,7 +230,7 @@ func TestConsumer_KYCTierChanged(t *testing.T) {
 	// Give the subscription a moment to establish.
 	time.Sleep(100 * time.Millisecond)
 
-	// Publish kyc.tier_changed with newTier = 2.
+	// Publish a correctly-signed kyc.tier_changed with newTier = 2.
 	publishKYCTierChanged(t, ctx, rdb, u.ID, 0, 2)
 
 	// Poll for up to 3 seconds for the update to land.
@@ -197,17 +243,37 @@ func TestConsumer_KYCTierChanged(t *testing.T) {
 	}, 3*time.Second, 100*time.Millisecond, "kyc_tier should be updated to 2")
 }
 
-// TestConsumer_KYCTierChanged_BadPayload verifies that bad payloads are skipped without crashing.
-func TestConsumer_KYCTierChanged_BadPayload(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+// seedTestUser inserts an ACTIVE user with kyc_tier=0 and returns it.
+func seedTestUser(t *testing.T, ctx context.Context, userStore *postgres.UserStore, email string) *domain.User {
+	t.Helper()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	u := &domain.User{
+		ID:           uuid.New(),
+		Email:        email,
+		PasswordHash: testPasswordHash,
+		DisplayName:  "KYC User",
+		AccountType:  "PERSONAL",
+		KYCTier:      0,
+		Status:       "ACTIVE",
+		TokenVersion: 0,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	require.NoError(t, userStore.Create(ctx, u))
+
+	return u
+}
+
+// startConsumerStack spins up Postgres + Redis containers, applies migrations, starts
+// the consumer with the given secret, and returns the connected Redis client and store.
+func startConsumerStack(t *testing.T, secret string) (*redis.Client, *postgres.UserStore) {
+	t.Helper()
+
+	ctx := context.Background()
 
 	pgDSN := startTestPostgres(t)
-	runMigrations(t, context.Background(), pgDSN)
+	runMigrations(t, ctx, pgDSN)
 
 	redisURL := startTestRedis(t)
 	redisOpts, err := redis.ParseURL(redisURL)
@@ -218,18 +284,32 @@ func TestConsumer_KYCTierChanged_BadPayload(t *testing.T) {
 
 	pool, err := postgres.NewPool(ctx, pgDSN, "", 0, 0)
 	require.NoError(t, err)
-
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 
 	userStore := postgres.NewUserStore(pool)
 
-	consumer := events.NewConsumer(rdb, userStore)
+	consumer := events.NewConsumer(rdb, userStore, secret)
 
 	consumerCtx, consumerCancel := context.WithCancel(context.Background())
-	defer consumerCancel()
+	t.Cleanup(consumerCancel)
 
 	go consumer.Run(consumerCtx)
 	time.Sleep(100 * time.Millisecond)
+
+	return rdb, userStore
+}
+
+// TestConsumer_KYCTierChanged_BadPayload verifies that bad payloads are skipped
+// without crashing the loop AND without mutating any user's tier.
+func TestConsumer_KYCTierChanged_BadPayload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	rdb, userStore := startConsumerStack(t, testHMACSecret)
+
+	u := seedTestUser(t, ctx, userStore, "badpayload@example.test")
 
 	// Publish malformed JSON — consumer must not crash.
 	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", "not-valid-json").Err())
@@ -241,9 +321,61 @@ func TestConsumer_KYCTierChanged_BadPayload(t *testing.T) {
 	// Give consumer time to process (and survive) the bad payloads.
 	time.Sleep(300 * time.Millisecond)
 
-	// If we got here the consumer is still alive (it would have panicked if not resilient).
-	assert.True(t, true, "consumer survived bad payloads")
+	// Consumer survived AND applied nothing: the seeded user's tier is still 0.
+	got, err := userStore.GetByID(ctx, u.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int16(0), got.KYCTier, "bad payloads must not change kyc_tier")
 }
+
+// TestConsumer_ForgedSignature_Rejected is the decisive P0 test: an event with an
+// INVALID HMAC signature MUST be dropped — the user's tier must NOT change. Without
+// message authentication a forged Redis publish could elevate any user to Tier2.
+func TestConsumer_ForgedSignature_Rejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	rdb, userStore := startConsumerStack(t, testHMACSecret)
+
+	u := seedTestUser(t, ctx, userStore, "forged@example.test")
+
+	// Forged signature: attacker tries to elevate to Tier2 with a bogus signature.
+	forged := signedEnvelope(t, u.ID, 0, 2, false, "deadbeefdeadbeefdeadbeefdeadbeef")
+	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", forged).Err())
+
+	// Wait, then assert the tier was NOT changed (event dropped).
+	time.Sleep(500 * time.Millisecond)
+	got, err := userStore.GetByID(ctx, u.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int16(0), got.KYCTier, "forged-signature event must NOT change kyc_tier")
+}
+
+// TestConsumer_MissingSignature_Rejected verifies that an event with NO signature
+// field is dropped (the tier is not applied).
+func TestConsumer_MissingSignature_Rejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	rdb, userStore := startConsumerStack(t, testHMACSecret)
+
+	u := seedTestUser(t, ctx, userStore, "nosig@example.test")
+
+	// Empty signature ("") simulates a missing signature.
+	unsigned := signedEnvelope(t, u.ID, 0, 2, false, "")
+	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", unsigned).Err())
+
+	time.Sleep(500 * time.Millisecond)
+	got, err := userStore.GetByID(ctx, u.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int16(0), got.KYCTier, "missing-signature event must NOT change kyc_tier")
+}
+
+// NOTE: the valid-signature happy path (correctly-signed event IS applied) is covered
+// by TestConsumer_KYCTierChanged above, which publishes via the now-signing
+// publishKYCTierChanged helper and asserts kyc_tier becomes 2.
 
 // TestConsumer_NilRedis_DoesNotCrash verifies that a nil Redis client results in a no-op consumer.
 func TestConsumer_NilRedis_DoesNotCrash(t *testing.T) {
@@ -252,7 +384,7 @@ func TestConsumer_NilRedis_DoesNotCrash(t *testing.T) {
 	}
 
 	// Nil Redis — consumer must block on ctx.Done() without crashing.
-	consumer := events.NewConsumer(nil, nil)
+	consumer := events.NewConsumer(nil, nil, testHMACSecret)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()

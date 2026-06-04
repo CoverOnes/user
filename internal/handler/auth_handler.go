@@ -32,7 +32,7 @@ type RegisterRequest struct {
 	Password    string `json:"password" binding:"required,min=12,max=128"`
 	DisplayName string `json:"displayName" binding:"required,max=80"`
 	AccountType string `json:"accountType" binding:"required"`
-	CompanyName string `json:"companyName"`
+	CompanyName string `json:"companyName" binding:"max=200"`
 }
 
 // Register handles POST /v1/auth/register.
