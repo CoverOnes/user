@@ -102,19 +102,20 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, "", cfg.PostgresSchema)
 }
 
-func TestLoad_AppBaseURL_DefaultsToDevOrigin(t *testing.T) {
+func TestLoad_AppBaseURL_DevCanBeEmptyWhenSMTPUnset(t *testing.T) {
 	setEnv(
 		t,
 		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
 		"USER_PORT", "8080",
 		"USER_LOG_LEVEL", "INFO",
+		"USER_SMTP_HOST", "",
 	)
 
 	os.Unsetenv("USER_APP_BASE_URL") //nolint:errcheck // test cleanup
 
 	cfg, err := config.Load()
 	require.NoError(t, err)
-	assert.Equal(t, "http://localhost:5500", cfg.AppBaseURL, "USER_APP_BASE_URL must default to the dev frontend origin")
+	assert.Empty(t, cfg.AppBaseURL, "USER_APP_BASE_URL must not be invented by code")
 }
 
 func TestLoad_AppBaseURL_Configurable(t *testing.T) {
@@ -215,6 +216,7 @@ func setProdSecrets(t *testing.T) {
 
 	t.Setenv("USER_PII_ENCRYPTION_KEY", validPIIKeyB64)
 	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+	t.Setenv("USER_APP_BASE_URL", "https://app.coverones.com")
 }
 
 func TestLoad_EventHMACSecret_ProdRequired(t *testing.T) {
@@ -315,6 +317,7 @@ func TestLoad_PIIKey_DevShortKeyAccepted(t *testing.T) {
 func TestLoad_PIIKey_ProdMissingFails(t *testing.T) {
 	setBaseProdEnv(t)
 	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+	t.Setenv("USER_APP_BASE_URL", "https://app.coverones.com")
 	t.Setenv("USER_PII_ENCRYPTION_KEY", "")
 
 	_, err := config.Load()
@@ -325,6 +328,7 @@ func TestLoad_PIIKey_ProdMissingFails(t *testing.T) {
 func TestLoad_PIIKey_ProdWrongLengthFails(t *testing.T) {
 	setBaseProdEnv(t)
 	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+	t.Setenv("USER_APP_BASE_URL", "https://app.coverones.com")
 	// Valid base64 but decodes to 16 bytes, not 32.
 	t.Setenv("USER_PII_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZg==")
 
@@ -336,6 +340,7 @@ func TestLoad_PIIKey_ProdWrongLengthFails(t *testing.T) {
 func TestLoad_PIIKey_ProdNotBase64Fails(t *testing.T) {
 	setBaseProdEnv(t)
 	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+	t.Setenv("USER_APP_BASE_URL", "https://app.coverones.com")
 	t.Setenv("USER_PII_ENCRYPTION_KEY", "not!valid!base64!!!")
 
 	_, err := config.Load()
@@ -347,21 +352,49 @@ func TestLoad_SMTPHost_ProdRequired(t *testing.T) {
 	setBaseProdEnv(t)
 	t.Setenv("USER_PII_ENCRYPTION_KEY", validPIIKeyB64)
 	t.Setenv("USER_SMTP_HOST", "")
+	t.Setenv("USER_APP_BASE_URL", "https://app.coverones.com")
 
 	_, err := config.Load()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "USER_SMTP_HOST")
 }
 
+func TestLoad_AppBaseURL_ProdRequired(t *testing.T) {
+	setBaseProdEnv(t)
+	t.Setenv("USER_PII_ENCRYPTION_KEY", validPIIKeyB64)
+	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+	t.Setenv("USER_APP_BASE_URL", "")
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_APP_BASE_URL")
+}
+
+func TestLoad_AppBaseURL_RequiredWhenSMTPConfigured(t *testing.T) {
+	setEnv(
+		t,
+		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+		"USER_ENV", "development",
+		"USER_SMTP_HOST", "localhost",
+		"USER_APP_BASE_URL", "",
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_APP_BASE_URL")
+}
+
 func TestLoad_ProdAllSecretsValid(t *testing.T) {
 	setBaseProdEnv(t)
 	t.Setenv("USER_PII_ENCRYPTION_KEY", validPIIKeyB64)
 	t.Setenv("USER_SMTP_HOST", "smtp.example.com")
+	t.Setenv("USER_APP_BASE_URL", "https://app.coverones.com")
 
 	cfg, err := config.Load()
 	require.NoError(t, err)
 	assert.Equal(t, validPIIKeyB64, cfg.PIIEncryptionKey)
 	assert.Equal(t, "smtp.example.com", cfg.SMTPHost)
+	assert.Equal(t, "https://app.coverones.com", cfg.AppBaseURL)
 	assert.Equal(t, 587, cfg.SMTPPort, "smtp port default must be 587")
 }
 

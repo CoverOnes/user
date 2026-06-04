@@ -836,6 +836,23 @@ func TestAuthService_VerifyEmail(t *testing.T) {
 
 		require.NoError(t, svc.VerifyEmail(context.Background(), "raw-token-1"))
 		assert.True(t, users.byID[u.ID].EmailVerified, "user must be marked email_verified")
+		assert.Equal(t, int16(1), users.byID[u.ID].KYCTier, "email verification must promote the account to Tier 1")
+	})
+
+	t.Run("happy path does not downgrade existing higher KYC tier", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		u := seedUser(t, users, "tier2@example.com")
+		users.byID[u.ID].KYCTier = 2
+		verifications := newFakeVerificationStore()
+		seedVerificationToken(t, verifications, u.ID, "raw-token-tier2", time.Now().UTC().Add(time.Hour), nil)
+
+		svc := newVerificationService(t, users, verifications, &spyMailer{}, nil)
+
+		require.NoError(t, svc.VerifyEmail(context.Background(), "raw-token-tier2"))
+		assert.True(t, users.byID[u.ID].EmailVerified, "user must be marked email_verified")
+		assert.Equal(t, int16(2), users.byID[u.ID].KYCTier, "email verification must not downgrade existing KYC tier")
 	})
 
 	t.Run("single-use: second verify with same token fails", func(t *testing.T) {

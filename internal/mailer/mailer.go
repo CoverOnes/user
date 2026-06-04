@@ -34,17 +34,13 @@ type Config struct {
 	// AppBaseURL is the public frontend base URL used to build the clickable
 	// verification link (<AppBaseURL>/verify-email?token=<token>) presented as the
 	// primary call-to-action in the verification email. Any trailing slash is
-	// trimmed before joining the path. Falls back to defaultAppBaseURL when empty.
+	// trimmed before joining the path.
 	AppBaseURL string
 	// SendTimeout bounds a single send. Zero falls back to defaultSendTimeout.
 	SendTimeout time.Duration
 }
 
 const defaultSendTimeout = 10 * time.Second
-
-// defaultAppBaseURL is the dev frontend origin used when AppBaseURL is empty so
-// the verification link is always well-formed even in a bare local setup.
-const defaultAppBaseURL = "http://localhost:5500"
 
 // SMTPMailer is the production Mailer backed by an SMTP server.
 type SMTPMailer struct {
@@ -62,7 +58,7 @@ func NewSMTPMailer(cfg *Config) (*SMTPMailer, error) {
 	}
 
 	if strings.TrimSpace(c.AppBaseURL) == "" {
-		c.AppBaseURL = defaultAppBaseURL
+		return nil, fmt.Errorf("mailer: app base url is required")
 	}
 
 	opts := []mail.Option{

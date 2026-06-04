@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -173,9 +175,9 @@ func run() error {
 		return fmt.Errorf("init pii encryptor: %w", err)
 	}
 
-	// Verification mailer (SMTP). In dev without USER_SMTP_HOST the mailer is left
-	// nil — register still returns 201, it just skips the email (validate() requires
-	// the host outside dev).
+	// Verification mailer (SMTP). In dev without USER_SMTP_HOST, fall back to a
+	// log-only mailer so local registrations still expose a usable verify path.
+	// validate() requires USER_SMTP_HOST outside development.
 	var verificationMailer service.Mailer
 	if cfg.SMTPHost != "" {
 		m, mailerErr := mailer.NewSMTPMailer(&mailer.Config{
@@ -192,7 +194,8 @@ func run() error {
 
 		verificationMailer = m
 	} else {
-		slog.Warn("USER_SMTP_HOST not set; verification emails will be skipped (dev only)")
+		verificationMailer = devLogMailer{appBaseURL: cfg.AppBaseURL}
+		slog.Warn("USER_SMTP_HOST not set; verification email path will be logged (dev only)")
 	}
 
 	// Service layer.
@@ -279,6 +282,32 @@ func run() error {
 	authSvc.WaitForPendingSends()
 
 	slog.Info("server stopped")
+
+	return nil
+}
+
+type devLogMailer struct {
+	appBaseURL string
+}
+
+func (m devLogMailer) SendVerification(ctx context.Context, to, token string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	base := strings.TrimRight(strings.TrimSpace(m.appBaseURL), "/")
+	attrs := []any{"to", to}
+	if base != "" {
+		attrs = append(attrs, "verify_url", fmt.Sprintf("%s/verify-email?token=%s", base, neturl.QueryEscape(token)))
+	} else {
+		attrs = append(attrs, "verify_token", token, "hint", "set USER_APP_BASE_URL to log a clickable verification link")
+	}
+	slog.Warn(
+		"DEV EMAIL VERIFICATION LINK",
+		attrs...,
+	)
 
 	return nil
 }

@@ -108,6 +108,9 @@ func (f *fakeUserStore) SetEmailVerified(_ context.Context, id uuid.UUID) error 
 	for _, u := range f.users {
 		if u.ID == id {
 			u.EmailVerified = true
+			if u.KYCTier < 1 {
+				u.KYCTier = 1
+			}
 
 			return nil
 		}

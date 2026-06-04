@@ -82,9 +82,7 @@ type Config struct {
 
 	// AppBaseURL is the public frontend base URL used to build the clickable
 	// email-verification link (<AppBaseURL>/verify-email?token=<token>) in the
-	// verification mail. Sourced from USER_APP_BASE_URL; defaults to the dev
-	// frontend origin (http://localhost:5500) when unset. The trailing slash (if
-	// any) is trimmed at the mailer call site so the joined path is well-formed.
+	// verification mail. Sourced from USER_APP_BASE_URL.
 	AppBaseURL string `mapstructure:"app_base_url"`
 
 	// MFAEnforced is the RESERVED flag for the future login-enforcement step
@@ -166,7 +164,6 @@ func Load() (*Config, error) {
 	v.SetDefault("db_max_conns", 10)
 	v.SetDefault("db_min_conns", 2)
 	v.SetDefault("smtp_port", 587)
-	v.SetDefault("app_base_url", "http://localhost:5500")
 	v.SetDefault("mfa_enforced", false)
 	v.SetDefault("totp_issuer", "CoverOnes")
 
@@ -286,6 +283,12 @@ func (c *Config) validatePIIAndSMTP() []string {
 
 	if !c.IsDev() && c.SMTPHost == "" {
 		errs = append(errs, "USER_SMTP_HOST is required when USER_ENV != development")
+	}
+	if !c.IsDev() && strings.TrimSpace(c.AppBaseURL) == "" {
+		errs = append(errs, "USER_APP_BASE_URL is required when USER_ENV != development")
+	}
+	if c.SMTPHost != "" && strings.TrimSpace(c.AppBaseURL) == "" {
+		errs = append(errs, "USER_APP_BASE_URL is required when USER_SMTP_HOST is set")
 	}
 
 	return errs
