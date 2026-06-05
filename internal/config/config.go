@@ -127,6 +127,16 @@ type Config struct {
 	// issuer would corrupt the label).
 	TOTPIssuer string `mapstructure:"totp_issuer"`
 
+	// UserRateLimitPerMin is the sustained per-authenticated-user request rate for the
+	// /v1/me group (tokens per minute). Set USER_USER_RATE_LIMIT_PER_MIN to 0 to
+	// disable the limiter entirely (useful in tests or environments that rate-limit
+	// at the gateway layer instead). Default: 120.
+	UserRateLimitPerMin int `mapstructure:"user_rate_limit_per_min"`
+
+	// UserRateLimitBurst is the maximum burst size for the per-user /v1/me limiter.
+	// Sourced from USER_USER_RATE_LIMIT_BURST. Default: 20.
+	UserRateLimitBurst int `mapstructure:"user_rate_limit_burst"`
+
 	// Log level: DEBUG, INFO, WARN, ERROR
 	LogLevel string `mapstructure:"log_level"`
 
@@ -177,6 +187,8 @@ func Load() (*Config, error) {
 		"refresh_token_ttl_hours": "USER_REFRESH_TOKEN_TTL_HOURS",
 		"mfa_enforced":            "USER_MFA_ENFORCED",
 		"totp_issuer":             "USER_TOTP_ISSUER",
+		"user_rate_limit_per_min": "USER_USER_RATE_LIMIT_PER_MIN",
+		"user_rate_limit_burst":   "USER_USER_RATE_LIMIT_BURST",
 		"log_level":               "USER_LOG_LEVEL",
 		"env":                     "USER_ENV",
 	}
@@ -198,6 +210,8 @@ func Load() (*Config, error) {
 	v.SetDefault("mailer_backend", "smtp")
 	v.SetDefault("mfa_enforced", false)
 	v.SetDefault("totp_issuer", "CoverOnes")
+	v.SetDefault("user_rate_limit_per_min", 120)
+	v.SetDefault("user_rate_limit_burst", 20)
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
@@ -214,12 +228,31 @@ func Load() (*Config, error) {
 func (c *Config) validate() error {
 	errs := c.validateCore()
 	errs = append(errs, c.validateDB()...)
+	errs = append(errs, c.validateUserRateLimit()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
 	}
 
 	return nil
+}
+
+// validateUserRateLimit checks the per-authenticated-user rate limiter settings.
+// perMin == 0 disables the limiter (valid for gateway-layer rate-limiting environments).
+// When perMin > 0 the burst MUST also be positive — a zero-burst token bucket admits no
+// requests at all and is almost certainly a misconfiguration.
+func (c *Config) validateUserRateLimit() []string {
+	var errs []string
+
+	if c.UserRateLimitPerMin < 0 {
+		errs = append(errs, "USER_USER_RATE_LIMIT_PER_MIN must be >= 0 (0 disables the limiter)")
+	}
+
+	if c.UserRateLimitPerMin > 0 && c.UserRateLimitBurst <= 0 {
+		errs = append(errs, "USER_USER_RATE_LIMIT_BURST must be > 0 when USER_USER_RATE_LIMIT_PER_MIN > 0")
+	}
+
+	return errs
 }
 
 // validateCore checks server, JWT, and token TTL fields.

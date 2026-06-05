@@ -635,6 +635,70 @@ func setBaseCommsEnv(t *testing.T) {
 	t.Setenv("USER_MAILER_BACKEND", "comms")
 }
 
+// TestLoad_ValidateUserRateLimit covers all branches of validateUserRateLimit:
+// negative perMin is rejected, zero-burst with positive perMin is rejected,
+// zero perMin (disabled) is accepted, and a fully-valid pair is accepted.
+func TestLoad_ValidateUserRateLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		perMin    string
+		burst     string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:      "perMin < 0 is rejected",
+			perMin:    "-1",
+			burst:     "10",
+			wantErr:   true,
+			errSubstr: "USER_USER_RATE_LIMIT_PER_MIN must be >= 0",
+		},
+		{
+			name:      "perMin > 0 with burst <= 0 is rejected",
+			perMin:    "60",
+			burst:     "0",
+			wantErr:   true,
+			errSubstr: "USER_USER_RATE_LIMIT_BURST must be > 0",
+		},
+		{
+			name:    "perMin = 0 disables limiter (no-op pass)",
+			perMin:  "0",
+			burst:   "0",
+			wantErr: false,
+		},
+		{
+			name:    "valid perMin > 0 and burst > 0 passes",
+			perMin:  "120",
+			burst:   "20",
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Cannot use t.Parallel() here: setEnv calls t.Setenv, which is
+			// incompatible with parallel subtests (panic in Go 1.21+).
+			setEnv(
+				t,
+				"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+				"USER_PORT", "8080",
+				"USER_LOG_LEVEL", "INFO",
+				"USER_ENV", "development",
+				"USER_USER_RATE_LIMIT_PER_MIN", tc.perMin,
+				"USER_USER_RATE_LIMIT_BURST", tc.burst,
+			)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 // TestLoad_CommsMailer validates USER_COMMS_S2S_TOKEN and USER_COMMS_BASE_URL
 // enforcement in dev vs non-dev — mirrors the EVENT_HMAC_SECRET / GATEWAY_HMAC_SECRET pattern.
 func TestLoad_CommsMailer(t *testing.T) {
