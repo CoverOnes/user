@@ -23,6 +23,10 @@ const minEventHMACSecretLen = 32
 // piiKeyBytes is the required decoded length of USER_PII_ENCRYPTION_KEY (AES-256).
 const piiKeyBytes = 32
 
+// mailerBackendComms is the USER_MAILER_BACKEND value that delegates email to the
+// notification comms service rather than SMTP-sending directly.
+const mailerBackendComms = "comms"
+
 // Config holds all configuration for the user service.
 type Config struct {
 	// Server
@@ -82,10 +86,23 @@ type Config struct {
 
 	// AppBaseURL is the public frontend base URL used to build the clickable
 	// email-verification link (<AppBaseURL>/verify-email?token=<token>) in the
-	// verification mail. Sourced from USER_APP_BASE_URL; defaults to the dev
-	// frontend origin (http://localhost:5500) when unset. The trailing slash (if
-	// any) is trimmed at the mailer call site so the joined path is well-formed.
+	// verification mail. Sourced from USER_APP_BASE_URL.
 	AppBaseURL string `mapstructure:"app_base_url"`
+
+	// MailerBackend selects the verification email transport: "smtp" (default)
+	// uses the SMTPMailer directly; "comms" delegates to the notification
+	// comms service. Sourced from USER_MAILER_BACKEND.
+	MailerBackend string `mapstructure:"mailer_backend"`
+
+	// CommsBaseURL is the internal base URL of the notification comms service
+	// (e.g. http://notification:8084 inside the Docker network).
+	// Required when MailerBackend="comms". Sourced from USER_COMMS_BASE_URL.
+	CommsBaseURL string `mapstructure:"comms_base_url"`
+
+	// CommsS2SToken is the shared bearer token for the S2S comms send API
+	// (X-Service-Token header). Required when MailerBackend="comms".
+	// Sourced from USER_COMMS_S2S_TOKEN (env-only, never committed).
+	CommsS2SToken string `mapstructure:"comms_s2s_token"`
 
 	// GatewayHMACSecret is the shared secret used to verify the gateway-origin
 	// identity signature (conventions §24.1). It MUST equal the gateway's
@@ -153,6 +170,9 @@ func Load() (*Config, error) {
 		"smtp_password":           "USER_SMTP_PASSWORD",
 		"smtp_from":               "USER_SMTP_FROM",
 		"app_base_url":            "USER_APP_BASE_URL",
+		"mailer_backend":          "USER_MAILER_BACKEND",
+		"comms_base_url":          "USER_COMMS_BASE_URL",
+		"comms_s2s_token":         "USER_COMMS_S2S_TOKEN",
 		"access_token_ttl_sec":    "USER_ACCESS_TOKEN_TTL_SEC",
 		"refresh_token_ttl_hours": "USER_REFRESH_TOKEN_TTL_HOURS",
 		"mfa_enforced":            "USER_MFA_ENFORCED",
@@ -175,7 +195,7 @@ func Load() (*Config, error) {
 	v.SetDefault("db_max_conns", 10)
 	v.SetDefault("db_min_conns", 2)
 	v.SetDefault("smtp_port", 587)
-	v.SetDefault("app_base_url", "http://localhost:5500")
+	v.SetDefault("mailer_backend", "smtp")
 	v.SetDefault("mfa_enforced", false)
 	v.SetDefault("totp_issuer", "CoverOnes")
 
@@ -254,6 +274,10 @@ func (c *Config) validateCore() []string {
 // the gateway's GATEWAY_HMAC_SECRET ≥32-char requirement (conventions §24.1).
 const minGatewayHMACSecretLen = 32
 
+// minCommsS2STokenLen is the minimum length of the USER_COMMS_S2S_TOKEN bearer secret.
+// 32 chars matches the SHA-256 block size and resists brute force — mirrors minEventHMACSecretLen.
+const minCommsS2STokenLen = 32
+
 // validateGatewayHMAC enforces the §24.1 fail-closed secret posture:
 //   - non-dev (production/staging): secret is REQUIRED and MUST be ≥32 chars —
 //     boot fails fast otherwise (mirrors the gateway which fails fast in non-dev).
@@ -295,7 +319,7 @@ func (c *Config) validateMFA() []string {
 	return errs
 }
 
-// validatePIIAndSMTP fail-fasts on the PII encryption key and SMTP settings.
+// validatePIIAndSMTP fail-fasts on the PII encryption key and email delivery settings.
 //
 // PII key (mirrors kyc config.go:151): the legal_name / national_id columns are
 // always encrypted — there is NO plaintext fallback, even in dev — so a usable
@@ -303,28 +327,83 @@ func (c *Config) validateMFA() []string {
 // exactly 32 bytes. In dev a documented dev-default key (see .env.example) keeps
 // the encrypt path exercised locally.
 //
-// SMTP: non-dev requires USER_SMTP_HOST so verification mail can actually be sent.
+// Mailer: validates USER_MAILER_BACKEND + the chosen backend's required fields.
 func (c *Config) validatePIIAndSMTP() []string {
-	var errs []string
+	errs := c.validatePIIKey()
+	errs = append(errs, c.validateMailer()...)
 
+	return errs
+}
+
+// validatePIIKey checks the AES-256 PII encryption key.
+func (c *Config) validatePIIKey() []string {
 	if c.PIIEncryptionKey == "" {
-		errs = append(errs,
-			"USER_PII_ENCRYPTION_KEY is required when USER_ENV != development "+
-				"(and a documented dev-default key is required in development): "+
-				"legal_name/national_id are encrypted with no plaintext fallback "+
-				"(generate with: openssl rand -base64 32)")
-	} else if !c.IsDev() {
+		return []string{
+			"USER_PII_ENCRYPTION_KEY is required when USER_ENV != development " +
+				"(and a documented dev-default key is required in development): " +
+				"legal_name/national_id are encrypted with no plaintext fallback " +
+				"(generate with: openssl rand -base64 32)",
+		}
+	}
+
+	if !c.IsDev() {
 		// Non-dev: the key MUST decode to exactly 32 bytes (AES-256). In dev we skip
 		// the strict length check so a short documented dev key still boots.
 		key, decErr := base64.StdEncoding.DecodeString(c.PIIEncryptionKey)
 		if decErr != nil || len(key) != piiKeyBytes {
-			errs = append(errs,
-				fmt.Sprintf("USER_PII_ENCRYPTION_KEY must be base64 that decodes to exactly %d bytes", piiKeyBytes))
+			return []string{fmt.Sprintf("USER_PII_ENCRYPTION_KEY must be base64 that decodes to exactly %d bytes", piiKeyBytes)}
 		}
 	}
 
-	if !c.IsDev() && c.SMTPHost == "" {
-		errs = append(errs, "USER_SMTP_HOST is required when USER_ENV != development")
+	return nil
+}
+
+// validateMailer checks USER_MAILER_BACKEND and the chosen backend's required fields.
+func (c *Config) validateMailer() []string {
+	var errs []string
+
+	backend := strings.ToLower(strings.TrimSpace(c.MailerBackend))
+	validBackends := map[string]bool{"smtp": true, mailerBackendComms: true, "": true}
+
+	if !validBackends[backend] {
+		errs = append(errs, "USER_MAILER_BACKEND must be smtp|comms")
+	}
+
+	if backend == mailerBackendComms {
+		errs = append(errs, c.validateCommsBackend()...)
+	}
+
+	if !c.IsDev() && backend != mailerBackendComms && c.SMTPHost == "" {
+		errs = append(errs, "USER_SMTP_HOST is required when USER_ENV != development (unless USER_MAILER_BACKEND=comms)")
+	}
+
+	if !c.IsDev() && strings.TrimSpace(c.AppBaseURL) == "" {
+		errs = append(errs, "USER_APP_BASE_URL is required when USER_ENV != development")
+	}
+
+	if backend != mailerBackendComms && c.SMTPHost != "" && strings.TrimSpace(c.AppBaseURL) == "" {
+		errs = append(errs, "USER_APP_BASE_URL is required when USER_SMTP_HOST is set")
+	}
+
+	return errs
+}
+
+// validateCommsBackend checks USER_COMMS_BASE_URL and USER_COMMS_S2S_TOKEN when
+// USER_MAILER_BACKEND=comms. In non-dev: BaseURL MUST be https (prevents X-Service-Token
+// leakage over plaintext); S2S token MUST be ≥32 chars (mirrors EVENT_HMAC_SECRET posture).
+func (c *Config) validateCommsBackend() []string {
+	var errs []string
+
+	if strings.TrimSpace(c.CommsBaseURL) == "" {
+		errs = append(errs, "USER_COMMS_BASE_URL is required when USER_MAILER_BACKEND=comms")
+	} else if !c.IsDev() && !strings.HasPrefix(c.CommsBaseURL, "https://") {
+		errs = append(errs, "USER_COMMS_BASE_URL must start with https:// in non-dev environments")
+	}
+
+	if strings.TrimSpace(c.CommsS2SToken) == "" {
+		errs = append(errs, "USER_COMMS_S2S_TOKEN is required when USER_MAILER_BACKEND=comms")
+	} else if !c.IsDev() && len(strings.TrimSpace(c.CommsS2SToken)) < minCommsS2STokenLen {
+		errs = append(errs, "USER_COMMS_S2S_TOKEN must be at least 32 characters in non-dev environments")
 	}
 
 	return errs

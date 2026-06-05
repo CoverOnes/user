@@ -89,7 +89,7 @@ func TestUserStore_PIIAndEmailVerified_Integration(t *testing.T) {
 		assert.Equal(t, "A123456789", nid)
 	})
 
-	t.Run("SetEmailVerified flips the flag (idempotent)", func(t *testing.T) {
+	t.Run("SetEmailVerified flips the flag and promotes to Tier 1 (idempotent)", func(t *testing.T) {
 		u := seedPendingUser(t, ctx, us, enc, "verify-flag@integration.test")
 
 		require.NoError(t, us.SetEmailVerified(ctx, u.ID))
@@ -97,9 +97,22 @@ func TestUserStore_PIIAndEmailVerified_Integration(t *testing.T) {
 		got, err := us.GetByID(ctx, u.ID)
 		require.NoError(t, err)
 		assert.True(t, got.EmailVerified)
+		assert.Equal(t, int16(1), got.KYCTier)
 
 		// Idempotent: second call still succeeds.
 		require.NoError(t, us.SetEmailVerified(ctx, u.ID))
+	})
+
+	t.Run("SetEmailVerified does not downgrade an existing higher tier", func(t *testing.T) {
+		u := seedPendingUser(t, ctx, us, enc, "verify-tier2@integration.test")
+		require.NoError(t, us.UpdateKYCTier(ctx, u.ID, 2))
+
+		require.NoError(t, us.SetEmailVerified(ctx, u.ID))
+
+		got, err := us.GetByID(ctx, u.ID)
+		require.NoError(t, err)
+		assert.True(t, got.EmailVerified)
+		assert.Equal(t, int16(2), got.KYCTier)
 	})
 
 	t.Run("SetEmailVerified on missing user returns ErrNotFound", func(t *testing.T) {

@@ -23,6 +23,7 @@ func TestNewSMTPMailer(t *testing.T) {
 			cfg: mailer.Config{
 				Host: "smtp.example.com", Port: 587,
 				Username: "user", Password: "pass", From: "no-reply@example.com",
+				AppBaseURL: "https://app.coverones.com",
 			},
 			wantErr: false,
 		},
@@ -30,6 +31,7 @@ func TestNewSMTPMailer(t *testing.T) {
 			name: "valid config without auth (local relay)",
 			cfg: mailer.Config{
 				Host: "localhost", Port: 1025, From: "no-reply@example.com",
+				AppBaseURL: "http://dev.coverones.test:5500",
 			},
 			wantErr: false,
 		},
@@ -37,13 +39,22 @@ func TestNewSMTPMailer(t *testing.T) {
 			name: "default send timeout applied when zero",
 			cfg: mailer.Config{
 				Host: "smtp.example.com", Port: 587, From: "no-reply@example.com",
+				AppBaseURL:  "https://app.coverones.com",
 				SendTimeout: 0,
 			},
 			wantErr: false,
 		},
 		{
+			name: "app base URL required",
+			cfg: mailer.Config{
+				Host: "smtp.example.com", Port: 587, From: "no-reply@example.com",
+				AppBaseURL: "",
+			},
+			wantErr: true,
+		},
+		{
 			name:    "empty host rejected by go-mail",
-			cfg:     mailer.Config{Host: "", Port: 587},
+			cfg:     mailer.Config{Host: "", Port: 587, AppBaseURL: "https://app.coverones.com"},
 			wantErr: true,
 		},
 	}
@@ -82,11 +93,6 @@ func TestRenderVerification_ContainsClickableURL(t *testing.T) {
 		baseURL string
 		wantURL string
 	}{
-		{
-			name:    "default dev base URL when unset",
-			baseURL: "",
-			wantURL: "http://localhost:5500/verify-email?token=abc123_DEF-456",
-		},
 		{
 			name:    "custom base URL",
 			baseURL: "https://app.coverones.com",
@@ -135,7 +141,7 @@ func TestRenderVerification_ContainsClickableURL(t *testing.T) {
 func TestNewSMTPMailer_DoesNotMutateCallerConfig(t *testing.T) {
 	t.Parallel()
 
-	cfg := mailer.Config{Host: "smtp.example.com", Port: 587, SendTimeout: 0}
+	cfg := mailer.Config{Host: "smtp.example.com", Port: 587, AppBaseURL: "https://app.coverones.com", SendTimeout: 0}
 	_, err := mailer.NewSMTPMailer(&cfg)
 	require.NoError(t, err)
 

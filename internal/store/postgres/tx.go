@@ -169,7 +169,13 @@ func (s *txUserStore) BumpTokenVersion(ctx context.Context, id uuid.UUID) (int, 
 }
 
 func (s *txUserStore) SetEmailVerified(ctx context.Context, id uuid.UUID) error {
-	q := `UPDATE users SET email_verified = true, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`
+	q := `
+	UPDATE users
+	SET email_verified = true,
+	    kyc_tier = GREATEST(kyc_tier, 1),
+	    updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL
+	`
 
 	tag, err := s.tx.Exec(ctx, q, id)
 	if err != nil {

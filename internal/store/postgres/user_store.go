@@ -140,15 +140,17 @@ func (s *UserStore) BumpTokenVersion(ctx context.Context, id uuid.UUID) (int, er
 	return newVersion, nil
 }
 
-// SetEmailVerified flips users.email_verified to true. Idempotent — re-running
-// on an already-verified row succeeds (row count 1); ErrNotFound only when no
-// live row matches.
+// SetEmailVerified flips users.email_verified to true and promotes the account to
+// at least Tier 1. Idempotent — re-running on an already-verified row succeeds
+// (row count 1); ErrNotFound only when no live row matches.
 func (s *UserStore) SetEmailVerified(ctx context.Context, id uuid.UUID) error {
 	q := `
-	UPDATE users
-	SET email_verified = true, updated_at = now()
-	WHERE id = $1 AND deleted_at IS NULL
-	`
+		UPDATE users
+		SET email_verified = true,
+		    kyc_tier = GREATEST(kyc_tier, 1),
+		    updated_at = now()
+		WHERE id = $1 AND deleted_at IS NULL
+		`
 
 	tag, err := s.pool.Exec(ctx, q, id)
 	if err != nil {

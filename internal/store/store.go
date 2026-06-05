@@ -22,8 +22,8 @@ type UserStore interface {
 	// Used by LogoutAll to invalidate all existing refresh tokens for a user.
 	BumpTokenVersion(ctx context.Context, id uuid.UUID) (int, error)
 
-	// SetEmailVerified sets users.email_verified = true for the given user.
-	// Idempotent; returns ErrNotFound if no live row matches.
+	// SetEmailVerified sets users.email_verified = true and promotes the user to
+	// at least Tier 1. Idempotent; returns ErrNotFound if no live row matches.
 	SetEmailVerified(ctx context.Context, id uuid.UUID) error
 
 	// SetPendingTOTPSecret stores the (encrypted) PENDING TOTP secret for enroll,

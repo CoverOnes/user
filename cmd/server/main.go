@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -173,26 +175,10 @@ func run() error {
 		return fmt.Errorf("init pii encryptor: %w", err)
 	}
 
-	// Verification mailer (SMTP). In dev without USER_SMTP_HOST the mailer is left
-	// nil — register still returns 201, it just skips the email (validate() requires
-	// the host outside dev).
-	var verificationMailer service.Mailer
-	if cfg.SMTPHost != "" {
-		m, mailerErr := mailer.NewSMTPMailer(&mailer.Config{
-			Host:       cfg.SMTPHost,
-			Port:       cfg.SMTPPort,
-			Username:   cfg.SMTPUsername,
-			Password:   cfg.SMTPPassword,
-			From:       cfg.SMTPFrom,
-			AppBaseURL: cfg.AppBaseURL,
-		})
-		if mailerErr != nil {
-			return fmt.Errorf("init smtp mailer: %w", mailerErr)
-		}
-
-		verificationMailer = m
-	} else {
-		slog.Warn("USER_SMTP_HOST not set; verification emails will be skipped (dev only)")
+	// Verification mailer — selected by USER_MAILER_BACKEND (smtp|comms; default smtp).
+	verificationMailer, err := buildMailer(cfg)
+	if err != nil {
+		return fmt.Errorf("init mailer: %w", err)
 	}
 
 	// Service layer.
@@ -280,6 +266,91 @@ func run() error {
 	authSvc.WaitForPendingSends()
 
 	slog.Info("server stopped")
+
+	return nil
+}
+
+// buildMailer selects and constructs the verification mailer from config.
+// Extracted to keep run()'s cyclomatic complexity within the lint threshold.
+//
+//   - "comms"          → CommsMailer posting to the notification service.
+//   - "smtp" (default) → SMTPMailer dialing USER_SMTP_*.
+//   - dev + no SMTP    → devLogMailer (logs the verify URL instead of sending).
+func buildMailer(cfg *config.Config) (service.Mailer, error) {
+	backend := strings.ToLower(strings.TrimSpace(cfg.MailerBackend))
+
+	if backend == "comms" {
+		cm, err := mailer.NewCommsMailer(&mailer.CommsConfig{
+			BaseURL:    cfg.CommsBaseURL,
+			ServiceID:  "user-service",
+			S2SToken:   cfg.CommsS2SToken,
+			AppBaseURL: cfg.AppBaseURL,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("init comms mailer: %w", err)
+		}
+
+		slog.Info("verification mailer: comms (notification service)", "base_url", cfg.CommsBaseURL)
+
+		return cm, nil
+	}
+
+	// smtp or empty (default).
+	if cfg.SMTPHost != "" {
+		m, err := mailer.NewSMTPMailer(&mailer.Config{
+			Host:       cfg.SMTPHost,
+			Port:       cfg.SMTPPort,
+			Username:   cfg.SMTPUsername,
+			Password:   cfg.SMTPPassword,
+			From:       cfg.SMTPFrom,
+			AppBaseURL: cfg.AppBaseURL,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("init smtp mailer: %w", err)
+		}
+
+		slog.Info("verification mailer: smtp", "host", cfg.SMTPHost)
+
+		return m, nil
+	}
+
+	// Dev-only fallback: log the verification URL instead of sending.
+	// config.validate() rejects this path outside development.
+	if !cfg.IsDev() {
+		return nil, fmt.Errorf("USER_SMTP_HOST required outside development when USER_MAILER_BACKEND is not comms")
+	}
+
+	slog.Warn("USER_SMTP_HOST not set; verification email path will be logged (dev only)")
+
+	return devLogMailer{appBaseURL: cfg.AppBaseURL}, nil
+}
+
+type devLogMailer struct {
+	appBaseURL string
+}
+
+func (m devLogMailer) SendVerification(ctx context.Context, to, token string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	base := strings.TrimRight(strings.TrimSpace(m.appBaseURL), "/")
+	attrs := []any{"to", to}
+
+	if base != "" {
+		// token embedded in verify URL (dev only); never enable this backend in staging/production.
+		attrs = append(attrs, "verify_url", fmt.Sprintf("%s/verify-email?token=%s", base, neturl.QueryEscape(token)))
+	} else {
+		// Raw token MUST NOT appear in logs even in dev (credential in logs — M1).
+		attrs = append(attrs, "verify_token", "[REDACTED]", "hint", "set USER_APP_BASE_URL to log a clickable verification link")
+	}
+
+	slog.Warn(
+		"DEV EMAIL VERIFICATION LINK",
+		attrs...,
+	)
 
 	return nil
 }
