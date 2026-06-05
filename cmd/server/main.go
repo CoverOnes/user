@@ -220,14 +220,16 @@ func run() error {
 	go consumer.Run(ctx)
 
 	// Router.
-	r := handler.NewRouter(handler.RouterConfig{
-		Auth:              authSvc,
-		Profile:           profileSvc,
-		MFA:               mfaSvc,
-		Signer:            signer,
-		Pool:              pool,
-		Redis:             redisClient,
-		GatewayHMACSecret: cfg.GatewayHMACSecret,
+	r := handler.NewRouter(&handler.RouterConfig{
+		Auth:                authSvc,
+		Profile:             profileSvc,
+		MFA:                 mfaSvc,
+		Signer:              signer,
+		Pool:                pool,
+		Redis:               redisClient,
+		GatewayHMACSecret:   cfg.GatewayHMACSecret,
+		UserRateLimitPerMin: cfg.UserRateLimitPerMin,
+		UserRateLimitBurst:  cfg.UserRateLimitBurst,
 	})
 
 	srv := &http.Server{

@@ -27,10 +27,19 @@ type RouterConfig struct {
 	// gateway-origin identity signature. Empty == dev posture (verification
 	// disabled); config validation guarantees it is non-empty in non-dev.
 	GatewayHMACSecret string
+
+	// UserRateLimitPerMin is the sustained per-authenticated-user request rate
+	// for the /v1/me group (tokens/minute). 0 disables the limiter entirely.
+	// Source: config.UserRateLimitPerMin (USER_USER_RATE_LIMIT_PER_MIN).
+	UserRateLimitPerMin int
+
+	// UserRateLimitBurst is the maximum burst size for the per-user /v1/me limiter.
+	// Source: config.UserRateLimitBurst (USER_USER_RATE_LIMIT_BURST).
+	UserRateLimitBurst int
 }
 
 // NewRouter builds and returns the configured Gin engine.
-func NewRouter(cfg RouterConfig) *gin.Engine {
+func NewRouter(cfg *RouterConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
@@ -72,6 +81,15 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	authGroup.POST("/logout", middleware.Auth(cfg.Signer), authH.Logout)
 
 	// Protected routes — require valid access token, Tier >= 0.
+	//
+	// /v1/auth vs /v1/me identity-source split (security note):
+	//   /v1/auth (login/register/reset) is PRE-authentication: no verified user_id
+	//   exists yet, so a per-user limiter would no-op. Those routes are guarded by
+	//   IP-level (ipRL) and account-level (authRL) limiters above.
+	//   /v1/me is POST-authentication: the JWT subject in the verified token is a
+	//   stable, gateway-verified user identity that cannot be spoofed by a client.
+	//   The per-user limiter is therefore mounted here — AFTER VerifyGatewaySignature
+	//   and Auth — so the key is always attacker-proof.
 	authMW := middleware.Auth(cfg.Signer)
 	me := r.Group("/v1/me")
 	// Defense-in-depth (§24.1): verify the gateway-origin HMAC signature BEFORE
@@ -80,6 +98,14 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// dev signing-skip.
 	me.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 	me.Use(authMW)
+	// Per-authenticated-user token-bucket limiter — mounted AFTER VerifyGatewaySignature
+	// + Auth so the JWT subject (the limiter key) is always a gateway-verified identity,
+	// never attacker-supplied. When UserRateLimitPerMin == 0 the limiter is disabled
+	// (no-op), e.g. in environments that rate-limit at the gateway layer instead.
+	if cfg.UserRateLimitPerMin > 0 {
+		userRL := middleware.NewGeneralUserRateLimiter(cfg.UserRateLimitPerMin, cfg.UserRateLimitBurst)
+		me.Use(userRL.Handler())
+	}
 	meH := NewMeHandler(cfg.Profile)
 	me.GET("", meH.Get)
 	profH := NewProfileHandler(cfg.Profile)

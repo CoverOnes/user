@@ -422,3 +422,99 @@ func randMember() string {
 
 	return hex.EncodeToString(b[:])
 }
+
+// generalUserLRUCap is the maximum number of unique subjects tracked by the
+// in-process per-user rate limiter. When the cap is reached, the least-recently-used
+// entry is evicted, bounding memory to O(cap × sizeof(*rate.Limiter)) even under
+// high-cardinality subject rotation.
+const generalUserLRUCap = 100_000
+
+// GeneralUserRateLimiter applies a per-authenticated-user (JWT subject) in-process
+// token-bucket rate limit to the /v1/me group. It is intentionally backed by an
+// in-process LRU token-bucket rather than Redis: this limiter is a general-purpose
+// abuse deterrent (not a brute-force oracle guard), so it FAILS OPEN on missing
+// claims — an unauthenticated request passes through and is handled downstream by
+// Auth middleware. It also fails open when PerMin == 0 (disabled).
+//
+// Key: "user:rl:user:<subject>" (LRU-local, not persisted to Redis).
+type GeneralUserRateLimiter struct {
+	mu      sync.Mutex
+	buckets *lru.Cache[string, *rate.Limiter]
+	r       rate.Limit
+	burst   int
+}
+
+// NewGeneralUserRateLimiter builds the per-user in-process limiter.
+// limitPerMin is the sustained request rate (tokens/minute); burst is the
+// maximum simultaneous burst. A limitPerMin of 0 disables the limiter (Handler
+// is a no-op pass-through), which matches the PerMin>=0 config validation.
+func NewGeneralUserRateLimiter(limitPerMin, burst int) *GeneralUserRateLimiter {
+	cache, err := lru.New[string, *rate.Limiter](generalUserLRUCap)
+	if err != nil {
+		// lru.New only errors when cap <= 0, which cannot happen with a positive constant.
+		panic(fmt.Sprintf("GeneralUserRateLimiter: unexpected lru.New error: %v", err))
+	}
+
+	return &GeneralUserRateLimiter{
+		buckets: cache,
+		r:       rate.Limit(float64(limitPerMin) / 60.0),
+		burst:   burst,
+	}
+}
+
+// Handler returns the Gin middleware. It keys the token bucket on the JWT subject
+// ("user:rl:user:<subject>"). When claims are absent (unauthenticated request before
+// Auth runs, or Auth already rejected) it passes through — Auth middleware is
+// responsible for rejecting unauthenticated requests; duplicating that logic here
+// would create a confusing fail-path ordering issue.
+func (l *GeneralUserRateLimiter) Handler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		claims, ok := ClaimsFromCtx(c)
+		if !ok || claims.Subject == "" {
+			// No authenticated subject available. Auth middleware (wired before this
+			// handler) should have already rejected the request. Pass through
+			// defensively — failing closed here would produce a misleading 429 instead
+			// of the 401 Auth middleware would return.
+			slog.Warn(
+				"general user rate limiter: no claims in context; passing through",
+				"path", c.Request.URL.Path,
+			)
+			c.Next()
+
+			return
+		}
+
+		key := "user:rl:user:" + claims.Subject
+
+		if !l.allow(key) {
+			retryAfter := int(60.0 / float64(l.r))
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+
+			c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
+			c.Abort()
+			httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
+
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// allow consumes one token from the bucket for the given key, creating a new
+// limiter if none exists yet for that subject. The LRU evicts the least-recently-
+// used entry when the cap is reached.
+func (l *GeneralUserRateLimiter) allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	lim, ok := l.buckets.Get(key)
+	if !ok {
+		lim = rate.NewLimiter(l.r, l.burst)
+		l.buckets.Add(key, lim)
+	}
+
+	return lim.Allow()
+}

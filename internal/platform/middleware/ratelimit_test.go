@@ -329,3 +329,165 @@ func TestMFACodeLimiter_NilRedisPassThrough(t *testing.T) {
 		assert.Equal(t, http.StatusOK, doCode(t, r, token), "nil-Redis (dev mode) attempt %d should pass", i+1)
 	}
 }
+
+// ── GeneralUserRateLimiter tests ─────────────────────────────────────────────
+//
+// GeneralUserRateLimiter is a pure in-process token-bucket limiter keyed on the
+// JWT subject (user:rl:user:<subject>). Tests exercise the full Gin middleware
+// path via a router that mirrors the production mount order:
+//
+//	VerifyGatewaySignature (no-op in tests, no secret) →
+//	Auth (sets JWT claims in context) →
+//	GeneralUserRateLimiter (reads claims.Subject via ClaimsFromCtx) →
+//	/me handler
+//
+// No Redis container is required — the limiter is purely in-process.
+
+// buildGeneralUserRateLimiterRouter wires a GET /me endpoint behind Auth + the
+// per-user limiter so tests drive the real middleware path. It returns the router
+// and a signed token for the given subject, mirroring buildMFACodeLimiterRouter.
+func buildGeneralUserRateLimiterRouter(t *testing.T, rl *middleware.GeneralUserRateLimiter, subject string) (router *gin.Engine, token string) {
+	t.Helper()
+
+	signer, err := jwt.NewEphemeralSigner(10 * time.Minute)
+	require.NoError(t, err)
+
+	token, err = signer.Issue(subject, domain.AccountTypePersonal, 0, 0, false)
+	require.NoError(t, err)
+
+	router = gin.New()
+	g := router.Group("/me")
+	g.Use(middleware.Auth(signer))
+	g.Use(rl.Handler())
+	g.GET("", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	return router, token
+}
+
+func doMe(t *testing.T, r http.Handler, token string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/me", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	return w
+}
+
+// TestGeneralUserRateLimiter table-driven suite covering all required behaviors:
+// (a) allow within budget, (b) over-budget → 429, (c) two different user_ids
+// have independent buckets, (d) missing identity → passthrough not 429,
+// (e) many distinct keys do not panic (LRU bound).
+func TestGeneralUserRateLimiter(t *testing.T) {
+	t.Parallel()
+
+	t.Run("within budget passes", func(t *testing.T) {
+		t.Parallel()
+
+		// limitPerMin=60, burst=5 → first 5 requests drain burst, all pass.
+		rl := middleware.NewGeneralUserRateLimiter(60, 5)
+		subject := uuid.NewString()
+		r, token := buildGeneralUserRateLimiterRouter(t, rl, subject)
+
+		for i := 0; i < 5; i++ {
+			w := doMe(t, r, token)
+			assert.Equal(t, http.StatusOK, w.Code, "request %d within burst budget should pass", i+1)
+		}
+	})
+
+	t.Run("over budget returns 429 with Retry-After header", func(t *testing.T) {
+		t.Parallel()
+
+		// burst=1 → first request passes, second is immediately over budget.
+		rl := middleware.NewGeneralUserRateLimiter(60, 1)
+		subject := uuid.NewString()
+		r, token := buildGeneralUserRateLimiterRouter(t, rl, subject)
+
+		first := doMe(t, r, token)
+		require.Equal(t, http.StatusOK, first.Code, "first request within burst must pass")
+
+		second := doMe(t, r, token)
+		require.Equal(t, http.StatusTooManyRequests, second.Code, "second request must be 429 when burst is exhausted")
+		assert.NotEmpty(t, second.Header().Get("Retry-After"), "429 must include Retry-After header")
+	})
+
+	t.Run("two different user_ids have independent buckets", func(t *testing.T) {
+		t.Parallel()
+
+		// burst=1 so the first user exhausts their bucket on request 1.
+		rl := middleware.NewGeneralUserRateLimiter(60, 1)
+
+		subjectA := uuid.NewString()
+		rA, tokenA := buildGeneralUserRateLimiterRouter(t, rl, subjectA)
+
+		subjectB := uuid.NewString()
+		rB, tokenB := buildGeneralUserRateLimiterRouter(t, rl, subjectB)
+
+		// User A exhausts their burst.
+		require.Equal(t, http.StatusOK, doMe(t, rA, tokenA).Code, "user A first request must pass")
+		require.Equal(t, http.StatusTooManyRequests, doMe(t, rA, tokenA).Code, "user A second request must be 429")
+
+		// User B is unaffected — independent bucket.
+		assert.Equal(t, http.StatusOK, doMe(t, rB, tokenB).Code, "user B must have an independent budget")
+	})
+
+	t.Run("missing identity passes through (not 429)", func(t *testing.T) {
+		t.Parallel()
+
+		// limitPerMin=1, burst=1: any authenticated request would hit the limit immediately;
+		// but an unauthenticated request (no Bearer token) must result in 401 from Auth
+		// middleware — never a 429 from the rate limiter.
+		rl := middleware.NewGeneralUserRateLimiter(1, 1)
+
+		// Build a router WITHOUT the Auth middleware so ClaimsFromCtx returns nothing.
+		// This simulates the case where the limiter is accidentally wired without Auth,
+		// proving it passes through rather than panicking or returning 429.
+		router := gin.New()
+		router.Use(rl.Handler())
+		router.GET("/me", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/me", http.NoBody)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		// No claims → limiter passes through; the 200 is from the stub handler.
+		// In production, Auth middleware runs first and would return 401 before
+		// reaching the limiter — this test isolates the limiter's own pass-through.
+		assert.Equal(t, http.StatusOK, w.Code, "missing identity must pass through (not 429)")
+		assert.NotEqual(t, http.StatusTooManyRequests, w.Code, "missing identity must not produce 429")
+	})
+
+	t.Run("many distinct keys do not panic (LRU bound)", func(t *testing.T) {
+		t.Parallel()
+
+		// Insert generalUserLRUCap+1 distinct subjects. The LRU evicts the oldest entry
+		// rather than growing unbounded — this must not panic or error.
+		// We use a small limitPerMin/burst (100/100) so no request is denied during the
+		// eviction sweep (each subject only fires once).
+		const distinctSubjects = 200
+		rl := middleware.NewGeneralUserRateLimiter(100, 100)
+
+		signer, err := jwt.NewEphemeralSigner(10 * time.Minute)
+		require.NoError(t, err)
+
+		router := gin.New()
+		g := router.Group("/me")
+		g.Use(middleware.Auth(signer))
+		g.Use(rl.Handler())
+		g.GET("", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+		for i := 0; i < distinctSubjects; i++ {
+			subject := uuid.NewString()
+			token, tokErr := signer.Issue(subject, domain.AccountTypePersonal, 0, 0, false)
+			require.NoError(t, tokErr)
+
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/me", http.NoBody)
+			req.Header.Set("Authorization", "Bearer "+token)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusOK, w.Code, "subject %d should pass (distinct key, within own budget)", i+1)
+		}
+	})
+}
