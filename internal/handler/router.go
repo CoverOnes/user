@@ -22,6 +22,11 @@ type RouterConfig struct {
 	Signer  *jwt.Signer
 	Pool    *pgxpool.Pool
 	Redis   *redis.Client // may be nil in dev
+
+	// GatewayHMACSecret is the §24.1 shared secret used to verify the
+	// gateway-origin identity signature. Empty == dev posture (verification
+	// disabled); config validation guarantees it is non-empty in non-dev.
+	GatewayHMACSecret string
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -69,6 +74,11 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// Protected routes — require valid access token, Tier >= 0.
 	authMW := middleware.Auth(cfg.Signer)
 	me := r.Group("/v1/me")
+	// Defense-in-depth (§24.1): verify the gateway-origin HMAC signature BEFORE
+	// the JWT auth middleware trusts any request on this protected group. When the
+	// secret is empty (dev) this is a no-op passthrough, matching the gateway's
+	// dev signing-skip.
+	me.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 	me.Use(authMW)
 	meH := NewMeHandler(cfg.Profile)
 	me.GET("", meH.Get)
