@@ -458,15 +458,15 @@ func TestGeneralUserRateLimiter(t *testing.T) {
 		assert.NotEqual(t, http.StatusTooManyRequests, w.Code, "missing identity must not produce 429")
 	})
 
-	t.Run("many distinct keys do not panic (LRU bound)", func(t *testing.T) {
+	t.Run("LRU eviction: exceeding cap evicts oldest entry without panic", func(t *testing.T) {
 		t.Parallel()
 
-		// Insert generalUserLRUCap+1 distinct subjects. The LRU evicts the oldest entry
-		// rather than growing unbounded — this must not panic or error.
-		// We use a small limitPerMin/burst (100/100) so no request is denied during the
-		// eviction sweep (each subject only fires once).
-		const distinctSubjects = 200
-		rl := middleware.NewGeneralUserRateLimiter(100, 100)
+		// Use a tiny cap (3) so that the 4th distinct subject causes the LRU to evict
+		// the least-recently-used entry. burst=1 per subject so each subject's own first
+		// request passes; after eviction the evicted subject's bucket is gone and a fresh
+		// one is created on re-entry (it passes again with a full burst).
+		const lruCap = 3
+		rl := middleware.NewGeneralUserRateLimiterWithCap(60, 1, lruCap)
 
 		signer, err := jwt.NewEphemeralSigner(10 * time.Minute)
 		require.NoError(t, err)
@@ -477,17 +477,40 @@ func TestGeneralUserRateLimiter(t *testing.T) {
 		g.Use(rl.Handler())
 		g.GET("", func(c *gin.Context) { c.Status(http.StatusOK) })
 
-		for i := 0; i < distinctSubjects; i++ {
-			subject := uuid.NewString()
-			token, tokErr := signer.Issue(subject, domain.AccountTypePersonal, 0, 0, false)
-			require.NoError(t, tokErr)
-
+		doRequest := func(t *testing.T, token string) int {
+			t.Helper()
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/me", http.NoBody)
 			req.Header.Set("Authorization", "Bearer "+token)
 			w := httptest.NewRecorder()
 			router.ServeHTTP(w, req)
-
-			assert.Equal(t, http.StatusOK, w.Code, "subject %d should pass (distinct key, within own budget)", i+1)
+			return w.Code
 		}
+
+		// Fill the LRU to capacity (subjects A, B, C — each uses their 1-token burst).
+		subjectA := uuid.NewString()
+		tokenA, err := signer.Issue(subjectA, domain.AccountTypePersonal, 0, 0, false)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, doRequest(t, tokenA), "subject A (slot 1) first request must pass")
+		require.Equal(t, http.StatusTooManyRequests, doRequest(t, tokenA), "subject A burst exhausted after 1 request")
+
+		subjectB := uuid.NewString()
+		tokenB, err := signer.Issue(subjectB, domain.AccountTypePersonal, 0, 0, false)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, doRequest(t, tokenB), "subject B (slot 2) first request must pass")
+
+		subjectC := uuid.NewString()
+		tokenC, err := signer.Issue(subjectC, domain.AccountTypePersonal, 0, 0, false)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, doRequest(t, tokenC), "subject C (slot 3) first request must pass")
+
+		// Adding subject D exceeds the cap — subject A (least-recently-used) is evicted.
+		subjectD := uuid.NewString()
+		tokenD, err := signer.Issue(subjectD, domain.AccountTypePersonal, 0, 0, false)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, doRequest(t, tokenD), "subject D (evicts A) first request must pass without panic")
+
+		// Subject A's bucket was evicted; re-requesting it creates a fresh bucket with a
+		// full burst, so it passes again (demonstrates actual eviction, not just no-panic).
+		assert.Equal(t, http.StatusOK, doRequest(t, tokenA), "re-entering evicted subject A must get a fresh bucket and pass")
 	})
 }

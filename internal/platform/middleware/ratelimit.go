@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -449,7 +450,18 @@ type GeneralUserRateLimiter struct {
 // maximum simultaneous burst. A limitPerMin of 0 disables the limiter (Handler
 // is a no-op pass-through), which matches the PerMin>=0 config validation.
 func NewGeneralUserRateLimiter(limitPerMin, burst int) *GeneralUserRateLimiter {
-	cache, err := lru.New[string, *rate.Limiter](generalUserLRUCap)
+	return newGeneralUserRateLimiterWithCap(limitPerMin, burst, generalUserLRUCap)
+}
+
+// NewGeneralUserRateLimiterWithCap is like NewGeneralUserRateLimiter but accepts an
+// explicit LRU capacity. It exists so tests can exercise LRU eviction with a small cap
+// without allocating the full 100 000-entry production cache.
+func NewGeneralUserRateLimiterWithCap(limitPerMin, burst, lruCap int) *GeneralUserRateLimiter {
+	return newGeneralUserRateLimiterWithCap(limitPerMin, burst, lruCap)
+}
+
+func newGeneralUserRateLimiterWithCap(limitPerMin, burst, lruCap int) *GeneralUserRateLimiter {
+	cache, err := lru.New[string, *rate.Limiter](lruCap)
 	if err != nil {
 		// lru.New only errors when cap <= 0, which cannot happen with a positive constant.
 		panic(fmt.Sprintf("GeneralUserRateLimiter: unexpected lru.New error: %v", err))
@@ -487,10 +499,13 @@ func (l *GeneralUserRateLimiter) Handler() gin.HandlerFunc {
 		key := "user:rl:user:" + claims.Subject
 
 		if !l.allow(key) {
-			retryAfter := int(60.0 / float64(l.r))
-			if retryAfter < 1 {
-				retryAfter = 1
-			}
+			// Retry-After = ceil(1 / r) where r is the token refill rate in
+			// requests-per-second = limitPerMin/60. Equivalently, ceil(60/limitPerMin)
+			// seconds. math.Ceil is used so the client always waits at least one full
+			// refill interval (integer truncation would emit "0" for high-rate limiters
+			// with r > 1 req/s, violating RFC 9110 §10.6.3). max(1, …) guarantees a
+			// minimum of 1 second even if the division rounds down to zero.
+			retryAfter := int(math.Max(1, math.Ceil(60.0/float64(l.r))))
 
 			c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
 			c.Abort()
