@@ -274,6 +274,10 @@ func (c *Config) validateCore() []string {
 // the gateway's GATEWAY_HMAC_SECRET ≥32-char requirement (conventions §24.1).
 const minGatewayHMACSecretLen = 32
 
+// minCommsS2STokenLen is the minimum length of the USER_COMMS_S2S_TOKEN bearer secret.
+// 32 chars matches the SHA-256 block size and resists brute force — mirrors minEventHMACSecretLen.
+const minCommsS2STokenLen = 32
+
 // validateGatewayHMAC enforces the §24.1 fail-closed secret posture:
 //   - non-dev (production/staging): secret is REQUIRED and MUST be ≥32 chars —
 //     boot fails fast otherwise (mirrors the gateway which fails fast in non-dev).
@@ -366,13 +370,7 @@ func (c *Config) validateMailer() []string {
 	}
 
 	if backend == mailerBackendComms {
-		if strings.TrimSpace(c.CommsBaseURL) == "" {
-			errs = append(errs, "USER_COMMS_BASE_URL is required when USER_MAILER_BACKEND=comms")
-		}
-
-		if strings.TrimSpace(c.CommsS2SToken) == "" {
-			errs = append(errs, "USER_COMMS_S2S_TOKEN is required when USER_MAILER_BACKEND=comms")
-		}
+		errs = append(errs, c.validateCommsBackend()...)
 	}
 
 	if !c.IsDev() && backend != mailerBackendComms && c.SMTPHost == "" {
@@ -385,6 +383,27 @@ func (c *Config) validateMailer() []string {
 
 	if backend != mailerBackendComms && c.SMTPHost != "" && strings.TrimSpace(c.AppBaseURL) == "" {
 		errs = append(errs, "USER_APP_BASE_URL is required when USER_SMTP_HOST is set")
+	}
+
+	return errs
+}
+
+// validateCommsBackend checks USER_COMMS_BASE_URL and USER_COMMS_S2S_TOKEN when
+// USER_MAILER_BACKEND=comms. In non-dev: BaseURL MUST be https (prevents X-Service-Token
+// leakage over plaintext); S2S token MUST be ≥32 chars (mirrors EVENT_HMAC_SECRET posture).
+func (c *Config) validateCommsBackend() []string {
+	var errs []string
+
+	if strings.TrimSpace(c.CommsBaseURL) == "" {
+		errs = append(errs, "USER_COMMS_BASE_URL is required when USER_MAILER_BACKEND=comms")
+	} else if !c.IsDev() && !strings.HasPrefix(c.CommsBaseURL, "https://") {
+		errs = append(errs, "USER_COMMS_BASE_URL must start with https:// in non-dev environments")
+	}
+
+	if strings.TrimSpace(c.CommsS2SToken) == "" {
+		errs = append(errs, "USER_COMMS_S2S_TOKEN is required when USER_MAILER_BACKEND=comms")
+	} else if !c.IsDev() && len(strings.TrimSpace(c.CommsS2SToken)) < minCommsS2STokenLen {
+		errs = append(errs, "USER_COMMS_S2S_TOKEN must be at least 32 characters in non-dev environments")
 	}
 
 	return errs

@@ -92,7 +92,7 @@ func computeGatewaySignature(secret []byte, c *gin.Context, ts string) []byte {
 	}, "|")
 
 	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(canonical))
+	_, _ = mac.Write([]byte(canonical)) // hash.Hash.Write never returns an error
 
 	return mac.Sum(nil)
 }

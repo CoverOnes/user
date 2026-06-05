@@ -26,7 +26,8 @@ const commsDefaultTimeout = 10 * time.Second
 
 // CommsSendRequest is the POST /v1/comms/send request body (matches comms
 // handler sendRequestBody, kept local so the user module has no import cycle
-// to the notification module).
+// to the notification module). Raw token values are deliberately NOT included in
+// Vars; verifyURL is the canonical token carrier across the S2S boundary.
 type CommsSendRequest struct {
 	Channel        string            `json:"channel"`
 	To             string            `json:"to"`
@@ -59,10 +60,19 @@ type CommsMailer struct {
 }
 
 // NewCommsMailer constructs a CommsMailer. Returns an error if required config
-// fields are missing.
+// fields are missing or the BaseURL is not a valid http/https URL (SSRF defense:
+// a misconfigured BaseURL such as file:// or ftp:// must not receive the X-Service-Token).
 func NewCommsMailer(cfg *CommsConfig) (*CommsMailer, error) {
 	if strings.TrimSpace(cfg.BaseURL) == "" {
 		return nil, fmt.Errorf("comms mailer: BaseURL is required")
+	}
+
+	// Validate BaseURL scheme before using it: only http and https are permitted.
+	// This prevents SSRF via a misconfigured or attacker-supplied BaseURL that could
+	// cause the X-Service-Token to be forwarded to an unintended endpoint.
+	parsedURL, err := url.ParseRequestURI(cfg.BaseURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return nil, fmt.Errorf("comms mailer: BaseURL must be a valid http/https URL")
 	}
 
 	if strings.TrimSpace(cfg.AppBaseURL) == "" {
@@ -93,9 +103,10 @@ func NewCommsMailer(cfg *CommsConfig) (*CommsMailer, error) {
 // SendVerification delivers an email-verification message through the comms
 // service. The comms service renders the email_verify template with:
 //
-//	verifyURL — the full clickable verification link
-//	token     — the raw token (secondary fallback in the template)
+//	verifyURL — the full clickable verification link (canonical delivery vehicle)
 //
+// The raw token is deliberately NOT forwarded across the S2S boundary; verifyURL
+// is the only token carrier so the raw secret never leaves the user service.
 // The idempotency key is a SHA-256 of the token so a duplicate notification
 // dispatch is safely deduplicated by the comms send log.
 func (m *CommsMailer) SendVerification(ctx context.Context, to, token string) error {
@@ -111,7 +122,7 @@ func (m *CommsMailer) SendVerification(ctx context.Context, to, token string) er
 		Locale:     "en",
 		Vars: map[string]string{
 			"verifyURL": verifyURL,
-			"token":     token,
+			// Raw token is deliberately absent: verifyURL is the canonical carrier.
 		},
 		IdempotencyKey: idempKey,
 	}
@@ -181,5 +192,6 @@ func buildVerifyURL(baseURL, token string) string {
 func idempotencyKey(token string) string {
 	h := sha256.Sum256([]byte(token))
 
-	return fmt.Sprintf("user:verify:%x", h[:8]) // 8 bytes = 16 hex chars, sufficient for deduplication
+	// 64-bit prefix: collision probability negligible at expected scale (<1M tokens/day).
+	return fmt.Sprintf("user:verify:%x", h[:8])
 }

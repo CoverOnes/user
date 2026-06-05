@@ -72,6 +72,15 @@ func TestNewCommsMailer_Validation(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "valid config with https BaseURL",
+			cfg: mailer.CommsConfig{
+				BaseURL:    "https://notification.internal:8084",
+				S2SToken:   "test-token-min24charslength!",
+				AppBaseURL: "http://localhost:5500",
+			},
+			wantErr: false,
+		},
+		{
 			name: "missing BaseURL",
 			cfg: mailer.CommsConfig{
 				S2SToken:   "test-token",
@@ -79,6 +88,36 @@ func TestNewCommsMailer_Validation(t *testing.T) {
 			},
 			wantErr: true,
 			errMsg:  "BaseURL is required",
+		},
+		{
+			name: "ftp BaseURL rejected (SSRF defense)",
+			cfg: mailer.CommsConfig{
+				BaseURL:    "ftp://malicious.internal:21",
+				S2SToken:   "test-token",
+				AppBaseURL: "http://localhost:5500",
+			},
+			wantErr: true,
+			errMsg:  "BaseURL must be a valid http/https URL",
+		},
+		{
+			name: "file BaseURL rejected (SSRF defense)",
+			cfg: mailer.CommsConfig{
+				BaseURL:    "file:///etc/passwd",
+				S2SToken:   "test-token",
+				AppBaseURL: "http://localhost:5500",
+			},
+			wantErr: true,
+			errMsg:  "BaseURL must be a valid http/https URL",
+		},
+		{
+			name: "empty-scheme BaseURL rejected",
+			cfg: mailer.CommsConfig{
+				BaseURL:    "//notification:8084",
+				S2SToken:   "test-token",
+				AppBaseURL: "http://localhost:5500",
+			},
+			wantErr: true,
+			errMsg:  "BaseURL must be a valid http/https URL",
 		},
 		{
 			name: "missing AppBaseURL",
@@ -160,10 +199,11 @@ func TestCommsMailer_SendVerification_HappyPath(t *testing.T) {
 	assert.Equal(t, "email_verify", captured.body.TemplateID)
 	assert.Equal(t, "en", captured.body.Locale)
 
-	// Assert template vars: verifyURL and token.
+	// Assert template vars: verifyURL is canonical; raw token must NOT be present.
 	wantURL := "http://localhost:5500/verify-email?token=abc123_DEF-456"
 	assert.Equal(t, wantURL, captured.body.Vars["verifyURL"])
-	assert.Equal(t, token, captured.body.Vars["token"])
+	_, hasRawToken := captured.body.Vars["token"]
+	assert.False(t, hasRawToken, "raw token must NOT be forwarded across the S2S boundary")
 
 	// Assert idempotency key is non-empty.
 	assert.NotEmpty(t, captured.body.IdempotencyKey)
@@ -241,6 +281,7 @@ func TestCommsMailer_SendVerification_TokenURLEncoded(t *testing.T) {
 	assert.Contains(t, verifyURL, "http://localhost:5500/verify-email?token=")
 	// The raw '+' must be percent-encoded as %2B in the URL.
 	assert.Contains(t, verifyURL, "%2B")
-	// The raw token is passed separately (for template secondary fallback).
-	assert.Equal(t, base64TokenWithSpecialChars, captured.body.Vars["token"])
+	// Raw token must NOT be present in vars (verifyURL is the canonical carrier).
+	_, hasRawToken := captured.body.Vars["token"]
+	assert.False(t, hasRawToken, "raw token must not be forwarded across the S2S boundary")
 }

@@ -340,7 +340,7 @@ func (m devLogMailer) SendVerification(ctx context.Context, to, token string) er
 	attrs := []any{"to", to}
 
 	if base != "" {
-		// Log the clickable verify URL (no raw token in the log — M1 security fix).
+		// token embedded in verify URL (dev only); never enable this backend in staging/production.
 		attrs = append(attrs, "verify_url", fmt.Sprintf("%s/verify-email?token=%s", base, neturl.QueryEscape(token)))
 	} else {
 		// Raw token MUST NOT appear in logs even in dev (credential in logs — M1).

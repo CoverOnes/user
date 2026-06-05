@@ -618,3 +618,99 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 		})
 	}
 }
+
+// testCommsS2SToken is a valid 32-char test token — not a real credential.
+const testCommsS2SToken = "0123456789abcdef0123456789abcdef"
+
+// setBaseCommsEnv configures the minimal production environment with
+// USER_MAILER_BACKEND=comms, so individual tests can vary comms-specific fields.
+func setBaseCommsEnv(t *testing.T) {
+	t.Helper()
+
+	setBaseProdEnv(t)
+	// Comms backend: SMTP host not required when backend=comms.
+	t.Setenv("USER_SMTP_HOST", "")
+	t.Setenv("USER_PII_ENCRYPTION_KEY", validPIIKeyB64)
+	t.Setenv("USER_APP_BASE_URL", "https://app.coverones.com")
+	t.Setenv("USER_MAILER_BACKEND", "comms")
+}
+
+// TestLoad_CommsMailer validates USER_COMMS_S2S_TOKEN and USER_COMMS_BASE_URL
+// enforcement in dev vs non-dev — mirrors the EVENT_HMAC_SECRET / GATEWAY_HMAC_SECRET pattern.
+func TestLoad_CommsMailer(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		baseURL   string
+		s2sToken  string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:      "non-dev short S2S token rejected",
+			env:       "production",
+			baseURL:   "https://notification.internal:8084",
+			s2sToken:  "too-short",
+			wantErr:   true,
+			errSubstr: "USER_COMMS_S2S_TOKEN must be at least 32 characters in non-dev",
+		},
+		{
+			name:      "non-dev http BaseURL rejected",
+			env:       "production",
+			baseURL:   "http://notification.internal:8084",
+			s2sToken:  testCommsS2SToken,
+			wantErr:   true,
+			errSubstr: "USER_COMMS_BASE_URL must start with https:// in non-dev",
+		},
+		{
+			name:     "non-dev valid 32-char token + https BaseURL passes",
+			env:      "production",
+			baseURL:  "https://notification.internal:8084",
+			s2sToken: testCommsS2SToken,
+			wantErr:  false,
+		},
+		{
+			name:     "dev short token allowed",
+			env:      "development",
+			baseURL:  "http://notification:8084",
+			s2sToken: "short",
+			wantErr:  false,
+		},
+		{
+			name:     "dev http BaseURL allowed",
+			env:      "development",
+			baseURL:  "http://notification:8084",
+			s2sToken: testCommsS2SToken,
+			wantErr:  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env == "production" {
+				setBaseCommsEnv(t)
+				t.Setenv("USER_ENV", "production")
+			} else {
+				setEnv(
+					t,
+					"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+					"USER_PORT", "8080",
+					"USER_LOG_LEVEL", "INFO",
+					"USER_ENV", "development",
+					"USER_MAILER_BACKEND", "comms",
+				)
+			}
+
+			t.Setenv("USER_COMMS_BASE_URL", tc.baseURL)
+			t.Setenv("USER_COMMS_S2S_TOKEN", tc.s2sToken)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
