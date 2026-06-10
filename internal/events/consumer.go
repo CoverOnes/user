@@ -236,18 +236,21 @@ func (c *Consumer) handleKYCTierChanged(ctx context.Context, payload string) {
 	// A SET NX (set-if-not-exists) returns true only on the first call for a
 	// given key, making the check-and-set atomic. The TTL is eventDedupTTL
 	// (>= maxEventAge) so any replayed event within the freshness window is
-	// caught. A Redis error is treated as a non-fatal warning — it is safer
-	// to process a duplicate than to drop a legitimate event.
+	// caught. A Redis error is FAIL-CLOSED: for a security-sensitive KYC tier
+	// event we drop rather than process without replay protection (the publisher
+	// can re-send the same eventID). The DB monotonic CAS remains a backstop.
 	dedupKey := fmt.Sprintf("%s%s", eventDedupKeyPrefix, env.EventID.String())
 
 	set, dedupErr := c.rdb.SetNX(ctx, dedupKey, "1", eventDedupTTL).Result()
 	if dedupErr != nil {
-		slog.Warn(
-			"consumer: redis dedup check failed; processing event anyway",
+		slog.Error(
+			"consumer: redis dedup check failed; dropping event (fail-closed)",
 			"channel", "kyc.tier_changed",
 			"event_id", env.EventID,
 			"err", dedupErr,
 		)
+
+		return
 	} else if !set {
 		// Key already exists → this eventID was already processed.
 		slog.Info(
