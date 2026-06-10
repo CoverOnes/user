@@ -49,9 +49,16 @@ func contractSignature(secret, eventID, occurredAt, version, userID, newTier str
 func signedEnvelope(t *testing.T, userID uuid.UUID, oldTier, newTier int16, sign bool, forgedSig string) string {
 	t.Helper()
 
-	eventID := uuid.New()
+	return signedEnvelopeAt(t, userID, oldTier, newTier, sign, forgedSig, time.Now().UTC(), uuid.New())
+}
+
+// signedEnvelopeAt is like signedEnvelope but allows specifying a custom
+// occurredAt time and eventID — used to test freshness / dedup behavior.
+func signedEnvelopeAt(t *testing.T, userID uuid.UUID, oldTier, newTier int16, sign bool, forgedSig string, at time.Time, eventID uuid.UUID) string {
+	t.Helper()
+
 	// Fix the occurredAt textual form so signing and the wire bytes agree exactly.
-	occurredAt := time.Now().UTC().Format(time.RFC3339Nano)
+	occurredAt := at.Format(time.RFC3339Nano)
 	const version = "1"
 
 	sig := forgedSig
@@ -432,4 +439,108 @@ func TestConsumer_NilRedis_DoesNotCrash(t *testing.T) {
 	consumer.Run(ctx)
 
 	// Reaching here means no panic.
+}
+
+// TestConsumer_StaleEvent_Dropped verifies that a correctly-signed event whose
+// occurredAt is older than maxEventAge (5 min) is dropped as a replay attempt.
+// This tests audit finding: kyc.tier_changed has no replay/freshness protection.
+func TestConsumer_StaleEvent_Dropped(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	rdb, userStore := startConsumerStack(t)
+
+	u := seedTestUser(t, ctx, userStore, "stale-event@example.test")
+
+	// Publish an event with occurredAt = 10 minutes ago (well beyond the 5-min window).
+	staleAt := time.Now().UTC().Add(-10 * time.Minute)
+	staleEnv := signedEnvelopeAt(t, u.ID, 0, 2, true, "", staleAt, uuid.New())
+	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", staleEnv).Err())
+
+	// Give consumer time to receive and process.
+	time.Sleep(500 * time.Millisecond)
+
+	// Tier must remain 0 — stale event must be dropped.
+	got, err := userStore.GetByID(ctx, u.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int16(0), got.KYCTier, "stale event (10 min old) must NOT update kyc_tier")
+}
+
+// TestConsumer_DuplicateEventID_Deduplicated verifies that an event published
+// twice with the same eventID is processed only once (idempotency / anti-replay).
+func TestConsumer_DuplicateEventID_Deduplicated(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	rdb, userStore := startConsumerStack(t)
+
+	u := seedTestUser(t, ctx, userStore, "dedup-event@example.test")
+
+	eventID := uuid.New()
+	freshAt := time.Now().UTC()
+
+	// Build two identical envelopes sharing the same eventID and occurredAt.
+	env := signedEnvelopeAt(t, u.ID, 0, 2, true, "", freshAt, eventID)
+
+	// Publish the same event twice.
+	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", env).Err())
+
+	// Wait for first event to be processed.
+	require.Eventually(t, func() bool {
+		got, getErr := userStore.GetByID(ctx, u.ID)
+		if getErr != nil {
+			return false
+		}
+
+		return got.KYCTier == 2
+	}, 3*time.Second, 100*time.Millisecond, "first event must be applied")
+
+	// Publish the duplicate.
+	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", env).Err())
+	time.Sleep(500 * time.Millisecond)
+
+	// Tier is still 2 — the dedup key in Redis prevented double-processing.
+	got, err := userStore.GetByID(ctx, u.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int16(2), got.KYCTier, "duplicate event must not cause additional tier change")
+}
+
+// TestConsumer_MonotonicTier_Replay_Rejected verifies that a stale signed event
+// with a LOWER tier cannot roll back a user's KYC tier (monotonic UpdateKYCTier).
+func TestConsumer_MonotonicTier_Replay_Rejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	rdb, userStore := startConsumerStack(t)
+
+	u := seedTestUser(t, ctx, userStore, "monotonic-tier@example.test")
+
+	// Advance user to tier 2 via a valid event.
+	publishKYCTierChanged(t, ctx, rdb, u.ID, 0, 2)
+
+	require.Eventually(t, func() bool {
+		got, getErr := userStore.GetByID(ctx, u.ID)
+		if getErr != nil {
+			return false
+		}
+
+		return got.KYCTier == 2
+	}, 3*time.Second, 100*time.Millisecond, "user must reach tier 2")
+
+	// Now publish a fresh (within freshness window), correctly-signed event for tier 1
+	// — simulating an out-of-order delivery or a captured old event re-published.
+	// The dedup key won't block this (different eventID) but the monotonic guard should.
+	downgradeEnv := signedEnvelopeAt(t, u.ID, 2, 1, true, "", time.Now().UTC(), uuid.New())
+	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", downgradeEnv).Err())
+	time.Sleep(500 * time.Millisecond)
+
+	got, err := userStore.GetByID(ctx, u.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int16(2), got.KYCTier, "monotonic guard must prevent tier downgrade from tier=1 event")
 }

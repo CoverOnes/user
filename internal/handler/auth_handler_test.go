@@ -202,13 +202,21 @@ func (f *fakeRefreshTokenStore) GetByID(_ context.Context, id uuid.UUID) (*domai
 	return rt, nil
 }
 
-func (f *fakeRefreshTokenStore) MarkUsed(_ context.Context, id uuid.UUID, now time.Time) error {
-	if rt, ok := f.tokens[id]; ok {
-		rt.UsedAt = &now
-		rt.RevokedAt = &now
+func (f *fakeRefreshTokenStore) MarkUsed(_ context.Context, id uuid.UUID, now time.Time) (bool, error) {
+	rt, ok := f.tokens[id]
+	if !ok {
+		return false, nil
 	}
 
-	return nil
+	// CAS: only flip when used_at IS NULL.
+	if rt.UsedAt != nil {
+		return false, nil
+	}
+
+	rt.UsedAt = &now
+	rt.RevokedAt = &now
+
+	return true, nil
 }
 
 func (f *fakeRefreshTokenStore) RevokeFamily(_ context.Context, familyID uuid.UUID, now time.Time) error {
