@@ -208,8 +208,8 @@ func (f *fakeRefreshTokenStore) MarkUsed(_ context.Context, id uuid.UUID, now ti
 		return false, nil
 	}
 
-	// CAS: only flip when used_at IS NULL.
-	if rt.UsedAt != nil {
+	// CAS: only flip when used_at IS NULL AND revoked_at IS NULL.
+	if rt.UsedAt != nil || rt.RevokedAt != nil {
 		return false, nil
 	}
 

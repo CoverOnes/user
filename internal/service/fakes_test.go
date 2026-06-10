@@ -268,12 +268,13 @@ func (f *fakeRefreshTokenStore) MarkUsed(_ context.Context, id uuid.UUID, now ti
 
 	rt, ok := f.tokens[id]
 	if !ok {
-		// Token does not exist — treat as already-used (CAS finds nothing to flip).
+		// Token does not exist — CAS finds nothing to flip.
 		return false, nil
 	}
 
-	// Mirror the Postgres CAS: only flip when used_at IS NULL.
-	if rt.UsedAt != nil {
+	// Mirror the Postgres CAS: only flip when used_at IS NULL AND revoked_at IS NULL.
+	// revoked_at may be set by RevokeFamily on sibling tokens without touching used_at.
+	if rt.UsedAt != nil || rt.RevokedAt != nil {
 		return false, nil
 	}
 

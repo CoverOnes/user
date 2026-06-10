@@ -69,17 +69,23 @@ func (s *RefreshTokenStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.
 	return scanRefreshToken(row)
 }
 
-// MarkUsed atomically marks a token as consumed via a CAS (compare-and-swap) on
-// used_at IS NULL. It returns (true, nil) when the row was successfully flipped
-// from unused to used (exactly one row affected). It returns (false, nil) when
-// used_at was already set — indicating a concurrent reuse attempt — so the caller
-// can trigger family revocation without a separate round-trip. Any DB error is
-// wrapped and returned with ok=false.
+// MarkUsed atomically marks a token as consumed via a CAS (compare-and-swap).
+// The guard is `WHERE id=$1 AND used_at IS NULL AND revoked_at IS NULL`:
+//
+//   - used_at IS NULL: prevents a concurrent second Refresh from winning twice
+//     (the TOCTOU fix).
+//   - revoked_at IS NULL: prevents issuing a new pair from a family-revoked
+//     sibling token (RevokeFamily sets revoked_at but not used_at on siblings).
+//
+// Returns (true, nil) when exactly one row was flipped — the caller should
+// proceed to issue a new token pair. Returns (false, nil) when the guard
+// rejects the row — the caller MUST treat this as reuse (RevokeFamily +
+// ErrRefreshReuse). Any DB error returns (false, err).
 //
 // The CAS mirrors MarkConsumed in verification_store.go which uses the identical
 // WHERE id=$1 AND consumed_at IS NULL pattern.
 func (s *RefreshTokenStore) MarkUsed(ctx context.Context, id uuid.UUID, now time.Time) (bool, error) {
-	q := `UPDATE refresh_tokens SET used_at = $2, revoked_at = $2 WHERE id = $1 AND used_at IS NULL`
+	q := `UPDATE refresh_tokens SET used_at = $2, revoked_at = $2 WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL`
 
 	tag, err := s.pool.Exec(ctx, q, id, now)
 	if err != nil {
