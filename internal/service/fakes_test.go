@@ -102,7 +102,10 @@ func (f *fakeUserStore) UpdateKYCTier(_ context.Context, id uuid.UUID, tier int1
 	if !ok {
 		return domain.ErrNotFound
 	}
-	u.KYCTier = tier
+	// Mirror the monotonic Postgres CAS: only advance tier, never lower it.
+	if tier > u.KYCTier {
+		u.KYCTier = tier
+	}
 
 	return nil
 }
@@ -258,17 +261,28 @@ func (f *fakeRefreshTokenStore) GetByID(_ context.Context, id uuid.UUID) (*domai
 	return rt, nil
 }
 
-func (f *fakeRefreshTokenStore) MarkUsed(_ context.Context, id uuid.UUID, now time.Time) error {
+func (f *fakeRefreshTokenStore) MarkUsed(_ context.Context, id uuid.UUID, now time.Time) (bool, error) {
 	if f.markUsedErr != nil {
-		return f.markUsedErr
-	}
-	if rt, ok := f.tokens[id]; ok {
-		t := now
-		rt.UsedAt = &t
-		rt.RevokedAt = &t
+		return false, f.markUsedErr
 	}
 
-	return nil
+	rt, ok := f.tokens[id]
+	if !ok {
+		// Token does not exist — CAS finds nothing to flip.
+		return false, nil
+	}
+
+	// Mirror the Postgres CAS: only flip when used_at IS NULL AND revoked_at IS NULL.
+	// revoked_at may be set by RevokeFamily on sibling tokens without touching used_at.
+	if rt.UsedAt != nil || rt.RevokedAt != nil {
+		return false, nil
+	}
+
+	t := now
+	rt.UsedAt = &t
+	rt.RevokedAt = &t
+
+	return true, nil
 }
 
 func (f *fakeRefreshTokenStore) RevokeFamily(_ context.Context, familyID uuid.UUID, now time.Time) error {

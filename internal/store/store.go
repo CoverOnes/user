@@ -81,8 +81,13 @@ type RefreshTokenStore interface {
 	// GetByID fetches a refresh token row by its PK.
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.RefreshToken, error)
 
-	// MarkUsed sets used_at and revoked_at on the row (rotation supersede).
-	MarkUsed(ctx context.Context, id uuid.UUID, now time.Time) error
+	// MarkUsed atomically sets used_at and revoked_at on the row IFF used_at IS NULL
+	// AND revoked_at IS NULL (CAS). Returns (true, nil) when the row was flipped —
+	// caller should proceed to issue a new token pair. Returns (false, nil) when
+	// either guard fails (row already used OR family already revoked) — caller MUST
+	// treat this as a reuse/revoked attempt (RevokeFamily + ErrRefreshReuse). Any
+	// DB error returns (false, err).
+	MarkUsed(ctx context.Context, id uuid.UUID, now time.Time) (bool, error)
 
 	// RevokeFamily sets revoked_at on all live rows in the family (reuse detection, logout).
 	RevokeFamily(ctx context.Context, familyID uuid.UUID, now time.Time) error

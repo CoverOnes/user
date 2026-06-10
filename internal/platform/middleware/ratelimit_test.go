@@ -400,6 +400,7 @@ func TestGeneralUserRateLimiter(t *testing.T) {
 		t.Parallel()
 
 		// burst=1 → first request passes, second is immediately over budget.
+		// limitPerMin=60 → l.r = 60/60 = 1 req/s → ceil(1/1) = 1 second.
 		rl := middleware.NewGeneralUserRateLimiter(60, 1)
 		subject := uuid.NewString()
 		r, token := buildGeneralUserRateLimiterRouter(t, rl, subject)
@@ -409,7 +410,25 @@ func TestGeneralUserRateLimiter(t *testing.T) {
 
 		second := doMe(t, r, token)
 		require.Equal(t, http.StatusTooManyRequests, second.Code, "second request must be 429 when burst is exhausted")
-		assert.NotEmpty(t, second.Header().Get("Retry-After"), "429 must include Retry-After header")
+		assert.Equal(t, "1", second.Header().Get("Retry-After"), "Retry-After must be 1 second for limitPerMin=60 (l.r=1.0 req/s, ceil(1/1.0)=1)")
+	})
+
+	t.Run("Retry-After value is correct for high-rate limit", func(t *testing.T) {
+		t.Parallel()
+
+		// limitPerMin=120 → l.r = 120/60 = 2 req/s → ceil(1/2) = 1 second (max(1, 0.5) = 1).
+		// This is the default config (config.go:213) and was previously broken:
+		// the old formula ceil(60/l.r) = ceil(60/2) = 30 s (30× too large).
+		rl := middleware.NewGeneralUserRateLimiter(120, 1)
+		subject := uuid.NewString()
+		r, token := buildGeneralUserRateLimiterRouter(t, rl, subject)
+
+		first := doMe(t, r, token)
+		require.Equal(t, http.StatusOK, first.Code, "first request must pass")
+
+		second := doMe(t, r, token)
+		require.Equal(t, http.StatusTooManyRequests, second.Code, "second request must be 429")
+		assert.Equal(t, "1", second.Header().Get("Retry-After"), "Retry-After must be 1 second for limitPerMin=120 (ceil(1/2.0)=1, NOT 30)")
 	})
 
 	t.Run("two different user_ids have independent buckets", func(t *testing.T) {

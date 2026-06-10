@@ -622,23 +622,7 @@ func (s *AuthService) Refresh(ctx context.Context, in RefreshInput) (*TokenPair,
 
 	now := time.Now().UTC()
 
-	// Reuse detection: used_at already set means token was already consumed.
-	if rt.UsedAt != nil || rt.RevokedAt != nil {
-		slog.Warn(
-			"refresh.reuse_detected",
-			"userId", rt.UserID,
-			"familyId", rt.FamilyID,
-		)
-
-		// Revoke the entire family.
-		if revokeErr := s.refreshTokens.RevokeFamily(ctx, rt.FamilyID, now); revokeErr != nil {
-			slog.Error("failed to revoke token family on reuse", "err", revokeErr)
-		}
-
-		return nil, domain.ErrRefreshReuse
-	}
-
-	// Check expiry.
+	// Check expiry before the database round-trip.
 	if now.After(rt.ExpiresAt) {
 		return nil, domain.ErrRefreshExpired
 	}
@@ -653,9 +637,30 @@ func (s *AuthService) Refresh(ctx context.Context, in RefreshInput) (*TokenPair,
 		)
 	}
 
-	// Mark old token used.
-	if err := s.refreshTokens.MarkUsed(ctx, rt.ID, now); err != nil {
+	// Atomic CAS: only one goroutine racing on the same token can flip
+	// used_at from NULL to a timestamp. The loser (ok=false) detects reuse,
+	// revokes the family, and returns ErrRefreshReuse — defeating replay even
+	// under concurrent requests. This replaces the pre-check on rt.UsedAt,
+	// which was a TOCTOU: two goroutines could both read used_at=nil, then
+	// both succeed the old unconditional UPDATE, and never trigger revocation.
+	ok, err := s.refreshTokens.MarkUsed(ctx, rt.ID, now)
+	if err != nil {
 		return nil, err
+	}
+
+	if !ok {
+		// CAS lost: another concurrent request already consumed this token.
+		slog.Warn(
+			"refresh.reuse_detected",
+			"userId", rt.UserID,
+			"familyId", rt.FamilyID,
+		)
+
+		if revokeErr := s.refreshTokens.RevokeFamily(ctx, rt.FamilyID, now); revokeErr != nil {
+			slog.Error("failed to revoke token family on reuse", "err", revokeErr)
+		}
+
+		return nil, domain.ErrRefreshReuse
 	}
 
 	// Fetch fresh user data.

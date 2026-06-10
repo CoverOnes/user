@@ -130,20 +130,30 @@ func (s *txUserStore) UpdateProfile(ctx context.Context, id uuid.UUID, displayNa
 }
 
 func (s *txUserStore) UpdateKYCTier(ctx context.Context, id uuid.UUID, tier int16) error {
+	// Monotonic: only advance the tier, never lower it (replay protection),
+	// mirroring the pool-backed UserStore.UpdateKYCTier. The CTE distinguishes
+	// "user not found" (ErrNotFound) from "already at/above tier" (idempotent no-op).
 	q := `
-	UPDATE users
-	SET kyc_tier = $2, updated_at = now()
-	WHERE id = $1 AND deleted_at IS NULL
+	WITH target AS (
+		SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL
+	), upd AS (
+		UPDATE users SET kyc_tier = $2, updated_at = now()
+		WHERE id = $1 AND deleted_at IS NULL AND kyc_tier < $2
+		RETURNING id
+	)
+	SELECT (SELECT count(*) FROM target), (SELECT count(*) FROM upd)
 	`
 
-	tag, err := s.tx.Exec(ctx, q, id, tier)
-	if err != nil {
+	var existed, updated int
+	if err := s.tx.QueryRow(ctx, q, id, tier).Scan(&existed, &updated); err != nil {
 		return fmt.Errorf("update kyc_tier (tx): %w", err)
 	}
 
-	if tag.RowsAffected() == 0 {
+	if existed == 0 {
 		return domain.ErrNotFound
 	}
+
+	_ = updated // updated==0 means already at/above tier: idempotent, monotonic no-op.
 
 	return nil
 }

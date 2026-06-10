@@ -40,7 +40,8 @@ func (s *RefreshTokenStore) Create(ctx context.Context, rt *domain.RefreshToken)
 		ipText = &s
 	}
 
-	_, err := s.pool.Exec(ctx, q,
+	_, err := s.pool.Exec(
+		ctx, q,
 		rt.ID, rt.UserID, rt.FamilyID, rt.TokenHash, rt.PrevID,
 		rt.UsedAt, rt.RevokedAt,
 		rt.DeviceFingerprint, ipText, rt.UserAgent,
@@ -68,16 +69,30 @@ func (s *RefreshTokenStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.
 	return scanRefreshToken(row)
 }
 
-// MarkUsed sets used_at and revoked_at on a token row to indicate it has been consumed (superseded).
-func (s *RefreshTokenStore) MarkUsed(ctx context.Context, id uuid.UUID, now time.Time) error {
-	q := `UPDATE refresh_tokens SET used_at = $2, revoked_at = $2 WHERE id = $1`
+// MarkUsed atomically marks a token as consumed via a CAS (compare-and-swap).
+// The guard is `WHERE id=$1 AND used_at IS NULL AND revoked_at IS NULL`:
+//
+//   - used_at IS NULL: prevents a concurrent second Refresh from winning twice
+//     (the TOCTOU fix).
+//   - revoked_at IS NULL: prevents issuing a new pair from a family-revoked
+//     sibling token (RevokeFamily sets revoked_at but not used_at on siblings).
+//
+// Returns (true, nil) when exactly one row was flipped — the caller should
+// proceed to issue a new token pair. Returns (false, nil) when the guard
+// rejects the row — the caller MUST treat this as reuse (RevokeFamily +
+// ErrRefreshReuse). Any DB error returns (false, err).
+//
+// The CAS mirrors MarkConsumed in verification_store.go which uses the identical
+// WHERE id=$1 AND consumed_at IS NULL pattern.
+func (s *RefreshTokenStore) MarkUsed(ctx context.Context, id uuid.UUID, now time.Time) (bool, error) {
+	q := `UPDATE refresh_tokens SET used_at = $2, revoked_at = $2 WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL`
 
-	_, err := s.pool.Exec(ctx, q, id, now)
+	tag, err := s.pool.Exec(ctx, q, id, now)
 	if err != nil {
-		return fmt.Errorf("mark refresh token used: %w", err)
+		return false, fmt.Errorf("mark refresh token used: %w", err)
 	}
 
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 // RevokeFamily sets revoked_at on all live rows in the same token family.

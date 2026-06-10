@@ -505,7 +505,11 @@ func (l *GeneralUserRateLimiter) Handler() gin.HandlerFunc {
 			// refill interval (integer truncation would emit "0" for high-rate limiters
 			// with r > 1 req/s, violating RFC 9110 §10.6.3). max(1, …) guarantees a
 			// minimum of 1 second even if the division rounds down to zero.
-			retryAfter := int(math.Max(1, math.Ceil(60.0/float64(l.r))))
+			//
+			// Note: l.r is in req/sec (= limitPerMin/60). The formula is ceil(1/l.r),
+			// NOT ceil(60/l.r) — the latter would produce ceil(3600/limitPerMin) which
+			// is 30–60× too large. With limitPerMin=120: l.r=2.0, 1/l.r=0.5 → 1s.
+			retryAfter := int(math.Max(1, math.Ceil(1.0/float64(l.r))))
 
 			c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
 			c.Abort()

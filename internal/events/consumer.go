@@ -5,9 +5,11 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/CoverOnes/user/internal/store"
 	"github.com/google/uuid"
@@ -23,6 +25,19 @@ var subscribedChannels = []string{
 // maxPayloadBytes is the maximum accepted event payload size (64 KiB).
 // Payloads above this limit are logged and silently dropped to prevent DoS.
 const maxPayloadBytes = 64 * 1024
+
+// maxEventAge is the freshness window for kyc.tier_changed events. Events whose
+// signed occurredAt is older than this value are dropped as stale/replayed.
+// Mirrors the gateway middleware's maxGatewaySkew pattern.
+const maxEventAge = 5 * time.Minute
+
+// eventDedupTTL is the Redis key TTL for the event-ID dedup set.
+// Must be >= maxEventAge so that dedup keys outlive the freshness window,
+// making replay within the window detectable.
+const eventDedupTTL = 10 * time.Minute
+
+// eventDedupKeyPrefix is the Redis key namespace for processed event IDs.
+const eventDedupKeyPrefix = "kyc:event:dedup:"
 
 // eventEnvelope is the canonical Redis pub/sub payload (CONVENTIONS §14) plus the
 // top-level "signature" field required by the EVENT HMAC CONTRACT.
@@ -154,13 +169,15 @@ func (c *Consumer) handleKYCTierChanged(ctx context.Context, payload string) {
 	// MESSAGE AUTHENTICATION (P0): recompute the HMAC over the received fields and
 	// reject any event whose signature is missing or does not verify in constant
 	// time. Without this a forged Redis publish could elevate any user to Tier2.
+	occurredAtStr := unquoteJSONString(string(env.OccurredAt))
 	sigInput := signatureInput{
 		eventID:    env.EventID.String(),
-		occurredAt: unquoteJSONString(string(env.OccurredAt)),
+		occurredAt: occurredAtStr,
 		version:    strings.TrimSpace(string(env.Version)),
 		userID:     data.UserID.String(),
 		newTier:    strconv.FormatInt(int64(data.NewTier), 10),
 	}
+
 	if !verifySignature(c.secret, &sigInput, env.Signature) {
 		slog.Warn(
 			"consumer: kyc.tier_changed signature verification failed; dropping event",
@@ -168,6 +185,79 @@ func (c *Consumer) handleKYCTierChanged(ctx context.Context, payload string) {
 			"event_id", env.EventID,
 			"user_id", data.UserID,
 			"has_signature", env.Signature != "",
+		)
+
+		return
+	}
+
+	// FRESHNESS CHECK: reject events whose signed occurredAt is older than
+	// maxEventAge. This prevents replay of captured signed events (a party with
+	// Redis publish access can re-publish an old event, but the staleness check
+	// will drop it). The occurredAt is authenticated by the HMAC above so the
+	// freshness check cannot be bypassed by altering the timestamp field.
+	occurredAt, parseErr := time.Parse(time.RFC3339Nano, occurredAtStr)
+	if parseErr != nil {
+		// Try RFC3339 (without sub-second precision) as a fallback.
+		occurredAt, parseErr = time.Parse(time.RFC3339, occurredAtStr)
+	}
+
+	if parseErr != nil {
+		slog.Warn(
+			"consumer: kyc.tier_changed unparseable occurredAt; dropping event",
+			"channel", "kyc.tier_changed",
+			"event_id", env.EventID,
+			"occurred_at", occurredAtStr,
+			"err", parseErr,
+		)
+
+		return
+	}
+
+	age := time.Since(occurredAt)
+	if age < 0 {
+		age = -age
+	}
+
+	if age > maxEventAge {
+		slog.Warn(
+			"consumer: kyc.tier_changed event too stale; dropping to prevent replay",
+			"channel", "kyc.tier_changed",
+			"event_id", env.EventID,
+			"user_id", data.UserID,
+			"occurred_at", occurredAtStr,
+			"age_seconds", age.Seconds(),
+			"max_age_seconds", maxEventAge.Seconds(),
+		)
+
+		return
+	}
+
+	// EVENTID DEDUP: use Redis SETNX to mark this eventID as processed.
+	// A SET NX (set-if-not-exists) returns true only on the first call for a
+	// given key, making the check-and-set atomic. The TTL is eventDedupTTL
+	// (>= maxEventAge) so any replayed event within the freshness window is
+	// caught. A Redis error is FAIL-CLOSED: for a security-sensitive KYC tier
+	// event we drop rather than process without replay protection (the publisher
+	// can re-send the same eventID). The DB monotonic CAS remains a backstop.
+	dedupKey := fmt.Sprintf("%s%s", eventDedupKeyPrefix, env.EventID.String())
+
+	set, dedupErr := c.rdb.SetNX(ctx, dedupKey, "1", eventDedupTTL).Result()
+	if dedupErr != nil {
+		slog.Error(
+			"consumer: redis dedup check failed; dropping event (fail-closed)",
+			"channel", "kyc.tier_changed",
+			"event_id", env.EventID,
+			"err", dedupErr,
+		)
+
+		return
+	} else if !set {
+		// Key already exists → this eventID was already processed.
+		slog.Info(
+			"consumer: kyc.tier_changed duplicate event_id; skipping",
+			"channel", "kyc.tier_changed",
+			"event_id", env.EventID,
+			"user_id", data.UserID,
 		)
 
 		return

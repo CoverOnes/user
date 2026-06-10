@@ -96,24 +96,42 @@ func (s *UserStore) UpdateProfile(ctx context.Context, id uuid.UUID, displayName
 	return nil
 }
 
-// UpdateKYCTier sets kyc_tier for the given user, bumping updated_at.
-// Called by the Redis consumer on kyc.tier_changed events.
+// UpdateKYCTier monotonically advances kyc_tier for the given user, bumping
+// updated_at. "Monotonic" means the tier is only written when newTier is strictly
+// greater than the stored value — a stale or replayed event with an equal or lower
+// tier is silently ignored (returns nil, not an error), preventing KYC downgrades
+// from replays. ErrNotFound is returned only when no live row matches the user ID.
+//
+// A CTE distinguishes the two 0-row outcomes in a single round-trip:
+//   - row exists but kyc_tier >= newTier → tier not advanced; return nil (no-op).
+//   - no live row at all                 → ErrNotFound.
 func (s *UserStore) UpdateKYCTier(ctx context.Context, id uuid.UUID, tier int16) error {
 	q := `
-	UPDATE users
-	SET kyc_tier = $2, updated_at = now()
-	WHERE id = $1 AND deleted_at IS NULL
+	WITH target AS (
+		SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL
+	), upd AS (
+		UPDATE users
+		SET kyc_tier = $2, updated_at = now()
+		WHERE id = $1 AND deleted_at IS NULL AND kyc_tier < $2
+		RETURNING id
+	)
+	SELECT
+		(SELECT count(*) FROM target) AS existed,
+		(SELECT count(*) FROM upd)    AS updated
 	`
 
-	tag, err := s.pool.Exec(ctx, q, id, tier)
-	if err != nil {
+	var existed, updated int64
+
+	if err := s.pool.QueryRow(ctx, q, id, tier).Scan(&existed, &updated); err != nil {
 		return fmt.Errorf("update kyc_tier: %w", err)
 	}
 
-	if tag.RowsAffected() == 0 {
+	if existed == 0 {
 		return domain.ErrNotFound
 	}
 
+	// existed > 0 but updated == 0 means tier was already >= newTier (stale/replay).
+	// This is not an error — the monotonic guard silently absorbed the event.
 	return nil
 }
 

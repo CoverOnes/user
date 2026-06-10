@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -321,12 +322,19 @@ func TestRefreshTokenStore_Integration(t *testing.T) {
 		require.NoError(t, rtStore.Create(ctx, rt))
 
 		now := time.Now().UTC()
-		require.NoError(t, rtStore.MarkUsed(ctx, rt.ID, now))
+		ok, err := rtStore.MarkUsed(ctx, rt.ID, now)
+		require.NoError(t, err)
+		assert.True(t, ok, "first MarkUsed must flip the row (CAS win)")
 
 		got, err := rtStore.GetByID(ctx, rt.ID)
 		require.NoError(t, err)
 		assert.NotNil(t, got.UsedAt)
 		assert.NotNil(t, got.RevokedAt)
+
+		// CAS: second MarkUsed on the same token must return ok=false (already used).
+		ok2, err2 := rtStore.MarkUsed(ctx, rt.ID, now)
+		require.NoError(t, err2)
+		assert.False(t, ok2, "second MarkUsed must return false (CAS guard: used_at IS NOT NULL)")
 	})
 
 	t.Run("revoke family", func(t *testing.T) {
@@ -449,4 +457,158 @@ func TestPool_ReservedWordSchema(t *testing.T) {
 	err = pool.QueryRow(ctx, "SELECT current_schema()").Scan(&currentSchema)
 	require.NoError(t, err)
 	assert.Equal(t, reservedSchema, currentSchema, "current_schema() must return %q when search_path is set", reservedSchema)
+}
+
+// TestRefreshTokenStore_MarkUsed_TOCTOU_Integration is the decisive concurrency
+// test for the CAS-based reuse detection (audit finding: refresh-token rotation
+// TOCTOU). Two goroutines race to call MarkUsed on the same valid token
+// simultaneously. The Postgres-level CAS (WHERE used_at IS NULL) ensures EXACTLY
+// ONE wins; the loser receives ok=false, so the caller can revoke the family and
+// return ErrRefreshReuse. This test cannot be expressed with an in-memory fake
+// because the race is in the DB serialization layer.
+func TestRefreshTokenStore_MarkUsed_TOCTOU_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn, "")
+
+	pool, err := postgres.NewPool(ctx, dsn, "", 0, 0)
+	require.NoError(t, err)
+
+	defer pool.Close()
+
+	rtStore := postgres.NewRefreshTokenStore(pool)
+
+	// Seed a fresh, unused token.
+	rtID := uuid.New()
+	rt := &domain.RefreshToken{
+		ID:        rtID,
+		UserID:    uuid.New(),
+		FamilyID:  uuid.New(),
+		TokenHash: rtID[:],
+		ExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+		CreatedAt: time.Now().UTC(),
+	}
+	require.NoError(t, rtStore.Create(ctx, rt))
+
+	now := time.Now().UTC()
+
+	const goroutines = 10
+
+	results := make([]bool, goroutines)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{}) // synchronized launch
+
+	for i := range goroutines {
+		wg.Add(1)
+
+		go func(idx int) {
+			defer wg.Done()
+
+			<-start // wait for all goroutines to be ready
+
+			ok, err := rtStore.MarkUsed(ctx, rtID, now)
+			if err != nil {
+				// Unexpected DB error — treat as a lose so the assertion below
+				// still counts correctly.
+				t.Logf("goroutine %d: MarkUsed error: %v", idx, err)
+				results[idx] = false
+
+				return
+			}
+
+			results[idx] = ok
+		}(i)
+	}
+
+	close(start) // release all goroutines simultaneously
+	wg.Wait()
+
+	// Exactly one goroutine must have won the CAS.
+	wins := 0
+
+	for _, ok := range results {
+		if ok {
+			wins++
+		}
+	}
+
+	assert.Equal(t, 1, wins, "exactly one CAS winner expected; got %d (concurrent MarkUsed race not serialized correctly)", wins)
+
+	// The winning goroutine must have actually set used_at in the DB.
+	got, err := rtStore.GetByID(ctx, rtID)
+	require.NoError(t, err)
+	assert.NotNil(t, got.UsedAt, "used_at must be set after the CAS winner")
+	assert.NotNil(t, got.RevokedAt, "revoked_at must be set after the CAS winner")
+}
+
+// TestUserStore_UpdateKYCTier_Monotonic_Integration verifies that UpdateKYCTier
+// is monotonic: it never lowers kyc_tier and silently absorbs stale/replayed events.
+func TestUserStore_UpdateKYCTier_Monotonic_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn, "")
+
+	pool, err := postgres.NewPool(ctx, dsn, "", 0, 0)
+	require.NoError(t, err)
+
+	defer pool.Close()
+
+	userStore := postgres.NewUserStore(pool)
+
+	// Seed a user at tier 0.
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	u := &domain.User{
+		ID:           uuid.New(),
+		Email:        "kyc-monotonic@integration.test",
+		PasswordHash: testPasswordHash,
+		DisplayName:  "Mono",
+		AccountType:  "PERSONAL",
+		KYCTier:      0,
+		Status:       "ACTIVE",
+		TokenVersion: 0,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	require.NoError(t, userStore.Create(ctx, u))
+
+	t.Run("tier advances normally", func(t *testing.T) {
+		require.NoError(t, userStore.UpdateKYCTier(ctx, u.ID, 2))
+
+		got, err := userStore.GetByID(ctx, u.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int16(2), got.KYCTier, "tier must be advanced to 2")
+	})
+
+	t.Run("equal tier is a no-op (idempotent)", func(t *testing.T) {
+		// Already at 2; publishing tier=2 again must not error and tier stays 2.
+		require.NoError(t, userStore.UpdateKYCTier(ctx, u.ID, 2))
+
+		got, err := userStore.GetByID(ctx, u.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int16(2), got.KYCTier, "tier must remain 2 after same-tier update")
+	})
+
+	t.Run("lower tier is silently ignored (replay protection)", func(t *testing.T) {
+		// Attempt to roll back to tier 1 (e.g. a replayed old event).
+		require.NoError(t, userStore.UpdateKYCTier(ctx, u.ID, 1),
+			"stale event must return nil, not an error")
+
+		got, err := userStore.GetByID(ctx, u.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int16(2), got.KYCTier, "tier must NOT be lowered by a stale event")
+	})
+
+	t.Run("unknown user returns ErrNotFound", func(t *testing.T) {
+		err := userStore.UpdateKYCTier(ctx, uuid.New(), 1)
+		require.ErrorIs(t, err, domain.ErrNotFound, "unknown user must return ErrNotFound")
+	})
 }
