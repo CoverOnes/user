@@ -30,8 +30,11 @@ func NewOAuthHandler(svc *service.OAuthService, frontendPostLoginURL string) *OA
 }
 
 // Start handles GET /v1/auth/oauth/:provider/start.
-// It returns a JSON body with the provider authorization URL so the frontend
-// can redirect the browser (no direct 302 here to keep CORS simple).
+// It 302-redirects the browser straight to the provider authorization URL.
+// The frontend reaches this via window.location.href (a top-level navigation),
+// so no CORS applies — neither on this redirect nor on the subsequent provider
+// redirect to our callback. The bind flow, by contrast, returns JSON because
+// it is triggered from an already-authenticated XHR (POST /v1/me/identities/:provider).
 func (h *OAuthHandler) Start(c *gin.Context) {
 	provider := strings.ToLower(c.Param("provider"))
 
@@ -41,7 +44,7 @@ func (h *OAuthHandler) Start(c *gin.Context) {
 		return
 	}
 
-	httpx.OK(c, gin.H{"authorizeUrl": result.AuthorizeURL})
+	c.Redirect(http.StatusFound, result.AuthorizeURL)
 }
 
 // Callback handles GET /v1/auth/oauth/:provider/callback.
