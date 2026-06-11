@@ -4,7 +4,9 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -38,6 +40,41 @@ func NewSignerFromSeed(seedB64 string, ttl time.Duration) (*Signer, error) {
 	}
 
 	priv := ed25519.NewKeyFromSeed(seedBytes)
+	pub := priv.Public().(ed25519.PublicKey)
+
+	return &Signer{
+		privateKey: priv,
+		publicKey:  pub,
+		kid:        kidFromPub(pub),
+		ttl:        ttl,
+	}, nil
+}
+
+// NewSignerFromPEM creates a Signer from a PKCS#8 PEM-encoded Ed25519 private key.
+// The PEM block must have type "PRIVATE KEY" and decode to a PKCS#8 Ed25519 key.
+// This is the preferred production path when the key is managed as a PEM file / secret
+// rather than a base64-encoded seed (USER_JWT_PRIVATE_KEY_PEM). It is functionally
+// equivalent to NewSignerFromSeed but uses the standard PKCS#8 container format.
+func NewSignerFromPEM(pemData string, ttl time.Duration) (*Signer, error) {
+	block, _ := pem.Decode([]byte(pemData))
+	if block == nil {
+		return nil, errors.New("decode jwt pem: no PEM block found")
+	}
+
+	if block.Type != "PRIVATE KEY" {
+		return nil, fmt.Errorf("decode jwt pem: expected type PRIVATE KEY, got %q", block.Type)
+	}
+
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse pkcs8 private key: %w", err)
+	}
+
+	priv, ok := key.(ed25519.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("decode jwt pem: expected Ed25519 key, got %T", key)
+	}
+
 	pub := priv.Public().(ed25519.PublicKey)
 
 	return &Signer{

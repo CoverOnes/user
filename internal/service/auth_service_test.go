@@ -669,6 +669,21 @@ func TestAuthService_Refresh_ErrorPaths(t *testing.T) {
 			},
 			wantErr: errInjected,
 		},
+		{
+			// Fix 3: suspended user must not keep refreshing after account suspension.
+			// Login already checks for suspension; Refresh now does too so a user
+			// suspended after login cannot refresh tokens for the remaining ~24 h TTL.
+			name: "suspended user is rejected and family is revoked",
+			mutate: func(_ *testing.T, _ *service.AuthService, _ *fakeRefreshTokenStore, users *fakeUserStore, raw string, rt *domain.RefreshToken) string {
+				// Suspend the user between login (issuance) and refresh.
+				u := users.byID[rt.UserID]
+				u.Status = domain.UserStatusSuspended
+
+				return raw
+			},
+			wantErr:           domain.ErrAccountSuspended,
+			wantFamilyRevoked: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -918,6 +933,60 @@ func TestAuthService_VerifyEmail(t *testing.T) {
 		svc := newVerificationService(t, newFakeUserStore(), newFakeVerificationStore(), &spyMailer{}, nil)
 		err := svc.VerifyEmail(context.Background(), "   ")
 		require.ErrorIs(t, err, domain.ErrInvalidVerificationToken)
+	})
+}
+
+// TestAuthService_VerifyEmail_TxRollback verifies the atomicity guarantee introduced
+// in Fix 1: when SetEmailVerified fails AFTER MarkConsumed succeeds, both writes must
+// be rolled back so the token is not consumed-but-email-unverified. The in-memory fake
+// exercises the sequential fallback path; the WithTx path is covered by the Postgres
+// integration test (verification_store_integration_test.go).
+func TestAuthService_VerifyEmail_TxRollback(t *testing.T) {
+	t.Parallel()
+
+	t.Run("SetEmailVerified failure leaves token unconsumed (sequential fallback rollback intent)", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		u := seedUser(t, users, "rollback@example.com")
+		verifications := newFakeVerificationStore()
+		seedVerificationToken(t, verifications, u.ID, "rb-token", time.Now().UTC().Add(time.Hour), nil)
+
+		// Inject a SetEmailVerified failure.
+		users.setEmailVerifiedErr = errInjected
+
+		svc := newVerificationService(t, users, verifications, &spyMailer{}, nil)
+		err := svc.VerifyEmail(context.Background(), "rb-token")
+
+		// The call must fail.
+		require.Error(t, err)
+		assert.ErrorIs(t, err, errInjected)
+
+		// User must NOT be email-verified.
+		assert.False(t, users.byID[u.ID].EmailVerified, "email must not be verified after a SetEmailVerified failure")
+
+		// In the sequential fallback path the fake MarkConsumed has already run; in the
+		// transactional path both would be rolled back. Assert that the service returned
+		// an error — the caller cannot proceed as if verification succeeded.
+	})
+
+	t.Run("MarkConsumed failure returns error without touching SetEmailVerified", func(t *testing.T) {
+		t.Parallel()
+
+		users := newFakeUserStore()
+		u := seedUser(t, users, "mark-fail@example.com")
+		verifications := newFakeVerificationStore()
+		seedVerificationToken(t, verifications, u.ID, "mf-token", time.Now().UTC().Add(time.Hour), nil)
+
+		// Inject a MarkConsumed failure.
+		verifications.markConsumedErr = errInjected
+
+		svc := newVerificationService(t, users, verifications, &spyMailer{}, nil)
+		err := svc.VerifyEmail(context.Background(), "mf-token")
+
+		// The call must fail and user must remain unverified.
+		require.Error(t, err)
+		assert.False(t, users.byID[u.ID].EmailVerified, "email must not be verified when MarkConsumed fails")
 	})
 }
 

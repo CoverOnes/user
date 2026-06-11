@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,17 @@ const maxPayloadBytes = 64 * 1024
 // signed occurredAt is older than this value are dropped as stale/replayed.
 // Mirrors the gateway middleware's maxGatewaySkew pattern.
 const maxEventAge = 5 * time.Minute
+
+// reconnectBaseDelay is the initial back-off between subscription reconnect attempts.
+const reconnectBaseDelay = time.Second
+
+// reconnectMaxDelay caps the exponential back-off so the consumer does not wait
+// longer than 30 s before re-subscribing after a Redis blip.
+const reconnectMaxDelay = 30 * time.Second
+
+// reconnectMaxAttempts is the maximum consecutive reconnect attempts logged at
+// Warn level before we start logging at Error. Zero disables the threshold (always Warn).
+const reconnectMaxAttempts = 10
 
 // eventDedupTTL is the Redis key TTL for the event-ID dedup set.
 // Must be >= maxEventAge so that dedup keys outlive the freshness window,
@@ -80,10 +92,18 @@ func NewConsumer(rdb *redis.Client, users store.UserStore, secret string) *Consu
 	return &Consumer{rdb: rdb, users: users, secret: []byte(secret)}
 }
 
-// Run starts the subscription loop. Blocks until ctx is canceled.
-// Designed to run in a goroutine with a context.Background()-derived context so
-// that it is not canceled when a request context expires.
-// Resilient: bad/unknown payload -> slog.Warn + skip, NEVER crashes the loop.
+// Run starts the subscription loop with automatic reconnect on channel close.
+// Blocks until ctx is canceled. Designed to run in a goroutine with a
+// context.Background()-derived context so that it is not canceled when a
+// request context expires.
+//
+// Channel close (ok=false) used to stop the consumer permanently. After a Redis
+// blip the channel closes without ctx being canceled — without reconnect logic
+// kyc.tier_changed events stop being processed silently. The outer retry loop
+// re-subscribes with exponential back-off (1 s … 30 s) so a transient Redis
+// restart does not permanently break the consumer.
+//
+// Resilient: bad/unknown payload → slog.Warn + skip, NEVER crashes the loop.
 func (c *Consumer) Run(ctx context.Context) {
 	if c.rdb == nil {
 		slog.Info("redis consumer disabled: no Redis client configured")
@@ -92,6 +112,52 @@ func (c *Consumer) Run(ctx context.Context) {
 		return
 	}
 
+	attempt := 0
+
+	for {
+		// Check context before each (re-)subscribe attempt so a shutdown during
+		// back-off does not wait for the next attempt.
+		if ctx.Err() != nil {
+			slog.Info("redis consumer stopping")
+			return
+		}
+
+		if attempt > 0 {
+			// Exponential back-off: delay = min(base * 2^(attempt-1), max).
+			delay := time.Duration(math.Min(
+				float64(reconnectBaseDelay)*math.Pow(2, float64(attempt-1)),
+				float64(reconnectMaxDelay),
+			))
+
+			logFn := slog.Warn
+			if attempt > reconnectMaxAttempts {
+				logFn = slog.Error
+			}
+
+			logFn("redis consumer reconnecting", "attempt", attempt, "delay", delay)
+
+			select {
+			case <-ctx.Done():
+				slog.Info("redis consumer stopping")
+				return
+			case <-time.After(delay):
+			}
+		}
+
+		closed := c.runSubscription(ctx)
+		if !closed {
+			// ctx was canceled — normal shutdown.
+			return
+		}
+
+		// Channel closed due to Redis blip — increment attempt and retry.
+		attempt++
+	}
+}
+
+// runSubscription opens one Subscribe session and processes messages until the
+// channel closes (returns true) or ctx is canceled (returns false).
+func (c *Consumer) runSubscription(ctx context.Context) (channelClosed bool) {
 	sub := c.rdb.Subscribe(ctx, subscribedChannels...)
 	defer func() {
 		if err := sub.Close(); err != nil {
@@ -107,12 +173,12 @@ func (c *Consumer) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			slog.Info("redis consumer stopping")
-			return
+			return false
 
 		case msg, ok := <-ch:
 			if !ok {
-				slog.Warn("redis consumer channel closed; stopping")
-				return
+				slog.Warn("redis consumer channel closed; will reconnect")
+				return true
 			}
 
 			c.handle(ctx, msg)

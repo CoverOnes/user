@@ -286,8 +286,18 @@ func (l *SubjectLimiter) Handler() gin.HandlerFunc {
 		}
 
 		if !allowed {
+			// Retry-After = ceil(window / limit) seconds — the minimum time until
+			// the oldest in-window request expires and frees a slot. For the MFA code
+			// limiter (e.g. 5 attempts / 60 s) this is ceil(60/5) = 12 s.
+			retryAfter := int(math.Ceil(l.window.Seconds() / float64(l.limit)))
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+
+			c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
 			c.Abort()
 			httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
+
 			return
 		}
 
@@ -346,8 +356,16 @@ func (rl *RateLimiter) Handler() gin.HandlerFunc {
 			// the service still has brute-force protection even without Redis (F4).
 			key := rl.keyFunc(c)
 			if !rl.fallback.allow(key) {
+				// Fallback is a token bucket; use ceil(window/limit) as Retry-After.
+				retryAfter := int(math.Ceil(rl.window.Seconds() / float64(rl.limit)))
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+
+				c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
 				c.Abort()
 				httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
+
 				return
 			}
 
@@ -363,8 +381,15 @@ func (rl *RateLimiter) Handler() gin.HandlerFunc {
 			// Redis error — engage the in-process fallback limiter instead of failing open (F4).
 			slog.Warn("rate limiter redis error; applying in-process fallback limiter", "err", err)
 			if !rl.fallback.allow(key) {
+				retryAfter := int(math.Ceil(rl.window.Seconds() / float64(rl.limit)))
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+
+				c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
 				c.Abort()
 				httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
+
 				return
 			}
 
@@ -373,8 +398,17 @@ func (rl *RateLimiter) Handler() gin.HandlerFunc {
 		}
 
 		if !allowed {
+			// Retry-After = ceil(window / limit) seconds — the minimum time until
+			// the oldest in-window request expires and frees a slot.
+			retryAfter := int(math.Ceil(rl.window.Seconds() / float64(rl.limit)))
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+
+			c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
 			c.Abort()
 			httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
+
 			return
 		}
 

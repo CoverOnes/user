@@ -48,6 +48,24 @@ func main() {
 	}
 }
 
+// newJWTSigner builds the JWT signer from config. Priority order:
+//  1. Seed (base64 Ed25519 seed via USER_JWT_PRIVATE_KEY)
+//  2. PEM  (PKCS#8 Ed25519 PEM via USER_JWT_PRIVATE_KEY_PEM)
+//  3. Ephemeral (dev only — tokens die on restart)
+func newJWTSigner(cfg *config.Config, accessTTL time.Duration) (*jwt.Signer, error) {
+	switch {
+	case cfg.JWTPrivateKey != "":
+		return jwt.NewSignerFromSeed(cfg.JWTPrivateKey, accessTTL)
+	case cfg.JWTPrivateKeyPEM != "":
+		// PEM-only config path (PKCS#8 Ed25519 PEM via USER_JWT_PRIVATE_KEY_PEM).
+		// Previously this branch was missing — a PEM-only config silently fell through
+		// to the ephemeral signer, making tokens die on every restart.
+		return jwt.NewSignerFromPEM(cfg.JWTPrivateKeyPEM, accessTTL)
+	default:
+		return jwt.NewEphemeralSigner(accessTTL)
+	}
+}
+
 // newPIIEncryptor decodes the base64 PII key and builds an AES-256-GCM encryptor.
 // config.validate() already fail-fasts on a missing / wrong-length key outside
 // dev; this re-decodes to construct the cipher and surfaces any residual error.
@@ -127,16 +145,9 @@ func run() error {
 
 	accessTTL := time.Duration(cfg.AccessTokenTTLSec) * time.Second
 
-	if cfg.JWTPrivateKey != "" {
-		signer, err = jwt.NewSignerFromSeed(cfg.JWTPrivateKey, accessTTL)
-		if err != nil {
-			return fmt.Errorf("create jwt signer: %w", err)
-		}
-	} else {
-		signer, err = jwt.NewEphemeralSigner(accessTTL)
-		if err != nil {
-			return fmt.Errorf("create ephemeral jwt signer: %w", err)
-		}
+	signer, err = newJWTSigner(cfg, accessTTL)
+	if err != nil {
+		return fmt.Errorf("create jwt signer: %w", err)
 	}
 
 	// Redis client (optional — nil means rate limiting passes through in dev).

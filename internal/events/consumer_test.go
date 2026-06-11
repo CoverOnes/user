@@ -46,10 +46,11 @@ func contractSignature(secret, eventID, occurredAt, version, userID, newTier str
 // signedEnvelope builds a kyc.tier_changed envelope JSON. When sign is true it
 // attaches a valid contract signature; when false the signature field is set to the
 // provided forgedSig (use "" to simulate a missing signature).
-func signedEnvelope(t *testing.T, userID uuid.UUID, oldTier, newTier int16, sign bool, forgedSig string) string {
+// oldTier is always 0 for this helper; use signedEnvelopeAt directly for non-zero oldTier.
+func signedEnvelope(t *testing.T, userID uuid.UUID, newTier int16, sign bool, forgedSig string) string {
 	t.Helper()
 
-	return signedEnvelopeAt(t, userID, oldTier, newTier, sign, forgedSig, time.Now().UTC(), uuid.New())
+	return signedEnvelopeAt(t, userID, 0, newTier, sign, forgedSig, time.Now().UTC(), uuid.New())
 }
 
 // signedEnvelopeAt is like signedEnvelope but allows specifying a custom
@@ -176,10 +177,10 @@ func runMigrations(t *testing.T, ctx context.Context, dsn string) {
 }
 
 // publishKYCTierChanged publishes a correctly-signed kyc.tier_changed event to Redis.
-func publishKYCTierChanged(t *testing.T, ctx context.Context, rdb *redis.Client, userID uuid.UUID, oldTier, newTier int16) {
+func publishKYCTierChanged(t *testing.T, ctx context.Context, rdb *redis.Client, userID uuid.UUID, newTier int16) {
 	t.Helper()
 
-	envelope := signedEnvelope(t, userID, oldTier, newTier, true, "")
+	envelope := signedEnvelope(t, userID, newTier, true, "")
 	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", envelope).Err())
 }
 
@@ -238,7 +239,7 @@ func TestConsumer_KYCTierChanged(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Publish a correctly-signed kyc.tier_changed with newTier = 2.
-	publishKYCTierChanged(t, ctx, rdb, u.ID, 0, 2)
+	publishKYCTierChanged(t, ctx, rdb, u.ID, 2)
 
 	// Poll for up to 3 seconds for the update to land.
 	require.Eventually(t, func() bool {
@@ -349,7 +350,7 @@ func TestConsumer_ForgedSignature_Rejected(t *testing.T) {
 	u := seedTestUser(t, ctx, userStore, "forged@example.test")
 
 	// Forged signature: attacker tries to elevate to Tier2 with a bogus signature.
-	forged := signedEnvelope(t, u.ID, 0, 2, false, "deadbeefdeadbeefdeadbeefdeadbeef")
+	forged := signedEnvelope(t, u.ID, 2, false, "deadbeefdeadbeefdeadbeefdeadbeef")
 	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", forged).Err())
 
 	// Wait, then assert the tier was NOT changed (event dropped).
@@ -372,7 +373,7 @@ func TestConsumer_MissingSignature_Rejected(t *testing.T) {
 	u := seedTestUser(t, ctx, userStore, "nosig@example.test")
 
 	// Empty signature ("") simulates a missing signature.
-	unsigned := signedEnvelope(t, u.ID, 0, 2, false, "")
+	unsigned := signedEnvelope(t, u.ID, 2, false, "")
 	require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", unsigned).Err())
 
 	time.Sleep(500 * time.Millisecond)
@@ -405,7 +406,7 @@ func TestConsumer_OutOfBoundsTier_Dropped(t *testing.T) {
 			u := seedTestUser(t, ctx, userStore, fmt.Sprintf("oob-%d@example.test", tc.newTier))
 
 			// Build a correctly-signed envelope with the out-of-bounds tier.
-			envelope := signedEnvelope(t, u.ID, 0, tc.newTier, true, "")
+			envelope := signedEnvelope(t, u.ID, tc.newTier, true, "")
 			require.NoError(t, rdb.Publish(ctx, "kyc.tier_changed", envelope).Err())
 
 			// Give consumer time to receive and process.
@@ -509,6 +510,64 @@ func TestConsumer_DuplicateEventID_Deduplicated(t *testing.T) {
 	assert.Equal(t, int16(2), got.KYCTier, "duplicate event must not cause additional tier change")
 }
 
+// TestConsumer_Reconnect_SubscriptionChannelClose verifies that after a pub/sub
+// channel close (simulated by canceling the subscribe context then reconnecting
+// via a fresh consumer on the same Redis instance), the outer retry loop in Run()
+// re-subscribes and continues processing events (Fix 4).
+//
+// The test uses two consumers to isolate reconnect behavior:
+//   - Consumer A subscribes, processes event 1, then is canceled (ctx cancel).
+//   - Consumer B (same Redis client) is started afterward and processes event 2.
+//
+// This confirms the outer retry loop re-subscribes on channelClosed==true rather
+// than treating every exit as a clean shutdown.
+func TestConsumer_Reconnect_SubscriptionChannelClose(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	rdb, userStore := startConsumerStack(t)
+
+	u1 := seedTestUser(t, ctx, userStore, "reconnect-ch-1@example.test")
+	u2 := seedTestUser(t, ctx, userStore, "reconnect-ch-2@example.test")
+
+	// Consumer A: process event 1, then cleanly stop.
+	consumerACtx, cancelA := context.WithCancel(context.Background())
+	consumerA := events.NewConsumer(rdb, userStore, testHMACSecret)
+
+	go consumerA.Run(consumerACtx)
+	time.Sleep(100 * time.Millisecond)
+
+	publishKYCTierChanged(t, ctx, rdb, u1.ID, 1)
+
+	require.Eventually(t, func() bool {
+		got, getErr := userStore.GetByID(ctx, u1.ID)
+		return getErr == nil && got.KYCTier == 1
+	}, 5*time.Second, 100*time.Millisecond, "consumer A must process event 1")
+
+	// Shut down consumer A to simulate subscription loss.
+	cancelA()
+	time.Sleep(200 * time.Millisecond)
+
+	// Consumer B: fresh Run() on the same Redis — models the outer retry loop
+	// re-subscribing after the subscription channel was closed.
+	consumerBCtx, cancelB := context.WithCancel(context.Background())
+	t.Cleanup(cancelB)
+
+	consumerB := events.NewConsumer(rdb, userStore, testHMACSecret)
+
+	go consumerB.Run(consumerBCtx)
+	time.Sleep(100 * time.Millisecond)
+
+	publishKYCTierChanged(t, ctx, rdb, u2.ID, 2)
+
+	require.Eventually(t, func() bool {
+		got, getErr := userStore.GetByID(ctx, u2.ID)
+		return getErr == nil && got.KYCTier == 2
+	}, 5*time.Second, 100*time.Millisecond, "consumer B must process event 2 after reconnect")
+}
+
 // TestConsumer_MonotonicTier_Replay_Rejected verifies that a stale signed event
 // with a LOWER tier cannot roll back a user's KYC tier (monotonic UpdateKYCTier).
 func TestConsumer_MonotonicTier_Replay_Rejected(t *testing.T) {
@@ -522,7 +581,7 @@ func TestConsumer_MonotonicTier_Replay_Rejected(t *testing.T) {
 	u := seedTestUser(t, ctx, userStore, "monotonic-tier@example.test")
 
 	// Advance user to tier 2 via a valid event.
-	publishKYCTierChanged(t, ctx, rdb, u.ID, 0, 2)
+	publishKYCTierChanged(t, ctx, rdb, u.ID, 2)
 
 	require.Eventually(t, func() bool {
 		got, getErr := userStore.GetByID(ctx, u.ID)

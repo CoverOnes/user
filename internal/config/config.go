@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
 
@@ -145,8 +146,19 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables (prefix USER_).
-// Optional .env file is loaded only in non-production environments.
+// Before viper binding, .env.local and .env files are loaded via godotenv so
+// local-dev configuration can be supplied without environment injection.
+// Errors are silently ignored — the files are optional and godotenv does NOT
+// override variables that are already set in the process environment, so
+// injected-by-Docker / injected-by-k8s env always wins.
+// Convention: .env = production-ish defaults (committed as .env.example only);
+// .env.local = developer-local overrides (gitignored).
 func Load() (*Config, error) {
+	// Load .env.local first (highest priority), then .env as fallback.
+	// Both are optional; missing files are not an error.
+	_ = godotenv.Load(".env.local")
+	_ = godotenv.Load(".env")
+
 	v := viper.New()
 
 	// ENV-FIRST: set prefix and auto-bind env vars.
