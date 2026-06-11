@@ -22,9 +22,11 @@ import (
 	"github.com/CoverOnes/user/internal/events"
 	"github.com/CoverOnes/user/internal/handler"
 	"github.com/CoverOnes/user/internal/mailer"
+	"github.com/CoverOnes/user/internal/oauth"
 	"github.com/CoverOnes/user/internal/platform/logger"
 	"github.com/CoverOnes/user/internal/platform/middleware"
 	"github.com/CoverOnes/user/internal/service"
+	"github.com/CoverOnes/user/internal/store"
 	"github.com/CoverOnes/user/internal/store/postgres"
 	"github.com/redis/go-redis/v9"
 )
@@ -230,17 +232,30 @@ func run() error {
 
 	go consumer.Run(ctx)
 
+	// OAuth social login service (Increment 4).
+	// Only wired when at least one provider is configured. When no providers are
+	// set, oauthSvc remains nil and the OAuth routes are not registered (router.go
+	// guards on cfg.OAuth != nil).
+	authIdentityStore := postgres.NewAuthIdentityStore(pool)
+
+	oauthSvc, err := buildOAuthService(cfg, userStore, authIdentityStore, rtStore, redisClient, signer, accessTTL)
+	if err != nil {
+		return fmt.Errorf("init oauth service: %w", err)
+	}
+
 	// Router.
 	r := handler.NewRouter(&handler.RouterConfig{
-		Auth:                authSvc,
-		Profile:             profileSvc,
-		MFA:                 mfaSvc,
-		Signer:              signer,
-		Pool:                pool,
-		Redis:               redisClient,
-		GatewayHMACSecret:   cfg.GatewayHMACSecret,
-		UserRateLimitPerMin: cfg.UserRateLimitPerMin,
-		UserRateLimitBurst:  cfg.UserRateLimitBurst,
+		Auth:                      authSvc,
+		Profile:                   profileSvc,
+		MFA:                       mfaSvc,
+		OAuth:                     oauthSvc,
+		Signer:                    signer,
+		Pool:                      pool,
+		Redis:                     redisClient,
+		GatewayHMACSecret:         cfg.GatewayHMACSecret,
+		UserRateLimitPerMin:       cfg.UserRateLimitPerMin,
+		UserRateLimitBurst:        cfg.UserRateLimitBurst,
+		OAuthFrontendPostLoginURL: cfg.OAuthFrontendPostLoginURL,
 	})
 
 	srv := &http.Server{
@@ -366,4 +381,54 @@ func (m devLogMailer) SendVerification(ctx context.Context, to, token string) er
 	)
 
 	return nil
+}
+
+// buildOAuthService constructs the OAuthService when one or more providers are configured.
+// Returns nil (no error) when no provider environment variables are set (feature disabled).
+// Extracted from run() to keep run()'s cyclomatic complexity within the lint threshold.
+func buildOAuthService(
+	cfg *config.Config,
+	userStore store.UserStore,
+	authIdentityStore store.AuthIdentityStore,
+	rtStore store.RefreshTokenStore,
+	redisClient *redis.Client,
+	signer *jwt.Signer,
+	accessTTL time.Duration,
+) (*service.OAuthService, error) {
+	if cfg.OAuthGoogleClientID == "" && cfg.OAuthLINEChannelID == "" {
+		return nil, nil
+	}
+
+	if redisClient == nil {
+		return nil, fmt.Errorf("OAuth requires Redis (USER_REDIS_URL must be set)")
+	}
+
+	providers := make(map[string]service.OAuthProvider)
+
+	if cfg.OAuthGoogleClientID != "" {
+		redirectURI := cfg.OAuthRedirectBaseURL + "/v1/auth/oauth/google/callback"
+		providers["google"] = oauth.GoogleConfig(cfg.OAuthGoogleClientID, cfg.OAuthGoogleClientSecret, redirectURI)
+	}
+
+	if cfg.OAuthLINEChannelID != "" {
+		redirectURI := cfg.OAuthRedirectBaseURL + "/v1/auth/oauth/line/callback"
+		providers["line"] = oauth.LINEConfig(cfg.OAuthLINEChannelID, cfg.OAuthLINEChannelSecret, redirectURI)
+	}
+
+	oauthCfg := &service.OAuthServiceConfig{
+		UserStore:         userStore,
+		AuthIdentityStore: authIdentityStore,
+		RefreshTokenStore: rtStore,
+		Redis:             redisClient,
+		Signer:            signer,
+		AccessTTL:         accessTTL,
+		RefreshTTLHours:   cfg.RefreshTokenTTLHours,
+		StateHMACSecret:   []byte(cfg.OAuthStateHMACSecret),
+		Providers:         providers,
+	}
+
+	svc := service.NewOAuthService(oauthCfg)
+	slog.Info("oauth social login enabled", "providers", len(providers))
+
+	return svc, nil
 }

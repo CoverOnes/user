@@ -46,14 +46,14 @@ func newAuthService(
 func seedUser(t *testing.T, users *fakeUserStore, email string) *domain.User {
 	t.Helper()
 
-	hash, err := password.Hash(validPassword, password.DefaultParams)
+	hashStr, err := password.Hash(validPassword, password.DefaultParams)
 	require.NoError(t, err)
 
 	now := time.Now().UTC()
 	u := &domain.User{
 		ID:           uuid.New(),
 		Email:        email,
-		PasswordHash: hash,
+		PasswordHash: &hashStr,
 		DisplayName:  "Seed",
 		AccountType:  domain.AccountTypePersonal,
 		Status:       domain.UserStatusActive,

@@ -29,7 +29,7 @@ func seedPendingUser(t *testing.T, ctx context.Context, us *postgres.UserStore, 
 	u := &domain.User{
 		ID:            uuid.New(),
 		Email:         email,
-		PasswordHash:  testPasswordHash,
+		PasswordHash:  testPH(),
 		DisplayName:   "Pending",
 		AccountType:   "PERSONAL",
 		KYCTier:       0,
@@ -263,7 +263,7 @@ func TestTxManager_RegisterAtomic_Integration(t *testing.T) {
 
 	t.Run("commit creates all three rows", func(t *testing.T) {
 		u := &domain.User{
-			ID: userID, Email: "tx-atomic@integration.test", PasswordHash: testPasswordHash,
+			ID: userID, Email: "tx-atomic@integration.test", PasswordHash: testPH(),
 			DisplayName: "TxAtomic", AccountType: "COMPANY", Status: domain.UserStatusPendingVerification,
 			CreatedAt: now, UpdatedAt: now,
 		}
@@ -304,7 +304,7 @@ func TestTxManager_RegisterAtomic_Integration(t *testing.T) {
 	t.Run("rollback on callback error leaves no rows", func(t *testing.T) {
 		rollbackUserID := uuid.New()
 		u := &domain.User{
-			ID: rollbackUserID, Email: "tx-rollback@integration.test", PasswordHash: testPasswordHash,
+			ID: rollbackUserID, Email: "tx-rollback@integration.test", PasswordHash: testPH(),
 			DisplayName: "TxRollback", AccountType: "PERSONAL", Status: domain.UserStatusPendingVerification,
 			CreatedAt: now, UpdatedAt: now,
 		}

@@ -138,6 +138,29 @@ type Config struct {
 	// Sourced from USER_USER_RATE_LIMIT_BURST. Default: 20.
 	UserRateLimitBurst int `mapstructure:"user_rate_limit_burst"`
 
+	// OAuthGoogleClientID / OAuthGoogleClientSecret are the Google OIDC app credentials.
+	// Required when OAuth is enabled (USER_OAUTH_GOOGLE_CLIENT_ID != "").
+	OAuthGoogleClientID     string `mapstructure:"oauth_google_client_id"`
+	OAuthGoogleClientSecret string `mapstructure:"oauth_google_client_secret"`
+
+	// OAuthLINEChannelID / OAuthLINEChannelSecret are the LINE Login v2.1 credentials.
+	// Required when OAuth is enabled (USER_OAUTH_LINE_CHANNEL_ID != "").
+	OAuthLINEChannelID     string `mapstructure:"oauth_line_channel_id"`
+	OAuthLINEChannelSecret string `mapstructure:"oauth_line_channel_secret"`
+
+	// OAuthRedirectBaseURL is the public base URL used to build per-provider redirect URIs
+	// (e.g. https://api.example.com). Required when any OAuth provider is configured.
+	OAuthRedirectBaseURL string `mapstructure:"oauth_redirect_base_url"`
+
+	// OAuthFrontendPostLoginURL is the frontend URL the callback redirects to after
+	// OAuth login (success: ?code=<onetime>, collision: ?error=email_exists).
+	// Required when any OAuth provider is configured.
+	OAuthFrontendPostLoginURL string `mapstructure:"oauth_frontend_post_login_url"`
+
+	// OAuthStateHMACSecret is the HMAC secret used to sign OAuth state parameters
+	// (anti-CSRF). Required when any OAuth provider is configured. ≥32 chars.
+	OAuthStateHMACSecret string `mapstructure:"oauth_state_hmac_secret"`
+
 	// Log level: DEBUG, INFO, WARN, ERROR
 	LogLevel string `mapstructure:"log_level"`
 
@@ -175,34 +198,41 @@ func Load() (*Config, error) {
 	// USER-prefixed AutomaticEnv lookup for this key.
 	//nolint:gosec // G101: map values are environment-variable NAMES (e.g. EVENT_HMAC_SECRET / USER_JWT_PRIVATE_KEY), not hardcoded credential values
 	bindings := map[string]string{
-		"port":                    "USER_PORT",
-		"postgres_dsn":            "USER_POSTGRES_DSN",
-		"postgres_schema":         "USER_DB_SCHEMA",
-		"db_max_conns":            "USER_DB_MAX_CONNS",
-		"db_min_conns":            "USER_DB_MIN_CONNS",
-		"redis_url":               "USER_REDIS_URL",
-		"jwt_private_key":         "USER_JWT_PRIVATE_KEY",
-		"jwt_private_key_pem":     "USER_JWT_PRIVATE_KEY_PEM",
-		"event_hmac_secret":       "EVENT_HMAC_SECRET",
-		"gateway_hmac_secret":     "USER_GATEWAY_HMAC_SECRET",
-		"pii_encryption_key":      "USER_PII_ENCRYPTION_KEY",
-		"smtp_host":               "USER_SMTP_HOST",
-		"smtp_port":               "USER_SMTP_PORT",
-		"smtp_username":           "USER_SMTP_USERNAME",
-		"smtp_password":           "USER_SMTP_PASSWORD",
-		"smtp_from":               "USER_SMTP_FROM",
-		"app_base_url":            "USER_APP_BASE_URL",
-		"mailer_backend":          "USER_MAILER_BACKEND",
-		"comms_base_url":          "USER_COMMS_BASE_URL",
-		"comms_s2s_token":         "USER_COMMS_S2S_TOKEN",
-		"access_token_ttl_sec":    "USER_ACCESS_TOKEN_TTL_SEC",
-		"refresh_token_ttl_hours": "USER_REFRESH_TOKEN_TTL_HOURS",
-		"mfa_enforced":            "USER_MFA_ENFORCED",
-		"totp_issuer":             "USER_TOTP_ISSUER",
-		"user_rate_limit_per_min": "USER_USER_RATE_LIMIT_PER_MIN",
-		"user_rate_limit_burst":   "USER_USER_RATE_LIMIT_BURST",
-		"log_level":               "USER_LOG_LEVEL",
-		"env":                     "USER_ENV",
+		"port":                          "USER_PORT",
+		"postgres_dsn":                  "USER_POSTGRES_DSN",
+		"postgres_schema":               "USER_DB_SCHEMA",
+		"db_max_conns":                  "USER_DB_MAX_CONNS",
+		"db_min_conns":                  "USER_DB_MIN_CONNS",
+		"redis_url":                     "USER_REDIS_URL",
+		"jwt_private_key":               "USER_JWT_PRIVATE_KEY",
+		"jwt_private_key_pem":           "USER_JWT_PRIVATE_KEY_PEM",
+		"event_hmac_secret":             "EVENT_HMAC_SECRET",
+		"gateway_hmac_secret":           "USER_GATEWAY_HMAC_SECRET",
+		"pii_encryption_key":            "USER_PII_ENCRYPTION_KEY",
+		"smtp_host":                     "USER_SMTP_HOST",
+		"smtp_port":                     "USER_SMTP_PORT",
+		"smtp_username":                 "USER_SMTP_USERNAME",
+		"smtp_password":                 "USER_SMTP_PASSWORD",
+		"smtp_from":                     "USER_SMTP_FROM",
+		"app_base_url":                  "USER_APP_BASE_URL",
+		"mailer_backend":                "USER_MAILER_BACKEND",
+		"comms_base_url":                "USER_COMMS_BASE_URL",
+		"comms_s2s_token":               "USER_COMMS_S2S_TOKEN",
+		"access_token_ttl_sec":          "USER_ACCESS_TOKEN_TTL_SEC",
+		"refresh_token_ttl_hours":       "USER_REFRESH_TOKEN_TTL_HOURS",
+		"mfa_enforced":                  "USER_MFA_ENFORCED",
+		"totp_issuer":                   "USER_TOTP_ISSUER",
+		"user_rate_limit_per_min":       "USER_USER_RATE_LIMIT_PER_MIN",
+		"user_rate_limit_burst":         "USER_USER_RATE_LIMIT_BURST",
+		"oauth_google_client_id":        "USER_OAUTH_GOOGLE_CLIENT_ID",
+		"oauth_google_client_secret":    "USER_OAUTH_GOOGLE_CLIENT_SECRET",
+		"oauth_line_channel_id":         "USER_OAUTH_LINE_CHANNEL_ID",
+		"oauth_line_channel_secret":     "USER_OAUTH_LINE_CHANNEL_SECRET",
+		"oauth_redirect_base_url":       "USER_OAUTH_REDIRECT_BASE_URL",
+		"oauth_frontend_post_login_url": "USER_OAUTH_FRONTEND_POST_LOGIN_URL",
+		"oauth_state_hmac_secret":       "USER_OAUTH_STATE_HMAC_SECRET",
+		"log_level":                     "USER_LOG_LEVEL",
+		"env":                           "USER_ENV",
 	}
 	for key, envKey := range bindings {
 		if err := v.BindEnv(key, envKey); err != nil {
@@ -241,12 +271,59 @@ func (c *Config) validate() error {
 	errs := c.validateCore()
 	errs = append(errs, c.validateDB()...)
 	errs = append(errs, c.validateUserRateLimit()...)
+	errs = append(errs, c.validateOAuth()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
 	}
 
 	return nil
+}
+
+// minOAuthHMACSecretLen is the minimum length of the OAuth state HMAC secret.
+const minOAuthHMACSecretLen = 32
+
+// validateOAuth checks OAuth provider credentials when any provider is configured.
+// OAuth is considered "enabled" when any of the provider credential fields is set.
+// When enabled, the shared fields (redirect URL, frontend URL, HMAC secret) are required.
+func (c *Config) validateOAuth() []string {
+	googleEnabled := c.OAuthGoogleClientID != ""
+	lineEnabled := c.OAuthLINEChannelID != ""
+
+	if !googleEnabled && !lineEnabled {
+		// OAuth disabled — no validation needed.
+		return nil
+	}
+
+	var errs []string
+
+	if googleEnabled && c.OAuthGoogleClientSecret == "" {
+		errs = append(errs, "USER_OAUTH_GOOGLE_CLIENT_SECRET is required when USER_OAUTH_GOOGLE_CLIENT_ID is set")
+	}
+
+	if lineEnabled && c.OAuthLINEChannelSecret == "" {
+		errs = append(errs, "USER_OAUTH_LINE_CHANNEL_SECRET is required when USER_OAUTH_LINE_CHANNEL_ID is set")
+	}
+
+	if strings.TrimSpace(c.OAuthRedirectBaseURL) == "" {
+		errs = append(errs, "USER_OAUTH_REDIRECT_BASE_URL is required when any OAuth provider is configured")
+	} else if !c.IsDev() && !strings.HasPrefix(c.OAuthRedirectBaseURL, "https://") {
+		errs = append(errs, "USER_OAUTH_REDIRECT_BASE_URL must start with https:// in non-dev environments")
+	}
+
+	if strings.TrimSpace(c.OAuthFrontendPostLoginURL) == "" {
+		errs = append(errs, "USER_OAUTH_FRONTEND_POST_LOGIN_URL is required when any OAuth provider is configured")
+	} else if !c.IsDev() && !strings.HasPrefix(c.OAuthFrontendPostLoginURL, "https://") {
+		errs = append(errs, "USER_OAUTH_FRONTEND_POST_LOGIN_URL must start with https:// in non-dev environments")
+	}
+
+	if strings.TrimSpace(c.OAuthStateHMACSecret) == "" {
+		errs = append(errs, "USER_OAUTH_STATE_HMAC_SECRET is required when any OAuth provider is configured")
+	} else if len(c.OAuthStateHMACSecret) < minOAuthHMACSecretLen {
+		errs = append(errs, "USER_OAUTH_STATE_HMAC_SECRET must be at least 32 characters")
+	}
+
+	return errs
 }
 
 // validateUserRateLimit checks the per-authenticated-user rate limiter settings.

@@ -93,6 +93,24 @@ type RefreshTokenStore interface {
 	RevokeFamily(ctx context.Context, familyID uuid.UUID, now time.Time) error
 }
 
+// AuthIdentityStore defines DB operations for OAuth auth_identities records.
+type AuthIdentityStore interface {
+	// GetByProvider fetches an auth identity by provider + provider-side subject ID.
+	// Returns domain.ErrNotFound when no matching row exists.
+	GetByProvider(ctx context.Context, provider, providerSubject string) (*domain.AuthIdentity, error)
+
+	// Create inserts a new auth_identities row.
+	// Returns domain.ErrIdentityAlreadyBound on unique-constraint violation.
+	Create(ctx context.Context, ai *domain.AuthIdentity) error
+
+	// ListByUserID returns all auth identities linked to a given user.
+	ListByUserID(ctx context.Context, userID uuid.UUID) ([]*domain.AuthIdentity, error)
+
+	// DeleteByUserAndProvider removes a single identity row.
+	// Returns domain.ErrNotFound when no matching row exists.
+	DeleteByUserAndProvider(ctx context.Context, userID uuid.UUID, provider string) error
+}
+
 // IssueTokensInput groups the parameters needed to atomically create a new token pair.
 type IssueTokensInput struct {
 	UserID            uuid.UUID

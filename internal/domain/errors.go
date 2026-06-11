@@ -40,4 +40,30 @@ var (
 	// disable failures (wrong code / expired window). One code, no oracle that would
 	// let a caller distinguish the cases (maps to HTTP 400).
 	ErrInvalidTOTPCode = errors.New("invalid totp code")
+
+	// OAuth errors (Increment 4).
+
+	// ErrOAuthStateInvalid is returned when the OAuth state/PKCE verification fails
+	// (replay, CSRF, expired state, PKCE verifier mismatch). Maps to HTTP 400.
+	ErrOAuthStateInvalid = errors.New("oauth state invalid or expired")
+
+	// ErrOAuthExchangeFailed is returned when the token exchange with the provider
+	// fails (network, invalid code, etc.). Maps to HTTP 502.
+	ErrOAuthExchangeFailed = errors.New("oauth token exchange failed")
+
+	// ErrOAuthProviderUnknown is returned when the provider parameter is not in
+	// the allowlist. Maps to HTTP 404.
+	ErrOAuthProviderUnknown = errors.New("unknown oauth provider")
+
+	// ErrOAuthOneTimeCodeInvalid is returned when the frontend one-time code
+	// is missing, expired, or already consumed. Maps to HTTP 400.
+	ErrOAuthOneTimeCodeInvalid = errors.New("oauth one-time code invalid or expired")
+
+	// ErrIdentityAlreadyBound is returned when POST /v1/me/identities/:provider finds
+	// the (provider, provider_subject) pair already linked to any user. Maps to HTTP 409.
+	ErrIdentityAlreadyBound = errors.New("oauth identity already bound to an account")
+
+	// ErrLastLoginMethod is returned by Unbind when removing the identity would leave
+	// the user with no remaining login method. Maps to HTTP 409.
+	ErrLastLoginMethod = errors.New("cannot remove last login method")
 )
