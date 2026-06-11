@@ -133,13 +133,22 @@ func (f *fakeUserStore) SetPendingTOTPSecret(_ context.Context, id uuid.UUID, se
 
 func (f *fakeUserStore) EnableMFA(_ context.Context, id uuid.UUID, backupCodesEnc []byte, enrolledAt time.Time) error {
 	for _, u := range f.users {
-		if u.ID == id {
-			u.MFAEnabled = true
-			u.MFABackupCodesEnc = backupCodesEnc
-			u.MFAEnrolledAt = &enrolledAt
-
-			return nil
+		if u.ID != id {
+			continue
 		}
+
+		// Mirror the service-layer fake CAS guard (fakes_test.go:163): reject a
+		// second EnableMFA on an already-enabled row so the handler-layer fake
+		// matches the real Postgres store's conditional UPDATE (mfa_enabled = false).
+		if u.MFAEnabled {
+			return domain.ErrMFAAlreadyEnabled
+		}
+
+		u.MFAEnabled = true
+		u.MFABackupCodesEnc = backupCodesEnc
+		u.MFAEnrolledAt = &enrolledAt
+
+		return nil
 	}
 
 	return domain.ErrNotFound

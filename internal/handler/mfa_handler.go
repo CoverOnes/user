@@ -52,6 +52,8 @@ func subjectFromCtx(c *gin.Context) (uuid.UUID, bool) {
 // Generates a new pending TOTP secret (stored encrypted, MFA not yet enabled) and
 // returns the otpauth provisioning URI + the base32 secret ONCE.
 func (h *MFAHandler) Enroll(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
 	id, ok := subjectFromCtx(c)
 	if !ok {
 		return

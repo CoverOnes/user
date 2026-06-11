@@ -1,6 +1,10 @@
 package jwt_test
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"testing"
 	"time"
 
@@ -121,4 +125,90 @@ func TestIssue_ClaimsHaveExpectedFields(t *testing.T) {
 	assert.Equal(t, "COMPANY", claims.AccountType)
 	assert.Equal(t, 5, claims.TokenVersion)
 	assert.False(t, claims.EmailVerified, "email_verified claim must round-trip false")
+}
+
+// generateEd25519PEM generates a fresh Ed25519 private key and encodes it as a
+// PKCS#8 PEM block for testing NewSignerFromPEM.
+func generateEd25519PEM(t *testing.T) string {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	require.NoError(t, err)
+	block := &pem.Block{Type: "PRIVATE KEY", Bytes: der}
+	return string(pem.EncodeToMemory(block))
+}
+
+func TestNewSignerFromPEM_HappyPath(t *testing.T) {
+	pemData := generateEd25519PEM(t)
+	s, err := jwt.NewSignerFromPEM(pemData, 10*time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, s)
+
+	// JWKS must expose a non-empty kid derived from the key.
+	jwks := s.BuildJWKS()
+	require.Len(t, jwks.Keys, 1)
+	assert.NotEmpty(t, jwks.Keys[0].Kid)
+	assert.Equal(t, "OKP", jwks.Keys[0].Kty)
+
+	// Tokens issued by the PEM signer must be verifiable by the same signer.
+	userID := uuid.New().String()
+	token, err := s.Issue(userID, "PERSONAL", 0, 1, true)
+	require.NoError(t, err)
+	claims, err := s.Verify(token)
+	require.NoError(t, err)
+	assert.Equal(t, userID, claims.Subject)
+}
+
+func TestNewSignerFromPEM_StableKIDSameKey(t *testing.T) {
+	// Two signers built from the same PEM must produce identical KIDs
+	// (deterministic kid derivation from public key bytes).
+	pemData := generateEd25519PEM(t)
+
+	s1, err := jwt.NewSignerFromPEM(pemData, 10*time.Minute)
+	require.NoError(t, err)
+	s2, err := jwt.NewSignerFromPEM(pemData, 5*time.Minute)
+	require.NoError(t, err)
+
+	assert.Equal(t, s1.BuildJWKS().Keys[0].Kid, s2.BuildJWKS().Keys[0].Kid,
+		"KID must be deterministic from the public key bytes regardless of TTL")
+}
+
+func TestNewSignerFromPEM_ErrorCases(t *testing.T) {
+	tests := []struct {
+		name    string
+		pemData string
+		wantErr string
+	}{
+		{
+			name:    "empty string returns error",
+			pemData: "",
+			wantErr: "no PEM block found",
+		},
+		{
+			name:    "garbage bytes returns error",
+			pemData: "this is not pem",
+			wantErr: "no PEM block found",
+		},
+		{
+			name: "wrong PEM type returns error",
+			// A CERTIFICATE block (not PRIVATE KEY) should be rejected.
+			pemData: "-----BEGIN CERTIFICATE-----\naGVsbG8=\n-----END CERTIFICATE-----\n",
+			wantErr: "expected type PRIVATE KEY",
+		},
+		{
+			name: "valid PEM type but invalid PKCS8 DER returns error",
+			// PRIVATE KEY block with junk bytes inside.
+			pemData: "-----BEGIN PRIVATE KEY-----\naGVsbG8=\n-----END PRIVATE KEY-----\n",
+			wantErr: "parse pkcs8 private key",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := jwt.NewSignerFromPEM(tc.pemData, 10*time.Minute)
+			require.Error(t, err)
+			assert.Nil(t, s)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
 }

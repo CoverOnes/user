@@ -487,10 +487,13 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*TokenPair, err
 }
 
 // VerifyEmail consumes a single-use verification token: it hashes the presented
-// raw token, looks up an unconsumed + unexpired row, atomically marks it consumed,
-// and sets users.email_verified = true. ALL failure modes (not-found / expired /
-// already-consumed) return the single generic ErrInvalidVerificationToken — no
-// oracle. Issues no tokens.
+// raw token, looks up an unconsumed + unexpired row, then atomically marks it
+// consumed AND sets users.email_verified = true inside a single DB transaction
+// (when s.tx is available). Without the transaction a crash between MarkConsumed
+// and SetEmailVerified would leave the token consumed but the email unverified —
+// the user would have no valid token and no verified email, effectively locked out.
+// ALL failure modes (not-found / expired / already-consumed) return the single
+// generic ErrInvalidVerificationToken — no oracle. Issues no tokens.
 func (s *AuthService) VerifyEmail(ctx context.Context, rawToken string) error {
 	if s.verifications == nil {
 		return domain.ErrInvalidVerificationToken
@@ -513,18 +516,36 @@ func (s *AuthService) VerifyEmail(ctx context.Context, rawToken string) error {
 		return domain.ErrInvalidVerificationToken
 	}
 
+	now := time.Now().UTC()
+
+	// Wrap MarkConsumed + SetEmailVerified in a single transaction so a crash
+	// between the two calls cannot leave the token consumed but email unverified.
+	if s.tx != nil {
+		return s.tx.WithTx(ctx, func(
+			txCtx context.Context,
+			txUsers store.UserStore,
+			_ store.CompanyStore,
+			txVerifications store.EmailVerificationTokenStore,
+		) error {
+			// Atomic single-use: MarkConsumed only updates when consumed_at IS NULL,
+			// so a concurrent double-verify loses the race and gets
+			// ErrInvalidVerificationToken.
+			if txErr := txVerifications.MarkConsumed(txCtx, vt.ID, now); txErr != nil {
+				return txErr
+			}
+
+			return txUsers.SetEmailVerified(txCtx, vt.UserID)
+		})
+	}
+
+	// Sequential fallback (no tx support — unit-test / dev path).
 	// Atomic single-use: MarkConsumed only updates when consumed_at IS NULL, so a
 	// concurrent double-verify loses the race and gets ErrInvalidVerificationToken.
-	now := time.Now().UTC()
 	if err := s.verifications.MarkConsumed(ctx, vt.ID, now); err != nil {
 		return err
 	}
 
-	if err := s.users.SetEmailVerified(ctx, vt.UserID); err != nil {
-		return err
-	}
-
-	return nil
+	return s.users.SetEmailVerified(ctx, vt.UserID)
 }
 
 // ResendVerification re-sends a verification email for the given address. It is
@@ -663,19 +684,47 @@ func (s *AuthService) Refresh(ctx context.Context, in RefreshInput) (*TokenPair,
 		return nil, domain.ErrRefreshReuse
 	}
 
-	// Fetch fresh user data.
+	u, err := s.validateUserForRefresh(ctx, rt, now)
+	if err != nil {
+		return nil, err
+	}
+
+	prevID := rt.ID
+
+	return s.issueTokenPair(ctx, u, &prevID, rt.FamilyID, in.DeviceFingerprint, in.IPAddr, in.UserAgent)
+}
+
+// validateUserForRefresh fetches the fresh user row for a token that has just been
+// CAS-consumed and validates the two post-MarkUsed invariants:
+//  1. Account must not be SUSPENDED (revoke family + ErrAccountSuspended).
+//  2. Stored token_version must match users.token_version (revoke family + ErrInvalidRefresh).
+//
+// Extracted from Refresh to keep its cyclomatic complexity within the lint threshold.
+func (s *AuthService) validateUserForRefresh(
+	ctx context.Context,
+	rt *domain.RefreshToken,
+	now time.Time,
+) (*domain.User, error) {
 	u, err := s.users.GetByID(ctx, rt.UserID)
 	if err != nil {
 		return nil, domain.ErrInvalidRefresh
+	}
+
+	// Mirror the Login suspended-account check: a suspended user must not be able
+	// to keep refreshing tokens for the remainder of the refresh TTL (~24 h).
+	// Revoke the token family so all in-flight tokens are invalidated immediately.
+	if u.Status == domain.UserStatusSuspended {
+		if revokeErr := s.refreshTokens.RevokeFamily(ctx, rt.FamilyID, now); revokeErr != nil {
+			slog.Error("failed to revoke token family for suspended user on refresh", "err", revokeErr)
+		}
+
+		return nil, domain.ErrAccountSuspended
 	}
 
 	// Enforce token_version server-side (M1 fix): compare the version stored in
 	// the refresh_tokens row at issuance time against the FRESH users.token_version
 	// loaded from DB above. The client supplies no version information — the stored
 	// value is authoritative, preventing version-laundering / logout-all bypass.
-	// NOTE: the bump trigger (a logout-all / revoke-all-sessions endpoint that
-	// increments users.token_version) is a pending follow-up — this enforcement
-	// path is wired and tested, but no endpoint increments the version yet.
 	if rt.TokenVersion != u.TokenVersion {
 		slog.Warn(
 			"refresh.token_version_mismatch",
@@ -687,12 +736,11 @@ func (s *AuthService) Refresh(ctx context.Context, in RefreshInput) (*TokenPair,
 		if revokeErr := s.refreshTokens.RevokeFamily(ctx, rt.FamilyID, now); revokeErr != nil {
 			slog.Error("failed to revoke token family on version mismatch", "err", revokeErr)
 		}
+
 		return nil, domain.ErrInvalidRefresh
 	}
 
-	prevID := rt.ID
-
-	return s.issueTokenPair(ctx, u, &prevID, rt.FamilyID, in.DeviceFingerprint, in.IPAddr, in.UserAgent)
+	return u, nil
 }
 
 // Logout revokes the presented refresh token's family.
