@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/CoverOnes/user/internal/domain"
@@ -56,7 +57,7 @@ func (h *OAuthHandler) Callback(c *gin.Context) {
 	state := c.Query("state")
 
 	if code == "" || state == "" {
-		c.Redirect(http.StatusFound, h.frontendPostLoginURL+"?error=invalid_request")
+		c.Redirect(http.StatusFound, h.frontendPostLoginURL+"?error="+url.QueryEscape("invalid_request"))
 		return
 	}
 
@@ -78,14 +79,14 @@ func (h *OAuthHandler) Callback(c *gin.Context) {
 			redirectErr = "identity_already_bound"
 		}
 
-		c.Redirect(http.StatusFound, h.frontendPostLoginURL+"?error="+redirectErr)
+		c.Redirect(http.StatusFound, h.frontendPostLoginURL+"?error="+url.QueryEscape(redirectErr))
 
 		return
 	}
 
 	switch result.Outcome {
 	case service.CallbackEmailCollision:
-		c.Redirect(http.StatusFound, h.frontendPostLoginURL+"?error=email_exists")
+		c.Redirect(http.StatusFound, h.frontendPostLoginURL+"?error="+url.QueryEscape("email_exists"))
 	case service.CallbackBindSuccess:
 		// Bind flow: redirect to frontend post-login URL with bind=success indicator.
 		// No one-time code is issued for bind — the user is already authenticated.
@@ -93,7 +94,7 @@ func (h *OAuthHandler) Callback(c *gin.Context) {
 	default:
 		// CallbackLogin and CallbackNewUser both carry a one-time code.
 		// Tokens NEVER go in the URL; only the short-lived opaque code does.
-		c.Redirect(http.StatusFound, h.frontendPostLoginURL+"?code="+result.OneTimeCode)
+		c.Redirect(http.StatusFound, h.frontendPostLoginURL+"?code="+url.QueryEscape(result.OneTimeCode))
 	}
 }
 
@@ -123,6 +124,48 @@ func (h *OAuthHandler) Exchange(c *gin.Context) {
 		"accessToken":  pair.AccessToken,
 		"refreshToken": pair.RefreshToken,
 		"expiresIn":    pair.ExpiresIn,
+	})
+}
+
+// ListIdentities handles GET /v1/me/identities (authenticated).
+// Returns the user's bound OAuth identities and whether they have a password.
+func (h *OAuthHandler) ListIdentities(c *gin.Context) {
+	claims, ok := middleware.ClaimsFromCtx(c)
+	if !ok {
+		httpx.Err(c, domain.ErrUnauthorized)
+		return
+	}
+
+	userID, err := uuid.Parse(claims.Subject)
+	if err != nil {
+		httpx.Err(c, domain.ErrUnauthorized)
+		return
+	}
+
+	res, err := h.svc.ListIdentities(c.Request.Context(), userID)
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	type identityJSON struct {
+		Provider string  `json:"provider"`
+		Email    *string `json:"email"`
+		LinkedAt string  `json:"linkedAt"`
+	}
+
+	items := make([]identityJSON, 0, len(res.Identities))
+	for _, it := range res.Identities {
+		items = append(items, identityJSON{
+			Provider: it.Provider,
+			Email:    it.Email,
+			LinkedAt: it.LinkedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		})
+	}
+
+	httpx.OK(c, gin.H{
+		"identities":  items,
+		"hasPassword": res.HasPassword,
 	})
 }
 

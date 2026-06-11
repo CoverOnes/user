@@ -82,7 +82,6 @@ var fixedErrorMappings = []errMapping{
 	{domain.ErrOAuthExchangeFailed, "OAUTH_EXCHANGE_FAILED", http.StatusBadGateway, "oauth token exchange failed"},
 	{domain.ErrOAuthProviderUnknown, "OAUTH_PROVIDER_UNKNOWN", http.StatusNotFound, "unknown oauth provider"},
 	{domain.ErrOAuthOneTimeCodeInvalid, "OAUTH_CODE_INVALID", http.StatusBadRequest, "oauth one-time code invalid or expired"},
-	{domain.ErrEmailAlreadyRegistered, "EMAIL_ALREADY_REGISTERED", http.StatusConflict, "email already registered by another account"},
 	{domain.ErrIdentityAlreadyBound, "IDENTITY_ALREADY_BOUND", http.StatusConflict, "oauth identity already bound to an account"},
 	{domain.ErrLastLoginMethod, "LAST_LOGIN_METHOD", http.StatusConflict, "cannot remove last login method"},
 }

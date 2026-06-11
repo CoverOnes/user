@@ -143,6 +143,8 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	if cfg.OAuth != nil {
 		oauthH := NewOAuthHandler(cfg.OAuth, cfg.OAuthFrontendPostLoginURL)
 		identities := me.Group("/identities")
+		// GET /v1/me/identities — list bound OAuth identities + hasPassword.
+		identities.GET("", oauthH.ListIdentities)
 		identities.POST("/:provider", oauthH.BindStart)
 		identities.DELETE("/:provider", oauthH.Unbind)
 	}

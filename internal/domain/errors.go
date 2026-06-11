@@ -59,11 +59,6 @@ var (
 	// is missing, expired, or already consumed. Maps to HTTP 400.
 	ErrOAuthOneTimeCodeInvalid = errors.New("oauth one-time code invalid or expired")
 
-	// ErrEmailAlreadyRegistered is returned during OAuth callback when the provider
-	// email matches an existing user but Design A forbids auto-linking.
-	// The handler redirects to ?error=email_exists. Maps to HTTP 409.
-	ErrEmailAlreadyRegistered = errors.New("email already registered by another account")
-
 	// ErrIdentityAlreadyBound is returned when POST /v1/me/identities/:provider finds
 	// the (provider, provider_subject) pair already linked to any user. Maps to HTTP 409.
 	ErrIdentityAlreadyBound = errors.New("oauth identity already bound to an account")

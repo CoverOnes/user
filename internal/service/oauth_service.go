@@ -225,13 +225,15 @@ func (s *OAuthService) handleLoginCallback(
 	// Exchange code → access token.
 	accessToken, err := p.ExchangeCode(ctx, code, entry.CodeVerifier, "")
 	if err != nil {
-		return nil, domain.ErrOAuthExchangeFailed
+		slog.Warn("oauth exchange failed", "provider", provider, "err", err)
+		return nil, fmt.Errorf("%w: %w", domain.ErrOAuthExchangeFailed, err)
 	}
 
 	// Fetch identity from provider.
 	identity, err := p.FetchIdentity(ctx, accessToken)
 	if err != nil {
-		return nil, domain.ErrOAuthExchangeFailed
+		slog.Warn("oauth fetch identity failed", "provider", provider, "err", err)
+		return nil, fmt.Errorf("%w: %w", domain.ErrOAuthExchangeFailed, err)
 	}
 
 	return s.resolveLoginIdentity(ctx, provider, identity)
@@ -269,7 +271,9 @@ func (s *OAuthService) resolveLoginIdentity(
 	}
 
 	// Case 2: no identity row. Check for email collision (Design A: NEVER auto-link).
-	if identity.Email != "" {
+	// Only check when the email is present AND the provider asserts it is verified —
+	// an unverified provider email must not block registration (denial-of-registration risk).
+	if identity.Email != "" && identity.EmailVerified {
 		_, emailErr := s.users.GetByEmail(ctx, strings.ToLower(strings.TrimSpace(identity.Email)))
 		if emailErr == nil {
 			return &CallbackResult{Outcome: CallbackEmailCollision}, nil
@@ -286,6 +290,11 @@ func (s *OAuthService) resolveLoginIdentity(
 
 // createOAuthUser creates a new OAuth-only user and auth_identity row,
 // then issues a one-time code.
+//
+// No-email providers (LINE without email permission): a synthetic unique email of the
+// form "oauth+<providerSubject>@noemail.<provider>.invalid" is used so the NOT-NULL
+// UNIQUE(email) constraint is satisfied. This address is never used for communication
+// (it resolves to the RFC-2606 .invalid TLD) and EmailVerified is always false.
 func (s *OAuthService) createOAuthUser(
 	ctx context.Context,
 	provider string,
@@ -294,17 +303,33 @@ func (s *OAuthService) createOAuthUser(
 	now := time.Now().UTC()
 	userID := uuid.New()
 
-	email := strings.ToLower(strings.TrimSpace(identity.Email))
+	// Determine the canonical email stored on the users row.
+	// When the provider supplies no email we synthesize a unique placeholder so the
+	// NOT NULL UNIQUE citext column is satisfied. The .invalid TLD (RFC 2606) prevents
+	// any accidental delivery.
+	var email string
+	var emailVerified bool
+	var displayName string
+
+	if identity.Email != "" {
+		email = strings.ToLower(strings.TrimSpace(identity.Email))
+		emailVerified = identity.EmailVerified
+		displayName = email
+	} else {
+		email = "oauth+" + identity.ProviderSubject + "@noemail." + provider + ".invalid"
+		emailVerified = false
+		displayName = identity.ProviderSubject
+	}
 
 	u := &domain.User{
 		ID:            userID,
 		Email:         email,
 		PasswordHash:  nil, // OAuth-only, no password
-		DisplayName:   email,
+		DisplayName:   displayName,
 		AccountType:   domain.AccountTypePersonal,
 		KYCTier:       0,
 		Status:        domain.UserStatusPendingVerification,
-		EmailVerified: identity.EmailVerified,
+		EmailVerified: emailVerified,
 		TokenVersion:  0,
 		CreatedAt:     now,
 		UpdatedAt:     now,
@@ -353,14 +378,22 @@ func (s *OAuthService) handleBindCallback(
 		return nil, domain.ErrOAuthStateInvalid
 	}
 
+	// Verify the bind target user still exists (e.g. not soft-deleted between
+	// BindStart and the callback arriving).
+	if _, err := s.users.GetByID(ctx, bindUserID); err != nil {
+		return nil, fmt.Errorf("bind target user: %w", err)
+	}
+
 	accessToken, err := p.ExchangeCode(ctx, code, entry.CodeVerifier, "")
 	if err != nil {
-		return nil, domain.ErrOAuthExchangeFailed
+		slog.Warn("oauth bind exchange failed", "provider", provider, "err", err)
+		return nil, fmt.Errorf("%w: %w", domain.ErrOAuthExchangeFailed, err)
 	}
 
 	identity, err := p.FetchIdentity(ctx, accessToken)
 	if err != nil {
-		return nil, domain.ErrOAuthExchangeFailed
+		slog.Warn("oauth bind fetch identity failed", "provider", provider, "err", err)
+		return nil, fmt.Errorf("%w: %w", domain.ErrOAuthExchangeFailed, err)
 	}
 
 	// Reject if (provider, provider_subject) already bound to ANY user.
@@ -528,6 +561,47 @@ func (s *OAuthService) Unbind(ctx context.Context, authenticatedUserID uuid.UUID
 	}
 
 	return s.identities.DeleteByUserAndProvider(ctx, authenticatedUserID, provider)
+}
+
+// IdentityItem is a single bound social identity returned by ListIdentities.
+type IdentityItem struct {
+	Provider string
+	Email    *string
+	LinkedAt time.Time
+}
+
+// ListIdentitiesResult is returned by ListIdentities.
+type ListIdentitiesResult struct {
+	Identities  []*IdentityItem
+	HasPassword bool
+}
+
+// ListIdentities returns all bound OAuth identities for the authenticated user and
+// whether the user also has a password (used by the frontend Settings page).
+func (s *OAuthService) ListIdentities(ctx context.Context, authenticatedUserID uuid.UUID) (*ListIdentitiesResult, error) {
+	u, err := s.users.GetByID(ctx, authenticatedUserID)
+	if err != nil {
+		return nil, fmt.Errorf("get user: %w", err)
+	}
+
+	ais, err := s.identities.ListByUserID(ctx, authenticatedUserID)
+	if err != nil {
+		return nil, fmt.Errorf("list identities: %w", err)
+	}
+
+	items := make([]*IdentityItem, 0, len(ais))
+	for _, ai := range ais {
+		items = append(items, &IdentityItem{
+			Provider: ai.Provider,
+			Email:    ai.Email,
+			LinkedAt: ai.LinkedAt,
+		})
+	}
+
+	return &ListIdentitiesResult{
+		Identities:  items,
+		HasPassword: u.PasswordHash != nil,
+	}, nil
 }
 
 // issueOneTimeCode creates a short-lived Redis entry and returns the raw code.

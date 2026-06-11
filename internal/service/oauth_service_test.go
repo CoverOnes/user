@@ -194,6 +194,40 @@ func issueSignedState(t *testing.T, svc *service.OAuthService) string {
 	return state
 }
 
+// issueSignedStateForProvider is like issueSignedState but allows specifying the provider.
+func issueSignedStateForProvider(t *testing.T, svc *service.OAuthService, provider string) string {
+	t.Helper()
+
+	ctx := context.Background()
+	res, err := svc.Start(ctx, provider)
+	require.NoError(t, err)
+
+	u := res.AuthorizeURL
+	const stateParam = "state="
+
+	idx := -1
+	for i := 0; i+len(stateParam) <= len(u); i++ {
+		if u[i:i+len(stateParam)] == stateParam {
+			idx = i + len(stateParam)
+			break
+		}
+	}
+
+	require.True(t, idx > 0, "state param not found in AuthorizeURL: %s", u)
+
+	state := u[idx:]
+	for i, ch := range state {
+		if ch == '&' {
+			state = state[:i]
+			break
+		}
+	}
+
+	require.NotEmpty(t, state)
+
+	return state
+}
+
 // --- TestOAuthService_Start ---
 
 func TestOAuthService_Start(t *testing.T) {
@@ -802,6 +836,192 @@ func TestOAuthService_BindStart(t *testing.T) {
 
 			require.NoError(t, err)
 			assert.NotEmpty(t, res.AuthorizeURL)
+		})
+	}
+}
+
+// --- TestOAuthService_NewUser_StatusPendingVerification ---
+
+// TestOAuthService_NewUser_StatusPendingVerification asserts that when a new OAuth user
+// is created via the callback flow their status is PENDING_VERIFICATION (not Active).
+func TestOAuthService_NewUser_StatusPendingVerification(t *testing.T) {
+	rdb := startOAuthTestRedis(t)
+	const provider = "google"
+
+	users := newFakeUserStore()
+	identities := newFakeAuthIdentityStore()
+
+	svc := newOAuthSvc(t, users, identities, newFakeRefreshTokenStore(),
+		map[string]service.OAuthProvider{
+			provider: &fakeOAuthProvider{
+				fetchIdentity: &oauth.Identity{
+					ProviderSubject: "statusCheckSub",
+					Email:           "statuscheck@example.com",
+					EmailVerified:   true,
+				},
+			},
+		},
+		rdb,
+	)
+
+	signedState := issueSignedState(t, svc)
+	res, err := svc.HandleCallback(context.Background(), provider, "code", signedState)
+	require.NoError(t, err)
+	require.Equal(t, service.CallbackNewUser, res.Outcome)
+
+	// Verify the created user has PENDING_VERIFICATION status.
+	created := users.byEmail["statuscheck@example.com"]
+	require.NotNil(t, created, "created user must exist in store")
+	assert.Equal(t, domain.UserStatusPendingVerification, created.Status)
+}
+
+// --- TestOAuthService_LINENoEmail_TwoUsersDistinct ---
+
+// TestOAuthService_LINENoEmail_TwoUsersDistinct proves that two LINE users without
+// email permission each create a distinct user record — no unique-email crash.
+func TestOAuthService_LINENoEmail_TwoUsersDistinct(t *testing.T) {
+	const provider = "line"
+
+	users := newFakeUserStore()
+	identities := newFakeAuthIdentityStore()
+
+	makeSvc := func(sub string) (*service.OAuthService, string) {
+		rdb := startOAuthTestRedis(t)
+		svc := newOAuthSvc(t, users, identities, newFakeRefreshTokenStore(),
+			map[string]service.OAuthProvider{
+				provider: &fakeOAuthProvider{
+					fetchIdentity: &oauth.Identity{
+						ProviderSubject: sub,
+						Email:           "", // LINE user without email permission
+						EmailVerified:   false,
+					},
+				},
+			},
+			rdb,
+		)
+
+		signedState := issueSignedStateForProvider(t, svc, provider)
+
+		return svc, signedState
+	}
+
+	// First LINE user (no email).
+	svc1, state1 := makeSvc("line_sub_aaa")
+	res1, err := svc1.HandleCallback(context.Background(), provider, "code1", state1)
+	require.NoError(t, err, "first LINE no-email user must create successfully")
+	assert.Equal(t, service.CallbackNewUser, res1.Outcome)
+
+	// Second LINE user (no email, different subject) — must NOT crash with email collision.
+	svc2, state2 := makeSvc("line_sub_bbb")
+	res2, err := svc2.HandleCallback(context.Background(), provider, "code2", state2)
+	require.NoError(t, err, "second LINE no-email user must create successfully (no unique email crash)")
+	assert.Equal(t, service.CallbackNewUser, res2.Outcome)
+
+	// Both one-time codes must be distinct (separate users).
+	assert.NotEqual(t, res1.OneTimeCode, res2.OneTimeCode)
+
+	// Two distinct synthetic emails must be in the store.
+	email1 := "oauth+line_sub_aaa@noemail.line.invalid"
+	email2 := "oauth+line_sub_bbb@noemail.line.invalid"
+	assert.NotNil(t, users.byEmail[email1], "first synthetic email must be stored")
+	assert.NotNil(t, users.byEmail[email2], "second synthetic email must be stored")
+
+	// Both users must have PENDING_VERIFICATION status and no password.
+	u1 := users.byEmail[email1]
+	u2 := users.byEmail[email2]
+	assert.Equal(t, domain.UserStatusPendingVerification, u1.Status)
+	assert.Equal(t, domain.UserStatusPendingVerification, u2.Status)
+	assert.Nil(t, u1.PasswordHash)
+	assert.Nil(t, u2.PasswordHash)
+	assert.False(t, u1.EmailVerified)
+	assert.False(t, u2.EmailVerified)
+}
+
+// --- TestOAuthService_ListIdentities ---
+
+func TestOAuthService_ListIdentities(t *testing.T) {
+	rdb := startOAuthTestRedis(t)
+
+	tests := []struct {
+		name            string
+		setup           func(users *fakeUserStore, identities *fakeAuthIdentityStore) uuid.UUID
+		wantCount       int
+		wantHasPassword bool
+		wantErr         error
+	}{
+		{
+			name: "user with two identities and no password",
+			setup: func(users *fakeUserStore, identities *fakeAuthIdentityStore) uuid.UUID {
+				u := seedOAuthUser(nil, users) // no password
+				seedAuthIdentity(nil, identities, u.ID, "google", "g_sub")
+				seedAuthIdentity(nil, identities, u.ID, "line", "l_sub")
+				return u.ID
+			},
+			wantCount:       2,
+			wantHasPassword: false,
+		},
+		{
+			name: "user with one identity and a password",
+			setup: func(users *fakeUserStore, identities *fakeAuthIdentityStore) uuid.UUID {
+				now := time.Now().UTC()
+				hash := "argon2hash"
+				u := &domain.User{
+					ID:           uuid.New(),
+					Email:        "withpw2@example.com",
+					PasswordHash: &hash,
+					AccountType:  domain.AccountTypePersonal,
+					Status:       domain.UserStatusActive,
+					CreatedAt:    now, UpdatedAt: now,
+				}
+				users.byID[u.ID] = u
+				users.byEmail[u.Email] = u
+				seedAuthIdentity(nil, identities, u.ID, "google", "g2_sub")
+				return u.ID
+			},
+			wantCount:       1,
+			wantHasPassword: true,
+		},
+		{
+			name: "user with no identities",
+			setup: func(users *fakeUserStore, identities *fakeAuthIdentityStore) uuid.UUID {
+				u := seedOAuthUser(nil, users)
+				return u.ID
+			},
+			wantCount:       0,
+			wantHasPassword: false,
+		},
+		{
+			name: "unknown user returns error",
+			setup: func(_ *fakeUserStore, _ *fakeAuthIdentityStore) uuid.UUID {
+				return uuid.New() // not in store
+			},
+			wantErr: domain.ErrNotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			users := newFakeUserStore()
+			identities := newFakeAuthIdentityStore()
+
+			uid := tc.setup(users, identities)
+
+			svc := newOAuthSvc(t, users, identities, newFakeRefreshTokenStore(),
+				map[string]service.OAuthProvider{"google": &fakeOAuthProvider{}},
+				rdb,
+			)
+
+			res, err := svc.ListIdentities(context.Background(), uid)
+
+			if tc.wantErr != nil {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, tc.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Len(t, res.Identities, tc.wantCount)
+			assert.Equal(t, tc.wantHasPassword, res.HasPassword)
 		})
 	}
 }

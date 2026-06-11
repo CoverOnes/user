@@ -307,10 +307,14 @@ func (c *Config) validateOAuth() []string {
 
 	if strings.TrimSpace(c.OAuthRedirectBaseURL) == "" {
 		errs = append(errs, "USER_OAUTH_REDIRECT_BASE_URL is required when any OAuth provider is configured")
+	} else if !c.IsDev() && !strings.HasPrefix(c.OAuthRedirectBaseURL, "https://") {
+		errs = append(errs, "USER_OAUTH_REDIRECT_BASE_URL must start with https:// in non-dev environments")
 	}
 
 	if strings.TrimSpace(c.OAuthFrontendPostLoginURL) == "" {
 		errs = append(errs, "USER_OAUTH_FRONTEND_POST_LOGIN_URL is required when any OAuth provider is configured")
+	} else if !c.IsDev() && !strings.HasPrefix(c.OAuthFrontendPostLoginURL, "https://") {
+		errs = append(errs, "USER_OAUTH_FRONTEND_POST_LOGIN_URL must start with https:// in non-dev environments")
 	}
 
 	if strings.TrimSpace(c.OAuthStateHMACSecret) == "" {
