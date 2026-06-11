@@ -99,6 +99,10 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 		// the one-time code is single-use and short-lived — it is already the
 		// rate-limiting artifact. The IP-level ipRL still applies.
 		r.POST("/v1/auth/oauth/exchange", middleware.NoCache(), oauthH.Exchange)
+		// Register completes the no-email provider flow (LINE without email scope).
+		// The regToken is single-use + short-lived (15 min) so it acts as its own
+		// rate-limiting artifact. IP-level ipRL still applies.
+		r.POST("/v1/auth/oauth/register", middleware.NoCache(), oauthH.Register)
 	}
 
 	// Protected routes — require valid access token, Tier >= 0.
