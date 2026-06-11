@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/CoverOnes/user/internal/auth/jwt"
@@ -34,6 +35,12 @@ const oauthStateKeyPrefix = "oauth:state:"
 // oauthCodeKeyPrefix is the Redis key prefix for one-time login codes.
 const oauthCodeKeyPrefix = "oauth:code:"
 
+// oauthRegTokenKeyPrefix is the Redis key prefix for no-email registration pending tokens.
+const oauthRegTokenKeyPrefix = "oauth:reg:" //nolint:gosec // G101: key prefix string, not a credential value
+
+// oauthRegTokenTTL is how long a no-email registration token remains valid.
+const oauthRegTokenTTL = 15 * time.Minute
+
 // oauthStateEntry is serialized into Redis to link state→PKCE verifier.
 type oauthStateEntry struct {
 	CodeVerifier string `json:"cv"`
@@ -45,6 +52,15 @@ type oauthStateEntry struct {
 // oauthCodeEntry is serialized into Redis for the one-time login code.
 type oauthCodeEntry struct {
 	UserID string `json:"u"`
+}
+
+// oauthRegTokenEntry is serialized into Redis when a no-email provider callback
+// (e.g. LINE without email scope) needs to collect a real email before creating
+// the user. The token is single-use and expires after oauthRegTokenTTL.
+type oauthRegTokenEntry struct {
+	Provider        string `json:"p"`
+	ProviderSubject string `json:"s"`
+	DisplayName     string `json:"d"`
 }
 
 // OAuthProvider abstracts the provider-specific HTTP operations
@@ -60,13 +76,17 @@ type OAuthService struct {
 	users         store.UserStore
 	identities    store.AuthIdentityStore
 	refreshTokens store.RefreshTokenStore
+	verifications store.EmailVerificationTokenStore // for no-email register flow
 	signer        *jwt.Signer
 	redisClient   *redis.Client
 	providers     map[string]OAuthProvider
+	mailer        Mailer // for verification email dispatch in Register
 	// stateHMACKey signs and verifies the state parameter to prevent CSRF.
 	stateHMACKey []byte
 	accessTTL    time.Duration
 	refreshTTLH  int
+	// sendWG tracks in-flight detached email goroutines (mirrors AuthService pattern).
+	sendWG sync.WaitGroup
 }
 
 // OAuthServiceConfig bundles the dependencies for NewOAuthService.
@@ -74,6 +94,10 @@ type OAuthServiceConfig struct {
 	UserStore         store.UserStore
 	AuthIdentityStore store.AuthIdentityStore
 	RefreshTokenStore store.RefreshTokenStore
+	// VerificationStore and Mailer are required for the no-email register endpoint
+	// (POST /v1/auth/oauth/register). When nil the Register method returns ErrNotFound.
+	VerificationStore store.EmailVerificationTokenStore
+	Mailer            Mailer
 	Signer            *jwt.Signer
 	Redis             *redis.Client
 	Providers         map[string]OAuthProvider
@@ -88,13 +112,21 @@ func NewOAuthService(cfg *OAuthServiceConfig) *OAuthService {
 		users:         cfg.UserStore,
 		identities:    cfg.AuthIdentityStore,
 		refreshTokens: cfg.RefreshTokenStore,
+		verifications: cfg.VerificationStore,
 		signer:        cfg.Signer,
 		redisClient:   cfg.Redis,
 		providers:     cfg.Providers,
+		mailer:        cfg.Mailer,
 		stateHMACKey:  cfg.StateHMACSecret,
 		accessTTL:     cfg.AccessTTL,
 		refreshTTLH:   cfg.RefreshTTLHours,
 	}
+}
+
+// WaitForPendingSends blocks until all in-flight detached verification-email goroutines
+// complete. Mirrors AuthService.WaitForPendingSends; called at graceful shutdown.
+func (s *OAuthService) WaitForPendingSends() {
+	s.sendWG.Wait()
 }
 
 // OAuthStartResult is returned by Start.
@@ -162,12 +194,18 @@ const (
 	CallbackEmailCollision
 	// CallbackBindSuccess means a bind flow completed successfully.
 	CallbackBindSuccess
+	// CallbackNeedsRegistration means the provider did not supply an email address
+	// (e.g. LINE without email scope). A short-lived registration token was stored in
+	// Redis. The frontend must collect a real email via POST /v1/auth/oauth/register.
+	// No user is created at this stage; RegToken carries the opaque token.
+	CallbackNeedsRegistration
 )
 
 // CallbackResult is returned by HandleCallback.
 type CallbackResult struct {
 	Outcome     CallbackOutcome
 	OneTimeCode string // non-empty for CallbackLogin and CallbackNewUser
+	RegToken    string // non-empty for CallbackNeedsRegistration
 }
 
 // HandleCallback is the unified callback handler for both login and bind flows.
@@ -284,41 +322,79 @@ func (s *OAuthService) resolveLoginIdentity(
 		}
 	}
 
-	// Case 3: no identity, no collision → create new PENDING_VERIFICATION user.
-	return s.createOAuthUser(ctx, provider, identity)
+	// Case 3: provider did not supply an email (e.g. LINE without email scope).
+	// Do NOT auto-create a placeholder account — redirect the frontend to collect a
+	// real email address via POST /v1/auth/oauth/register.
+	if identity.Email == "" {
+		return s.issueRegToken(ctx, provider, identity)
+	}
+
+	// Case 4: no identity, email present, no collision → create new PENDING_VERIFICATION user.
+	return s.createOAuthUser(ctx, provider, identity, "")
 }
 
-// createOAuthUser creates a new OAuth-only user and auth_identity row,
-// then issues a one-time code.
-//
-// No-email providers (LINE without email permission): a synthetic unique email of the
-// form "oauth+<providerSubject>@noemail.<provider>.invalid" is used so the NOT-NULL
-// UNIQUE(email) constraint is satisfied. This address is never used for communication
-// (it resolves to the RFC-2606 .invalid TLD) and EmailVerified is always false.
-func (s *OAuthService) createOAuthUser(
+// issueRegToken stores a short-lived registration-pending token in Redis and returns
+// a CallbackNeedsRegistration result. Called when the provider does not supply an email.
+func (s *OAuthService) issueRegToken(
 	ctx context.Context,
 	provider string,
 	identity *oauth.Identity,
 ) (*CallbackResult, error) {
+	regToken, err := randBase64URL32()
+	if err != nil {
+		return nil, fmt.Errorf("generate reg token: %w", err)
+	}
+
+	// Use providerSubject as the display name seed — the frontend can update it later.
+	// oauth.Identity has no separate DisplayName field.
+	displayName := identity.ProviderSubject
+
+	entry := oauthRegTokenEntry{
+		Provider:        provider,
+		ProviderSubject: identity.ProviderSubject,
+		DisplayName:     displayName,
+	}
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return nil, fmt.Errorf("marshal reg token entry: %w", err)
+	}
+
+	key := oauthRegTokenKeyPrefix + regToken
+
+	if err := s.redisClient.Set(ctx, key, data, oauthRegTokenTTL).Err(); err != nil {
+		return nil, fmt.Errorf("store reg token: %w", err)
+	}
+
+	return &CallbackResult{Outcome: CallbackNeedsRegistration, RegToken: regToken}, nil
+}
+
+// createOAuthUser creates a new OAuth-only user and auth_identity row for a provider
+// that DID supply an email address, then issues a one-time code.
+// INVARIANT: identity.Email MUST NOT be empty — callers MUST check before calling.
+// displayNameOverride, when non-empty, is used instead of the email as the display name
+// (used by the Register flow where the provider subject is a better initial name).
+func (s *OAuthService) createOAuthUser(
+	ctx context.Context,
+	provider string,
+	identity *oauth.Identity,
+	displayNameOverride string,
+) (*CallbackResult, error) {
 	now := time.Now().UTC()
 	userID := uuid.New()
 
-	// Determine the canonical email stored on the users row.
-	// When the provider supplies no email we synthesize a unique placeholder so the
-	// NOT NULL UNIQUE citext column is satisfied. The .invalid TLD (RFC 2606) prevents
-	// any accidental delivery.
-	var email string
-	var emailVerified bool
-	var displayName string
+	// identity.Email is guaranteed non-empty by the caller (resolveLoginIdentity case 4
+	// and Register). Enforce defensively.
+	if identity.Email == "" {
+		return nil, fmt.Errorf("createOAuthUser called with empty email for provider %s subject %s", provider, identity.ProviderSubject)
+	}
 
-	if identity.Email != "" {
-		email = strings.ToLower(strings.TrimSpace(identity.Email))
-		emailVerified = identity.EmailVerified
-		displayName = email
-	} else {
-		email = "oauth+" + identity.ProviderSubject + "@noemail." + provider + ".invalid"
-		emailVerified = false
-		displayName = identity.ProviderSubject
+	email := strings.ToLower(strings.TrimSpace(identity.Email))
+	emailVerified := identity.EmailVerified
+
+	displayName := email
+	if displayNameOverride != "" {
+		displayName = displayNameOverride
 	}
 
 	u := &domain.User{
@@ -339,18 +415,14 @@ func (s *OAuthService) createOAuthUser(
 		return nil, fmt.Errorf("create oauth user: %w", err)
 	}
 
-	var emailPtr *string
-	if identity.Email != "" {
-		v := identity.Email
-		emailPtr = &v
-	}
-
+	// email is non-empty (enforced above); store it as the linked identity email.
+	emailCopy := identity.Email
 	ai := &domain.AuthIdentity{
 		ID:              uuid.New(),
 		Provider:        provider,
 		ProviderSubject: identity.ProviderSubject,
 		UserID:          userID,
-		Email:           emailPtr,
+		Email:           &emailCopy,
 		LinkedAt:        now,
 	}
 
@@ -561,6 +633,136 @@ func (s *OAuthService) Unbind(ctx context.Context, authenticatedUserID uuid.UUID
 	}
 
 	return s.identities.DeleteByUserAndProvider(ctx, authenticatedUserID, provider)
+}
+
+// RegisterOutcome enumerates the possible outcomes of a Register call.
+type RegisterOutcome int
+
+const (
+	// RegisterNewUser means a new user was created and a one-time login code was issued.
+	RegisterNewUser RegisterOutcome = iota
+	// RegisterEmailCollision means the supplied email already belongs to a non-deleted
+	// user. Design A: NEVER auto-link. No user was created.
+	RegisterEmailCollision
+)
+
+// RegisterResult is returned by Register.
+type RegisterResult struct {
+	Outcome     RegisterOutcome
+	OneTimeCode string // non-empty for RegisterNewUser
+}
+
+// ErrOAuthRegTokenInvalid is returned by Register when the regToken is missing,
+// expired, or already consumed (single-use guard).
+var ErrOAuthRegTokenInvalid = errors.New("oauth registration token invalid or expired")
+
+// Register consumes a no-email registration token (issued by issueRegToken during a
+// no-email provider callback) and creates a new user with the caller-supplied email.
+//
+// Flow:
+//  1. GetDel regToken from Redis (single-use). Invalid/expired → ErrOAuthRegTokenInvalid.
+//  2. Validate + normalize email.
+//  3. Email collision check (Design A): existing non-deleted user → RegisterEmailCollision.
+//  4. Create PENDING_VERIFICATION user with real email + linked identity.
+//  5. Create email-verification token, dispatch verification email (detached goroutine).
+//  6. Issue a one-time login code → user is logged in as PENDING_VERIFICATION.
+func (s *OAuthService) Register(ctx context.Context, regToken, email string) (*RegisterResult, error) {
+	// 1. Consume the registration token (single-use).
+	key := oauthRegTokenKeyPrefix + regToken
+	data, err := s.redisClient.GetDel(ctx, key).Bytes()
+	if err != nil {
+		return nil, ErrOAuthRegTokenInvalid
+	}
+
+	var entry oauthRegTokenEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return nil, ErrOAuthRegTokenInvalid
+	}
+
+	// 2. Validate + normalize email.
+	normalized := strings.ToLower(strings.TrimSpace(email))
+	if normalized == "" {
+		return nil, domain.ErrValidation
+	}
+
+	// 3. Email collision check (Design A — NEVER auto-link).
+	_, emailErr := s.users.GetByEmail(ctx, normalized)
+	if emailErr == nil {
+		// User with this email exists.
+		return &RegisterResult{Outcome: RegisterEmailCollision}, nil
+	}
+
+	if !errors.Is(emailErr, domain.ErrNotFound) {
+		return nil, fmt.Errorf("check email collision: %w", emailErr)
+	}
+
+	// 4. Create new user + auth_identity.
+	// Use normalized email as identity.Email; pass the stored displayName override so
+	// the user row gets a meaningful name (provider subject) rather than just the email.
+	synthetic := &oauth.Identity{
+		ProviderSubject: entry.ProviderSubject,
+		Email:           normalized,
+		EmailVerified:   false, // email not yet verified — user must click the link
+	}
+
+	result, err := s.createOAuthUser(ctx, entry.Provider, synthetic, entry.DisplayName)
+	if err != nil {
+		return nil, err
+	}
+
+	// 5. Create verification token + dispatch email (detached, same pattern as AuthService).
+	if s.verifications != nil {
+		rawToken, tokenHash, vtErr := newVerificationToken()
+		if vtErr != nil {
+			return nil, fmt.Errorf("create verification token: %w", vtErr)
+		}
+
+		now := time.Now().UTC()
+		vt := &domain.EmailVerificationToken{
+			ID:        uuid.New(),
+			UserID:    uuid.Nil, // will be set after we can obtain the user ID
+			TokenHash: tokenHash,
+			ExpiresAt: now.Add(verificationTokenTTL),
+			CreatedAt: now,
+		}
+
+		// Obtain the just-created user ID via the store (needed for the token).
+		// createOAuthUser already called users.Create; we need the ID back.
+		// Since we pass identity.Email == normalized, GetByEmail will retrieve it.
+		createdUser, getUserErr := s.users.GetByEmail(ctx, normalized)
+		if getUserErr != nil {
+			return nil, fmt.Errorf("get created user: %w", getUserErr)
+		}
+
+		vt.UserID = createdUser.ID
+
+		if createErr := s.verifications.Create(ctx, vt); createErr != nil {
+			return nil, fmt.Errorf("persist verification token: %w", createErr)
+		}
+
+		//nolint:contextcheck // intentional detach: goroutine MUST NOT inherit the request ctx (canceled on handler return) — backend-security-design §5
+		s.dispatchVerificationEmail(normalized, rawToken)
+	}
+
+	return &RegisterResult{Outcome: RegisterNewUser, OneTimeCode: result.OneTimeCode}, nil
+}
+
+// dispatchVerificationEmail sends the verification email on a detached goroutine.
+// MUST NOT inherit request context (canceled when handler returns) — §5 backend-security-design.
+// Uses context.Background() explicitly so the send is not canceled when the request ends.
+func (s *OAuthService) dispatchVerificationEmail(email, rawToken string) {
+	if s.mailer == nil {
+		return
+	}
+
+	s.sendWG.Add(1)
+
+	go func() {
+		defer s.sendWG.Done()
+		if err := s.mailer.SendVerification(context.Background(), email, rawToken); err != nil {
+			slog.Warn("oauth register: verification email send failed", "email", email, "err", err)
+		}
+	}()
 }
 
 // IdentityItem is a single bound social identity returned by ListIdentities.

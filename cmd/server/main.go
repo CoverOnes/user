@@ -238,7 +238,7 @@ func run() error {
 	// guards on cfg.OAuth != nil).
 	authIdentityStore := postgres.NewAuthIdentityStore(pool)
 
-	oauthSvc, err := buildOAuthService(cfg, userStore, authIdentityStore, rtStore, redisClient, signer, accessTTL)
+	oauthSvc, err := buildOAuthService(cfg, userStore, authIdentityStore, rtStore, verificationStore, redisClient, signer, accessTTL, verificationMailer)
 	if err != nil {
 		return fmt.Errorf("init oauth service: %w", err)
 	}
@@ -292,6 +292,11 @@ func run() error {
 	// Drain any in-flight detached verification-email sends before exiting so a
 	// shutdown does not silently drop a send dispatched just before SIGTERM.
 	authSvc.WaitForPendingSends()
+
+	// Drain OAuth register verification emails (detached goroutines same pattern).
+	if oauthSvc != nil {
+		oauthSvc.WaitForPendingSends()
+	}
 
 	slog.Info("server stopped")
 
@@ -391,9 +396,11 @@ func buildOAuthService(
 	userStore store.UserStore,
 	authIdentityStore store.AuthIdentityStore,
 	rtStore store.RefreshTokenStore,
+	verificationStore store.EmailVerificationTokenStore,
 	redisClient *redis.Client,
 	signer *jwt.Signer,
 	accessTTL time.Duration,
+	verificationMailer service.Mailer,
 ) (*service.OAuthService, error) {
 	if cfg.OAuthGoogleClientID == "" && cfg.OAuthLINEChannelID == "" {
 		return nil, nil
@@ -419,6 +426,8 @@ func buildOAuthService(
 		UserStore:         userStore,
 		AuthIdentityStore: authIdentityStore,
 		RefreshTokenStore: rtStore,
+		VerificationStore: verificationStore,
+		Mailer:            verificationMailer,
 		Redis:             redisClient,
 		Signer:            signer,
 		AccessTTL:         accessTTL,

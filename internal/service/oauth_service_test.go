@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,6 +93,7 @@ func startOAuthTestRedis(t *testing.T) *redis.Client {
 }
 
 // newOAuthSvc builds a minimal OAuthService backed by fakes + real Redis.
+// verifications and mailer may be nil (no-email register flow not exercised).
 func newOAuthSvc(
 	t *testing.T,
 	users *fakeUserStore,
@@ -99,8 +101,14 @@ func newOAuthSvc(
 	rts *fakeRefreshTokenStore,
 	providers map[string]service.OAuthProvider,
 	rdb *redis.Client,
+	opts ...oauthSvcOpt,
 ) *service.OAuthService {
 	t.Helper()
+
+	cfg := &oauthSvcCfg{}
+	for _, o := range opts {
+		o(cfg)
+	}
 
 	signer, err := jwt.NewEphemeralSigner(10 * time.Minute)
 	require.NoError(t, err)
@@ -109,6 +117,8 @@ func newOAuthSvc(
 		UserStore:         users,
 		AuthIdentityStore: identities,
 		RefreshTokenStore: rts,
+		VerificationStore: cfg.verifications,
+		Mailer:            cfg.mailer,
 		Signer:            signer,
 		Redis:             rdb,
 		Providers:         providers,
@@ -116,6 +126,23 @@ func newOAuthSvc(
 		AccessTTL:         10 * time.Minute,
 		RefreshTTLHours:   24,
 	})
+}
+
+// oauthSvcCfg holds optional dependencies for newOAuthSvc.
+type oauthSvcCfg struct {
+	verifications *fakeVerificationStore
+	mailer        *spyMailer
+}
+
+// oauthSvcOpt is a functional option for newOAuthSvc.
+type oauthSvcOpt func(*oauthSvcCfg)
+
+// withVerifications injects a fake verification store + spy mailer.
+func withVerifications(vs *fakeVerificationStore, m *spyMailer) oauthSvcOpt {
+	return func(c *oauthSvcCfg) {
+		c.verifications = vs
+		c.mailer = m
+	}
 }
 
 // seedOAuthUser creates an active user (no password) in the fake store.
@@ -851,7 +878,8 @@ func TestOAuthService_NewUser_StatusPendingVerification(t *testing.T) {
 	users := newFakeUserStore()
 	identities := newFakeAuthIdentityStore()
 
-	svc := newOAuthSvc(t, users, identities, newFakeRefreshTokenStore(),
+	svc := newOAuthSvc(
+		t, users, identities, newFakeRefreshTokenStore(),
 		map[string]service.OAuthProvider{
 			provider: &fakeOAuthProvider{
 				fetchIdentity: &oauth.Identity{
@@ -875,66 +903,44 @@ func TestOAuthService_NewUser_StatusPendingVerification(t *testing.T) {
 	assert.Equal(t, domain.UserStatusPendingVerification, created.Status)
 }
 
-// --- TestOAuthService_LINENoEmail_TwoUsersDistinct ---
+// --- TestOAuthService_LINENoEmail_NeedsRegistration ---
 
-// TestOAuthService_LINENoEmail_TwoUsersDistinct proves that two LINE users without
-// email permission each create a distinct user record — no unique-email crash.
-func TestOAuthService_LINENoEmail_TwoUsersDistinct(t *testing.T) {
+// TestOAuthService_LINENoEmail_NeedsRegistration proves that a LINE callback without
+// email returns CallbackNeedsRegistration (no user created, reg token issued).
+// This is the core regression test for the "phantom account" bug.
+func TestOAuthService_LINENoEmail_NeedsRegistration(t *testing.T) {
+	rdb := startOAuthTestRedis(t)
 	const provider = "line"
 
 	users := newFakeUserStore()
 	identities := newFakeAuthIdentityStore()
 
-	makeSvc := func(sub string) (*service.OAuthService, string) {
-		rdb := startOAuthTestRedis(t)
-		svc := newOAuthSvc(t, users, identities, newFakeRefreshTokenStore(),
-			map[string]service.OAuthProvider{
-				provider: &fakeOAuthProvider{
-					fetchIdentity: &oauth.Identity{
-						ProviderSubject: sub,
-						Email:           "", // LINE user without email permission
-						EmailVerified:   false,
-					},
+	svc := newOAuthSvc(
+		t, users, identities, newFakeRefreshTokenStore(),
+		map[string]service.OAuthProvider{
+			provider: &fakeOAuthProvider{
+				fetchIdentity: &oauth.Identity{
+					ProviderSubject: "line_sub_noemail",
+					Email:           "", // LINE without email scope
+					EmailVerified:   false,
 				},
 			},
-			rdb,
-		)
+		},
+		rdb,
+	)
 
-		signedState := issueSignedStateForProvider(t, svc, provider)
+	signedState := issueSignedStateForProvider(t, svc, provider)
+	res, err := svc.HandleCallback(context.Background(), provider, "code", signedState)
+	require.NoError(t, err)
 
-		return svc, signedState
-	}
+	// MUST be NeedsRegistration — NOT NewUser, NOT Login.
+	assert.Equal(t, service.CallbackNeedsRegistration, res.Outcome)
+	assert.NotEmpty(t, res.RegToken, "regToken must be non-empty")
+	assert.Empty(t, res.OneTimeCode, "no login code must be issued before email is collected")
 
-	// First LINE user (no email).
-	svc1, state1 := makeSvc("line_sub_aaa")
-	res1, err := svc1.HandleCallback(context.Background(), provider, "code1", state1)
-	require.NoError(t, err, "first LINE no-email user must create successfully")
-	assert.Equal(t, service.CallbackNewUser, res1.Outcome)
-
-	// Second LINE user (no email, different subject) — must NOT crash with email collision.
-	svc2, state2 := makeSvc("line_sub_bbb")
-	res2, err := svc2.HandleCallback(context.Background(), provider, "code2", state2)
-	require.NoError(t, err, "second LINE no-email user must create successfully (no unique email crash)")
-	assert.Equal(t, service.CallbackNewUser, res2.Outcome)
-
-	// Both one-time codes must be distinct (separate users).
-	assert.NotEqual(t, res1.OneTimeCode, res2.OneTimeCode)
-
-	// Two distinct synthetic emails must be in the store.
-	email1 := "oauth+line_sub_aaa@noemail.line.invalid"
-	email2 := "oauth+line_sub_bbb@noemail.line.invalid"
-	assert.NotNil(t, users.byEmail[email1], "first synthetic email must be stored")
-	assert.NotNil(t, users.byEmail[email2], "second synthetic email must be stored")
-
-	// Both users must have PENDING_VERIFICATION status and no password.
-	u1 := users.byEmail[email1]
-	u2 := users.byEmail[email2]
-	assert.Equal(t, domain.UserStatusPendingVerification, u1.Status)
-	assert.Equal(t, domain.UserStatusPendingVerification, u2.Status)
-	assert.Nil(t, u1.PasswordHash)
-	assert.Nil(t, u2.PasswordHash)
-	assert.False(t, u1.EmailVerified)
-	assert.False(t, u2.EmailVerified)
+	// MUST NOT have auto-created any user.
+	assert.Empty(t, users.byID, "no user must be created without email")
+	assert.Empty(t, users.byEmail, "no user must be created without email")
 }
 
 // --- TestOAuthService_ListIdentities ---
@@ -1006,7 +1012,8 @@ func TestOAuthService_ListIdentities(t *testing.T) {
 
 			uid := tc.setup(users, identities)
 
-			svc := newOAuthSvc(t, users, identities, newFakeRefreshTokenStore(),
+			svc := newOAuthSvc(
+				t, users, identities, newFakeRefreshTokenStore(),
 				map[string]service.OAuthProvider{"google": &fakeOAuthProvider{}},
 				rdb,
 			)
@@ -1024,4 +1031,171 @@ func TestOAuthService_ListIdentities(t *testing.T) {
 			assert.Equal(t, tc.wantHasPassword, res.HasPassword)
 		})
 	}
+}
+
+// --- TestOAuthService_Register ---
+
+// TestOAuthService_Register covers the no-email registration endpoint.
+func TestOAuthService_Register(t *testing.T) {
+	const provider = "line"
+
+	tests := []struct {
+		name          string
+		email         string
+		setupUsers    func(users *fakeUserStore) // pre-populate colliding users
+		wantOutcome   service.RegisterOutcome
+		wantUserCount int // expected users.byID length after call
+		wantVerifSent int // expected verification emails dispatched
+		wantErr       error
+	}{
+		{
+			name:          "new email creates user + sends verification",
+			email:         "newline@example.com",
+			wantOutcome:   service.RegisterNewUser,
+			wantUserCount: 1,
+			wantVerifSent: 1,
+		},
+		{
+			name:  "colliding email returns email_exists (Design A — no auto-link)",
+			email: "existing@example.com",
+			setupUsers: func(users *fakeUserStore) {
+				now := time.Now().UTC()
+				u := &domain.User{
+					ID: uuid.New(), Email: "existing@example.com",
+					Status: domain.UserStatusActive, AccountType: domain.AccountTypePersonal,
+					CreatedAt: now, UpdatedAt: now,
+				}
+				users.byID[u.ID] = u
+				users.byEmail[u.Email] = u
+			},
+			wantOutcome:   service.RegisterEmailCollision,
+			wantUserCount: 1, // the pre-seeded user, no new one
+			wantVerifSent: 0,
+		},
+		{
+			name:    "expired regToken returns ErrOAuthRegTokenInvalid",
+			email:   "irrelevant@example.com",
+			wantErr: service.ErrOAuthRegTokenInvalid,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rdb := startOAuthTestRedis(t)
+			users := newFakeUserStore()
+			identities := newFakeAuthIdentityStore()
+			vs := newFakeVerificationStore()
+			mailer := &spyMailer{}
+
+			if tc.setupUsers != nil {
+				tc.setupUsers(users)
+			}
+
+			svc := newOAuthSvc(
+				t, users, identities, newFakeRefreshTokenStore(),
+				map[string]service.OAuthProvider{
+					provider: &fakeOAuthProvider{
+						fetchIdentity: &oauth.Identity{
+							ProviderSubject: "line_noemail_sub",
+							Email:           "",
+							EmailVerified:   false,
+						},
+					},
+				},
+				rdb,
+				withVerifications(vs, mailer),
+			)
+
+			// Obtain a valid regToken via the callback flow (if not testing invalid token).
+			var regToken string
+			if tc.wantErr == nil || !errors.Is(tc.wantErr, service.ErrOAuthRegTokenInvalid) {
+				signedState := issueSignedStateForProvider(t, svc, provider)
+				cbRes, cbErr := svc.HandleCallback(context.Background(), provider, "code", signedState)
+				require.NoError(t, cbErr)
+				require.Equal(t, service.CallbackNeedsRegistration, cbRes.Outcome)
+				regToken = cbRes.RegToken
+			} else {
+				// Use a bogus token to trigger the invalid token path.
+				regToken = "bogus-invalid-token-that-does-not-exist"
+			}
+
+			res, err := svc.Register(context.Background(), regToken, tc.email)
+
+			if tc.wantErr != nil {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, tc.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantOutcome, res.Outcome)
+
+			if tc.wantOutcome == service.RegisterNewUser {
+				assert.NotEmpty(t, res.OneTimeCode, "one-time code must be issued")
+				assert.Len(t, users.byID, tc.wantUserCount)
+
+				// Created user must be PENDING_VERIFICATION.
+				createdUser := users.byEmail[strings.ToLower(strings.TrimSpace(tc.email))]
+				require.NotNil(t, createdUser)
+				assert.Equal(t, domain.UserStatusPendingVerification, createdUser.Status)
+				assert.Nil(t, createdUser.PasswordHash)
+				assert.False(t, createdUser.EmailVerified)
+
+				// Verification email is sent async; wait for it.
+				svc.WaitForPendingSends()
+				assert.Equal(t, tc.wantVerifSent, mailer.sendCount())
+			}
+
+			if tc.wantOutcome == service.RegisterEmailCollision {
+				assert.Empty(t, res.OneTimeCode, "no code on collision")
+				assert.Len(t, users.byID, tc.wantUserCount)
+				svc.WaitForPendingSends()
+				assert.Equal(t, tc.wantVerifSent, mailer.sendCount())
+			}
+		})
+	}
+}
+
+// TestOAuthService_Register_RegTokenSingleUse verifies that a regToken cannot be
+// consumed twice (replay protection).
+func TestOAuthService_Register_RegTokenSingleUse(t *testing.T) {
+	rdb := startOAuthTestRedis(t)
+	const provider = "line"
+
+	users := newFakeUserStore()
+	identities := newFakeAuthIdentityStore()
+	vs := newFakeVerificationStore()
+	mailer := &spyMailer{}
+
+	svc := newOAuthSvc(
+		t, users, identities, newFakeRefreshTokenStore(),
+		map[string]service.OAuthProvider{
+			provider: &fakeOAuthProvider{
+				fetchIdentity: &oauth.Identity{
+					ProviderSubject: "replay_sub",
+					Email:           "",
+					EmailVerified:   false,
+				},
+			},
+		},
+		rdb,
+		withVerifications(vs, mailer),
+	)
+
+	// Issue a reg token via the callback.
+	signedState := issueSignedStateForProvider(t, svc, provider)
+	cbRes, err := svc.HandleCallback(context.Background(), provider, "code", signedState)
+	require.NoError(t, err)
+	require.Equal(t, service.CallbackNeedsRegistration, cbRes.Outcome)
+	regToken := cbRes.RegToken
+
+	// First use: should succeed.
+	res1, err := svc.Register(context.Background(), regToken, "replay@example.com")
+	require.NoError(t, err)
+	assert.Equal(t, service.RegisterNewUser, res1.Outcome)
+
+	// Second use of the SAME token: must be rejected (single-use guard).
+	_, err = svc.Register(context.Background(), regToken, "replay2@example.com")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, service.ErrOAuthRegTokenInvalid)
 }

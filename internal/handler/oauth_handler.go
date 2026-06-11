@@ -91,6 +91,10 @@ func (h *OAuthHandler) Callback(c *gin.Context) {
 		// Bind flow: redirect to frontend post-login URL with bind=success indicator.
 		// No one-time code is issued for bind — the user is already authenticated.
 		c.Redirect(http.StatusFound, h.frontendPostLoginURL+"?bind=success")
+	case service.CallbackNeedsRegistration:
+		// Provider did not supply an email (LINE without email scope). Redirect frontend
+		// to the email collection screen with a short-lived opaque registration token.
+		c.Redirect(http.StatusFound, h.frontendPostLoginURL+"?register="+url.QueryEscape(result.RegToken))
 	default:
 		// CallbackLogin and CallbackNewUser both carry a one-time code.
 		// Tokens NEVER go in the URL; only the short-lived opaque code does.
@@ -125,6 +129,58 @@ func (h *OAuthHandler) Exchange(c *gin.Context) {
 		"refreshToken": pair.RefreshToken,
 		"expiresIn":    pair.ExpiresIn,
 	})
+}
+
+// registerRequest is the POST /v1/auth/oauth/register request body.
+type registerRequest struct {
+	RegToken string `json:"regToken" binding:"required"`
+	Email    string `json:"email"    binding:"required"`
+}
+
+// Register handles POST /v1/auth/oauth/register.
+// It completes the no-email provider registration flow by collecting the user's real
+// email, creating a PENDING_VERIFICATION account, and issuing a one-time login code.
+//
+// Response shapes:
+//
+//	201 {"outcome":"new_user","code":"<oneTimeCode>"}
+//	200 {"outcome":"email_exists"}           — Design A: no user created, no login
+//	400 {"code":"VALIDATION_ERROR",...}      — missing/malformed fields
+//	400 {"code":"OAUTH_REG_TOKEN_INVALID",...} — token expired or already used
+func (h *OAuthHandler) Register(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxOAuthBodyBytes)
+
+	var req registerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	result, err := h.svc.Register(c.Request.Context(), req.RegToken, req.Email)
+	if err != nil {
+		if errors.Is(err, service.ErrOAuthRegTokenInvalid) {
+			httpx.ErrCode(c, http.StatusBadRequest, "OAUTH_REG_TOKEN_INVALID", err.Error())
+			return
+		}
+
+		httpx.Err(c, err)
+
+		return
+	}
+
+	switch result.Outcome {
+	case service.RegisterEmailCollision:
+		// Design A: return outcome, do NOT create or log in. Frontend shows
+		// "this email is already registered — try logging in instead".
+		httpx.OK(c, gin.H{"outcome": "email_exists"})
+	default:
+		// RegisterNewUser: user is created + logged in as PENDING_VERIFICATION.
+		// Frontend exchanges the code immediately (POST /v1/auth/oauth/exchange).
+		c.JSON(http.StatusCreated, gin.H{
+			"outcome": "new_user",
+			"code":    result.OneTimeCode,
+		})
+	}
 }
 
 // ListIdentities handles GET /v1/me/identities (authenticated).
