@@ -12,7 +12,7 @@ import (
 type User struct {
 	ID           uuid.UUID  `json:"id"`
 	Email        string     `json:"email"`
-	PasswordHash string     `json:"-"`
+	PasswordHash *string    `json:"-"` // NULL for OAuth-only accounts (migration 000007)
 	DisplayName  string     `json:"displayName"`
 	AvatarURL    *string    `json:"avatarUrl"`
 	AccountType  string     `json:"accountType"`
@@ -74,6 +74,30 @@ var ValidUserStatuses = map[string]bool{
 	UserStatusActive:              true,
 	UserStatusSuspended:           true,
 	UserStatusPendingVerification: true,
+}
+
+// AuthIdentity represents a linked OAuth provider account for a user.
+// One user may have at most one identity per provider,
+// enforced by UNIQUE(provider, provider_subject) in the DB.
+type AuthIdentity struct {
+	ID              uuid.UUID `json:"id"`
+	Provider        string    `json:"provider"`
+	ProviderSubject string    `json:"-"` // provider-side subject — never exposed to clients
+	UserID          uuid.UUID `json:"userId"`
+	Email           *string   `json:"email,omitempty"`
+	LinkedAt        time.Time `json:"linkedAt"`
+}
+
+// OAuthProvider constants.
+const (
+	OAuthProviderGoogle = "google"
+	OAuthProviderLINE   = "line"
+)
+
+// ValidOAuthProviders is the allowlist for OAuth providers.
+var ValidOAuthProviders = map[string]bool{
+	OAuthProviderGoogle: true,
+	OAuthProviderLINE:   true,
 }
 
 // RefreshToken represents a stored refresh token record.

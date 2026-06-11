@@ -406,6 +406,98 @@ func (m *spyMailer) SendVerification(_ context.Context, to, token string) error 
 
 func (m *spyMailer) sendCount() int { return len(m.sentTo) }
 
+// --- fakeAuthIdentityStore ---
+
+// fakeAuthIdentityStore is an in-memory AuthIdentityStore for OAuthService unit tests.
+type fakeAuthIdentityStore struct {
+	// keyed by "provider:subject"
+	byProviderSubject map[string]*domain.AuthIdentity
+	// keyed by userID string
+	byUserID map[string][]*domain.AuthIdentity
+
+	createErr error
+	getErr    error
+	listErr   error
+	deleteErr error
+}
+
+func newFakeAuthIdentityStore() *fakeAuthIdentityStore {
+	return &fakeAuthIdentityStore{
+		byProviderSubject: make(map[string]*domain.AuthIdentity),
+		byUserID:          make(map[string][]*domain.AuthIdentity),
+	}
+}
+
+func (f *fakeAuthIdentityStore) GetByProvider(_ context.Context, provider, providerSubject string) (*domain.AuthIdentity, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+
+	key := provider + ":" + providerSubject
+	ai, ok := f.byProviderSubject[key]
+
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+
+	return ai, nil
+}
+
+func (f *fakeAuthIdentityStore) Create(_ context.Context, ai *domain.AuthIdentity) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
+
+	key := ai.Provider + ":" + ai.ProviderSubject
+	if _, exists := f.byProviderSubject[key]; exists {
+		return domain.ErrIdentityAlreadyBound
+	}
+
+	cp := *ai
+	f.byProviderSubject[key] = &cp
+	uid := ai.UserID.String()
+	f.byUserID[uid] = append(f.byUserID[uid], &cp)
+
+	return nil
+}
+
+func (f *fakeAuthIdentityStore) ListByUserID(_ context.Context, userID uuid.UUID) ([]*domain.AuthIdentity, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+
+	return f.byUserID[userID.String()], nil
+}
+
+func (f *fakeAuthIdentityStore) DeleteByUserAndProvider(_ context.Context, userID uuid.UUID, provider string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+
+	uid := userID.String()
+	list := f.byUserID[uid]
+	newList := list[:0]
+
+	found := false
+
+	for _, ai := range list {
+		if ai.Provider == provider {
+			found = true
+			delete(f.byProviderSubject, ai.Provider+":"+ai.ProviderSubject)
+		} else {
+			newList = append(newList, ai)
+		}
+	}
+
+	if !found {
+		return domain.ErrNotFound
+	}
+
+	f.byUserID[uid] = newList
+
+	return nil
+}
+
 // --- noopEncryptor ---
 
 // noopEncryptor is a deterministic in-memory Encryptor for service tests: it

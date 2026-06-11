@@ -77,6 +77,14 @@ var fixedErrorMappings = []errMapping{
 	{domain.ErrInvalidTOTPCode, "INVALID_TOTP_CODE", http.StatusBadRequest, "invalid totp code"},
 	{domain.ErrMFANotEnrolled, "MFA_NOT_ENROLLED", http.StatusConflict, "mfa is not enrolled"},
 	{domain.ErrMFAAlreadyEnabled, "MFA_ALREADY_ENABLED", http.StatusConflict, "mfa is already enabled"},
+	// OAuth social login (Increment 4).
+	{domain.ErrOAuthStateInvalid, "OAUTH_STATE_INVALID", http.StatusBadRequest, "oauth state invalid or expired"},
+	{domain.ErrOAuthExchangeFailed, "OAUTH_EXCHANGE_FAILED", http.StatusBadGateway, "oauth token exchange failed"},
+	{domain.ErrOAuthProviderUnknown, "OAUTH_PROVIDER_UNKNOWN", http.StatusNotFound, "unknown oauth provider"},
+	{domain.ErrOAuthOneTimeCodeInvalid, "OAUTH_CODE_INVALID", http.StatusBadRequest, "oauth one-time code invalid or expired"},
+	{domain.ErrEmailAlreadyRegistered, "EMAIL_ALREADY_REGISTERED", http.StatusConflict, "email already registered by another account"},
+	{domain.ErrIdentityAlreadyBound, "IDENTITY_ALREADY_BOUND", http.StatusConflict, "oauth identity already bound to an account"},
+	{domain.ErrLastLoginMethod, "LAST_LOGIN_METHOD", http.StatusConflict, "cannot remove last login method"},
 }
 
 // passthroughValidationErrors are validation sentinels whose own Error() text is

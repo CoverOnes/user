@@ -34,7 +34,7 @@ func TestUserStore_UpdateKYCTier_Integration(t *testing.T) {
 		u := &domain.User{
 			ID:           uuid.New(),
 			Email:        "kyc-tier-update@example.test",
-			PasswordHash: testPasswordHash,
+			PasswordHash: testPH(),
 			DisplayName:  "KYC Test",
 			AccountType:  "PERSONAL",
 			KYCTier:      0,
@@ -63,7 +63,7 @@ func TestUserStore_UpdateKYCTier_Integration(t *testing.T) {
 		u := &domain.User{
 			ID:           uuid.New(),
 			Email:        "kyc-multi@example.test",
-			PasswordHash: testPasswordHash,
+			PasswordHash: testPH(),
 			DisplayName:  "Multi",
 			AccountType:  "PERSONAL",
 			KYCTier:      0,
@@ -105,7 +105,7 @@ func TestUserStore_BumpTokenVersion_Integration(t *testing.T) {
 		u := &domain.User{
 			ID:           uuid.New(),
 			Email:        "bump-version@example.test",
-			PasswordHash: testPasswordHash,
+			PasswordHash: testPH(),
 			DisplayName:  "Bump",
 			AccountType:  "PERSONAL",
 			KYCTier:      0,

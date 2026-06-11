@@ -65,13 +65,13 @@ func TestRevokeAll_HappyPath(t *testing.T) {
 	// sessionTestPasswordHash is a structurally-valid but inert argon2id hash for test fixtures.
 	// Not a real credential — the value is intentionally synthetic and cannot be used to authenticate.
 	//nolint:gosec // G101: test fixture, not a real credential
-	const sessionTestPasswordHash = "$argon2id$v=19$m=65536,t=3,p=2$xtest$xtest"
+	sessionTestPasswordHash := "$argon2id$v=19$m=65536,t=3,p=2$xtest$xtest"
 
 	now := time.Now().UTC()
 	u := &domain.User{
 		ID:           uuid.New(),
 		Email:        "revoke@example.com",
-		PasswordHash: sessionTestPasswordHash,
+		PasswordHash: &sessionTestPasswordHash,
 		DisplayName:  "Revoke User",
 		AccountType:  "PERSONAL",
 		KYCTier:      0,

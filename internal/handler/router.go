@@ -19,6 +19,7 @@ type RouterConfig struct {
 	Auth    *service.AuthService
 	Profile *service.ProfileService
 	MFA     *service.MFAService
+	OAuth   *service.OAuthService // may be nil when OAuth is not configured
 	Signer  *jwt.Signer
 	Pool    *pgxpool.Pool
 	Redis   *redis.Client // may be nil in dev
@@ -36,6 +37,10 @@ type RouterConfig struct {
 	// UserRateLimitBurst is the maximum burst size for the per-user /v1/me limiter.
 	// Source: config.UserRateLimitBurst (USER_USER_RATE_LIMIT_BURST).
 	UserRateLimitBurst int
+
+	// OAuthFrontendPostLoginURL is passed to OAuthHandler for callback redirects.
+	// Required when OAuth != nil.
+	OAuthFrontendPostLoginURL string
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -80,6 +85,22 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// Logout requires access token.
 	authGroup.POST("/logout", middleware.Auth(cfg.Signer), authH.Logout)
 
+	// OAuth social login routes (Increment 4).
+	// GET /v1/auth/oauth/:provider/start — public, returns authorization URL.
+	// GET /v1/auth/oauth/:provider/callback — public, browser redirect target.
+	// POST /v1/auth/oauth/exchange — public, consumes one-time code → token pair.
+	// Only registered when the OAuthService is wired (non-nil).
+	if cfg.OAuth != nil {
+		oauthH := NewOAuthHandler(cfg.OAuth, cfg.OAuthFrontendPostLoginURL)
+		// Start + callback share authRL (they're in the public auth surface).
+		authGroup.GET("/oauth/:provider/start", oauthH.Start)
+		authGroup.GET("/oauth/:provider/callback", oauthH.Callback)
+		// Exchange is intentionally outside the authGroup rate limiter because
+		// the one-time code is single-use and short-lived — it is already the
+		// rate-limiting artifact. The IP-level ipRL still applies.
+		r.POST("/v1/auth/oauth/exchange", middleware.NoCache(), oauthH.Exchange)
+	}
+
 	// Protected routes — require valid access token, Tier >= 0.
 	//
 	// /v1/auth vs /v1/me identity-source split (security note):
@@ -115,6 +136,16 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// Session management.
 	sessH := NewSessionHandler(cfg.Auth)
 	me.POST("/sessions/revoke-all", sessH.RevokeAll)
+
+	// OAuth identity bind/unbind (Increment 4) — protected, same Auth chain as /v1/me.
+	// POST  /v1/me/identities/:provider — start bind flow (returns authorize URL).
+	// DELETE /v1/me/identities/:provider — unbind (guarded: last-method check).
+	if cfg.OAuth != nil {
+		oauthH := NewOAuthHandler(cfg.OAuth, cfg.OAuthFrontendPostLoginURL)
+		identities := me.Group("/identities")
+		identities.POST("/:provider", oauthH.BindStart)
+		identities.DELETE("/:provider", oauthH.Unbind)
+	}
 
 	// TOTP 2FA primitives (Increment 3). Protected by the same Auth middleware as
 	// the rest of /v1/me. NOT wired into login this wave — enroll/confirm/verify/

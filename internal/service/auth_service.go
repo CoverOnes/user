@@ -230,7 +230,7 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 	u := &domain.User{
 		ID:            userID,
 		Email:         strings.ToLower(strings.TrimSpace(in.Email)),
-		PasswordHash:  hash,
+		PasswordHash:  &hash,
 		DisplayName:   in.DisplayName,
 		AccountType:   in.AccountType,
 		KYCTier:       0,
@@ -469,7 +469,14 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*TokenPair, err
 	// INVALID_CREDENTIALS as for a wrong password / unknown email, so they cannot probe
 	// which accounts exist and are suspended. Only a caller who proves knowledge of the
 	// correct password is told the account is suspended (legitimate-user UX preserved).
-	ok, err := password.Verify(in.Password, u.PasswordHash)
+	//
+	// OAuth-only accounts have password_hash = NULL (migration 000007). If the client
+	// presents a password for such an account, reject it — they must use OAuth login.
+	if u.PasswordHash == nil {
+		return nil, domain.ErrInvalidCredentials
+	}
+
+	ok, err := password.Verify(in.Password, *u.PasswordHash)
 	if err != nil || !ok {
 		return nil, domain.ErrInvalidCredentials
 	}

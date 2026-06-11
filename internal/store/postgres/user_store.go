@@ -297,6 +297,7 @@ func (s *UserStore) SetMFABackupCodes(ctx context.Context, id uuid.UUID, backupC
 
 func scanUser(row pgx.Row) (*domain.User, error) {
 	var u domain.User
+	// password_hash is nullable since migration 000007 (OAuth-only accounts).
 	err := row.Scan(
 		&u.ID, &u.Email, &u.PasswordHash, &u.DisplayName, &u.AvatarURL,
 		&u.AccountType, &u.KYCTier, &u.CompanyID, &u.Status, &u.EmailVerified,

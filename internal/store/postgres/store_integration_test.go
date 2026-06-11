@@ -24,6 +24,10 @@ import (
 // It is not a real credential — the value is a structurally-valid but inert hash for schema compatibility only.
 const testPasswordHash = "$argon2id$v=19$m=65536,t=3,p=2$abc$def" //nolint:gosec // G101: test fixture, not a real credential
 
+// testPH is a *string pointing at testPasswordHash for use in domain.User struct literals
+// where PasswordHash is nullable since migration 000007.
+func testPH() *string { s := testPasswordHash; return &s }
+
 // startTestDB spins up a real Postgres container via testcontainers.
 func startTestDB(t *testing.T) string {
 	t.Helper()
@@ -111,7 +115,7 @@ func TestUserStore_Integration(t *testing.T) {
 		u := &domain.User{
 			ID:           uuid.New(),
 			Email:        "alice@integration.test",
-			PasswordHash: testPasswordHash,
+			PasswordHash: testPH(),
 			DisplayName:  "Alice",
 			AccountType:  "PERSONAL",
 			KYCTier:      0,
@@ -135,7 +139,7 @@ func TestUserStore_Integration(t *testing.T) {
 		u := &domain.User{
 			ID:           uuid.New(),
 			Email:        "bob@integration.test",
-			PasswordHash: testPasswordHash,
+			PasswordHash: testPH(),
 			DisplayName:  "Bob",
 			AccountType:  "PERSONAL",
 			KYCTier:      0,
@@ -156,7 +160,7 @@ func TestUserStore_Integration(t *testing.T) {
 		u := &domain.User{
 			ID:           uuid.New(),
 			Email:        "carol@integration.test",
-			PasswordHash: testPasswordHash,
+			PasswordHash: testPH(),
 			DisplayName:  "Carol",
 			AccountType:  "PERSONAL",
 			KYCTier:      0,
@@ -178,7 +182,7 @@ func TestUserStore_Integration(t *testing.T) {
 		u := &domain.User{
 			ID:           uuid.New(),
 			Email:        "dup@integration.test",
-			PasswordHash: testPasswordHash,
+			PasswordHash: testPH(),
 			DisplayName:  "Dup",
 			AccountType:  "PERSONAL",
 			KYCTier:      0,
@@ -205,7 +209,7 @@ func TestUserStore_Integration(t *testing.T) {
 		u := &domain.User{
 			ID:           uuid.New(),
 			Email:        "dave@integration.test",
-			PasswordHash: testPasswordHash,
+			PasswordHash: testPH(),
 			DisplayName:  "Dave",
 			AccountType:  "PERSONAL",
 			KYCTier:      0,
@@ -569,7 +573,7 @@ func TestUserStore_UpdateKYCTier_Monotonic_Integration(t *testing.T) {
 	u := &domain.User{
 		ID:           uuid.New(),
 		Email:        "kyc-monotonic@integration.test",
-		PasswordHash: testPasswordHash,
+		PasswordHash: testPH(),
 		DisplayName:  "Mono",
 		AccountType:  "PERSONAL",
 		KYCTier:      0,

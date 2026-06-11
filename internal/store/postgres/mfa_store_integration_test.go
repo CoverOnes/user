@@ -22,7 +22,7 @@ func seedActiveUser(t *testing.T, ctx context.Context, us *postgres.UserStore, e
 	u := &domain.User{
 		ID:           uuid.New(),
 		Email:        email,
-		PasswordHash: testPasswordHash,
+		PasswordHash: testPH(),
 		DisplayName:  "MFA User",
 		AccountType:  "PERSONAL",
 		KYCTier:      0,

@@ -29,6 +29,10 @@ import (
 // testPasswordHash is a structurally-valid but inert argon2id hash for test fixtures.
 const testPasswordHash = "$argon2id$v=19$m=65536,t=3,p=2$abc$def" //nolint:gosec // G101: test fixture, not a real credential
 
+// testPH returns a *string pointing at testPasswordHash for domain.User.PasswordHash
+// which is nullable since migration 000007 (OAuth-only accounts).
+func testPH() *string { s := testPasswordHash; return &s }
+
 // testHMACSecret is the shared event-authentication secret used across consumer tests.
 const testHMACSecret = "this-is-a-32-byte-test-secret-xx" //nolint:gosec // G101: test fixture, not a real credential
 
@@ -216,7 +220,7 @@ func TestConsumer_KYCTierChanged(t *testing.T) {
 	u := &domain.User{
 		ID:           uuid.New(),
 		Email:        "kyc-consumer@example.test",
-		PasswordHash: testPasswordHash,
+		PasswordHash: testPH(),
 		DisplayName:  "KYC User",
 		AccountType:  "PERSONAL",
 		KYCTier:      0,
@@ -259,7 +263,7 @@ func seedTestUser(t *testing.T, ctx context.Context, userStore *postgres.UserSto
 	u := &domain.User{
 		ID:           uuid.New(),
 		Email:        email,
-		PasswordHash: testPasswordHash,
+		PasswordHash: testPH(),
 		DisplayName:  "KYC User",
 		AccountType:  "PERSONAL",
 		KYCTier:      0,
