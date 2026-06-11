@@ -147,7 +147,7 @@ type registerRequest struct {
 // Response shapes:
 //
 //	201 {"outcome":"new_user","code":"<oneTimeCode>"}
-//	200 {"outcome":"email_exists"}           — Design A: no user created, no login
+//	409 {"code":"EMAIL_EXISTS"}              — Design A: no user created, no login
 //	400 {"code":"VALIDATION_ERROR",...}      — missing/malformed fields
 //	400 {"code":"OAUTH_REG_TOKEN_INVALID",...} — token expired or already used
 func (h *OAuthHandler) Register(c *gin.Context) {
@@ -173,9 +173,10 @@ func (h *OAuthHandler) Register(c *gin.Context) {
 
 	switch result.Outcome {
 	case service.RegisterEmailCollision:
-		// Design A: return outcome, do NOT create or log in. Frontend shows
-		// "this email is already registered — try logging in instead".
-		httpx.OK(c, gin.H{"outcome": "email_exists"})
+		// Design A: do NOT create or log in. 409 EMAIL_EXISTS — the frontend surfaces
+		// "this email is already registered; log in with your password then bind the
+		// provider in Settings".
+		httpx.ErrCode(c, http.StatusConflict, "EMAIL_EXISTS", "this email is already registered; log in with your password then bind the provider in Settings")
 	default:
 		// RegisterNewUser: user is created + logged in as PENDING_VERIFICATION.
 		// Frontend exchanges the code immediately (POST /v1/auth/oauth/exchange).
