@@ -835,6 +835,32 @@ func TestLoad_DevConstantDenylist(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "prod: trailing-space dev-constant EVENT_HMAC_SECRET rejected (whitespace bypass)",
+			env:  envProduction,
+			envOverride: map[string]string{
+				// Trailing space: without TrimSpace, len(devEventHMAC+" ") ≥ 32 passes the
+				// length check AND devEventHMAC+" " != devEventHMAC bypasses the denylist →
+				// the padded value would be accepted as a real secret. TrimSpace must
+				// normalise it before both checks so the denylist fires correctly.
+				"EVENT_HMAC_SECRET": devEventHMAC + " ",
+			},
+			wantErr:     true,
+			errContains: "must not be a known development-default value",
+		},
+		{
+			name: "prod: trailing-space dev-constant USER_PII_ENCRYPTION_KEY rejected (whitespace bypass)",
+			env:  envProduction,
+			envOverride: map[string]string{
+				// Trailing space: without TrimSpace, devPIIKey+" " still decodes correctly
+				// (base64 decoder ignores trailing whitespace in some impls) but more
+				// importantly devPIIKey+" " != devPIIKey bypasses the denylist check.
+				// TrimSpace must normalise it so the denylist fires on the clean value.
+				"USER_PII_ENCRYPTION_KEY": devPIIKey + " ",
+			},
+			wantErr:     true,
+			errContains: "must not be a known development-default value",
+		},
 	}
 
 	for _, tc := range tests {

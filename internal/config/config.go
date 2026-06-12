@@ -403,14 +403,19 @@ func (c *Config) validateEventHMAC() []string {
 		return nil
 	}
 
+	// TrimSpace before all checks: os.Getenv does not strip surrounding
+	// whitespace, so a value like "secret " (trailing space) would pass len≥32
+	// AND bypass the denylist equality check if not normalised first.
+	secret := strings.TrimSpace(c.EventHMACSecret)
+
 	var errs []string
 
 	switch {
-	case c.EventHMACSecret == "":
+	case secret == "":
 		errs = append(errs, "EVENT_HMAC_SECRET is required outside development")
-	case len(c.EventHMACSecret) < minEventHMACSecretLen:
+	case len(secret) < minEventHMACSecretLen:
 		errs = append(errs, "EVENT_HMAC_SECRET must be at least 32 characters")
-	case c.EventHMACSecret == devEventHMACSecret:
+	case secret == devEventHMACSecret:
 		errs = append(errs, "EVENT_HMAC_SECRET must not be a known development-default value")
 	}
 
@@ -484,7 +489,11 @@ func (c *Config) validatePIIAndSMTP() []string {
 
 // validatePIIKey checks the AES-256 PII encryption key.
 func (c *Config) validatePIIKey() []string {
-	if c.PIIEncryptionKey == "" {
+	// TrimSpace before all checks: os.Getenv does not strip surrounding whitespace,
+	// so a value with a trailing space would bypass the denylist equality check.
+	key := strings.TrimSpace(c.PIIEncryptionKey)
+
+	if key == "" {
 		return []string{
 			"USER_PII_ENCRYPTION_KEY is required when USER_ENV != development " +
 				"(and a documented dev-default key is required in development): " +
@@ -496,14 +505,14 @@ func (c *Config) validatePIIKey() []string {
 	if !c.IsDev() {
 		// Non-dev: the key MUST decode to exactly 32 bytes (AES-256). In dev we skip
 		// the strict length check so a short documented dev key still boots.
-		key, decErr := base64.StdEncoding.DecodeString(c.PIIEncryptionKey)
-		if decErr != nil || len(key) != piiKeyBytes {
+		decoded, decErr := base64.StdEncoding.DecodeString(key)
+		if decErr != nil || len(decoded) != piiKeyBytes {
 			return []string{fmt.Sprintf("USER_PII_ENCRYPTION_KEY must be base64 that decodes to exactly %d bytes", piiKeyBytes)}
 		}
 
 		// Reject the publicly-known dev-default value so a prod deploy that forgets
 		// to set the key never silently encrypts PII with a compromised key.
-		if c.PIIEncryptionKey == devPIIEncryptionKey {
+		if key == devPIIEncryptionKey {
 			return []string{"USER_PII_ENCRYPTION_KEY must not be a known development-default value"}
 		}
 	}
