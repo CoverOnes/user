@@ -121,7 +121,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// the JWT auth middleware trusts any request on this protected group. When the
 	// secret is empty (dev) this is a no-op passthrough, matching the gateway's
 	// dev signing-skip.
-	me.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
+	me.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret, cfg.Redis))
 	me.Use(authMW)
 	// Per-authenticated-user token-bucket limiter — mounted AFTER VerifyGatewaySignature
 	// + Auth so the JWT subject (the limiter key) is always a gateway-verified identity,
