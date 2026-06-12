@@ -28,7 +28,7 @@ func TestLoad_HappyPath(t *testing.T) {
 		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
 		"USER_PORT", "9090",
 		"USER_LOG_LEVEL", "DEBUG",
-		"USER_ENV", "development",
+		"USER_ENV", envDevelopment,
 		"USER_ACCESS_TOKEN_TTL_SEC", "600",
 		"USER_REFRESH_TOKEN_TTL_HOURS", "24",
 	)
@@ -47,7 +47,7 @@ func TestLoad_MissingPostgresDSN(t *testing.T) {
 		t,
 		"USER_PORT", "8080",
 		"USER_LOG_LEVEL", "INFO",
-		"USER_ENV", "development",
+		"USER_ENV", envDevelopment,
 	)
 
 	_, err := config.Load()
@@ -194,7 +194,7 @@ func TestLoad_EventHMACSecret_DevOptional(t *testing.T) {
 		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
 		"USER_PORT", "8080",
 		"USER_LOG_LEVEL", "INFO",
-		"USER_ENV", "development",
+		"USER_ENV", envDevelopment,
 		// Shared, un-prefixed name; empty value exercises the dev-optional path
 		// while t.Setenv guarantees restoration after the test.
 		"EVENT_HMAC_SECRET", "",
@@ -208,6 +208,13 @@ func TestLoad_EventHMACSecret_DevOptional(t *testing.T) {
 // validPIIKeyB64 decodes to exactly 32 bytes (AES-256) — used by production-env
 // config tests so they exercise the field under test, not the PII guard.
 const validPIIKeyB64 = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
+// envProduction and envDevelopment are the canonical env string values used across
+// config tests. Declared as constants to satisfy the goconst linter and avoid drift.
+const (
+	envProduction  = "production"
+	envDevelopment = "development"
+)
 
 // setProdSecrets sets the PII key + SMTP host that every production-env load now
 // requires, so a test can isolate the specific field it asserts on.
@@ -225,7 +232,7 @@ func TestLoad_EventHMACSecret_ProdRequired(t *testing.T) {
 		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
 		"USER_PORT", "8080",
 		"USER_LOG_LEVEL", "INFO",
-		"USER_ENV", "production",
+		"USER_ENV", envProduction,
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "",
 		"USER_GATEWAY_HMAC_SECRET", testGatewayHMACSecret,
@@ -243,7 +250,7 @@ func TestLoad_EventHMACSecret_ProdTooShort(t *testing.T) {
 		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
 		"USER_PORT", "8080",
 		"USER_LOG_LEVEL", "INFO",
-		"USER_ENV", "production",
+		"USER_ENV", envProduction,
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "too-short",
 		"USER_GATEWAY_HMAC_SECRET", testGatewayHMACSecret,
@@ -261,7 +268,7 @@ func TestLoad_EventHMACSecret_ProdValid(t *testing.T) {
 		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
 		"USER_PORT", "8080",
 		"USER_LOG_LEVEL", "INFO",
-		"USER_ENV", "production",
+		"USER_ENV", envProduction,
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
 		"USER_GATEWAY_HMAC_SECRET", testGatewayHMACSecret,
@@ -287,7 +294,7 @@ func setBaseProdEnv(t *testing.T) {
 		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
 		"USER_PORT", "8080",
 		"USER_LOG_LEVEL", "INFO",
-		"USER_ENV", "production",
+		"USER_ENV", envProduction,
 		"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
 		"EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
 		"USER_GATEWAY_HMAC_SECRET", testGatewayHMACSecret,
@@ -300,7 +307,7 @@ func TestLoad_PIIKey_DevRequiresKey(t *testing.T) {
 	setEnv(
 		t,
 		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
-		"USER_ENV", "development",
+		"USER_ENV", envDevelopment,
 		"USER_PII_ENCRYPTION_KEY", "",
 	)
 
@@ -313,7 +320,7 @@ func TestLoad_PIIKey_DevShortKeyAccepted(t *testing.T) {
 	setEnv(
 		t,
 		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
-		"USER_ENV", "development",
+		"USER_ENV", envDevelopment,
 		"USER_PII_ENCRYPTION_KEY", "dev-default-not-32-bytes",
 	)
 
@@ -382,7 +389,7 @@ func TestLoad_AppBaseURL_RequiredWhenSMTPConfigured(t *testing.T) {
 	setEnv(
 		t,
 		"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
-		"USER_ENV", "development",
+		"USER_ENV", envDevelopment,
 		"USER_SMTP_HOST", "localhost",
 		"USER_APP_BASE_URL", "",
 	)
@@ -540,14 +547,14 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 		{
 			// §24.1: dev may omit the secret (verification disabled).
 			name:    "dev with empty secret is allowed",
-			env:     "development",
+			env:     envDevelopment,
 			secret:  "",
 			wantErr: false,
 		},
 		{
 			// §24.1: non-dev MUST have a ≥32-char secret — boot fails fast.
 			name:      "production without gateway secret fails (fail-closed)",
-			env:       "production",
+			env:       envProduction,
 			secret:    "",
 			wantErr:   true,
 			errSubstr: "USER_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev",
@@ -555,27 +562,27 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 		{
 			// Even in dev a too-short secret is an error (catches typos).
 			name:      "dev with too-short secret is rejected",
-			env:       "development",
+			env:       envDevelopment,
 			secret:    "tooshort",
 			wantErr:   true,
 			errSubstr: "USER_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters",
 		},
 		{
 			name:      "production with too-short secret is rejected",
-			env:       "production",
+			env:       envProduction,
 			secret:    "tooshort",
 			wantErr:   true,
 			errSubstr: "USER_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev",
 		},
 		{
 			name:    "production with valid 32-char secret passes",
-			env:     "production",
+			env:     envProduction,
 			secret:  testGatewayHMACSecret,
 			wantErr: false,
 		},
 		{
 			name:    "dev with valid 32-char secret passes",
-			env:     "development",
+			env:     envDevelopment,
 			secret:  testGatewayHMACSecret,
 			wantErr: false,
 		},
@@ -585,7 +592,7 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Non-dev tests need all production secrets set (PII key + SMTP + event HMAC);
 			// the gateway HMAC field under test is set explicitly after.
-			if tc.env == "production" {
+			if tc.env == envProduction {
 				setEnv(
 					t,
 					"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
@@ -683,7 +690,7 @@ func TestLoad_ValidateUserRateLimit(t *testing.T) {
 				"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
 				"USER_PORT", "8080",
 				"USER_LOG_LEVEL", "INFO",
-				"USER_ENV", "development",
+				"USER_ENV", envDevelopment,
 				"USER_USER_RATE_LIMIT_PER_MIN", tc.perMin,
 				"USER_USER_RATE_LIMIT_BURST", tc.burst,
 			)
@@ -712,7 +719,7 @@ func TestLoad_CommsMailer(t *testing.T) {
 	}{
 		{
 			name:      "non-dev short S2S token rejected",
-			env:       "production",
+			env:       envProduction,
 			baseURL:   "https://notification.internal:8084",
 			s2sToken:  "too-short",
 			wantErr:   true,
@@ -720,7 +727,7 @@ func TestLoad_CommsMailer(t *testing.T) {
 		},
 		{
 			name:      "non-dev http BaseURL rejected",
-			env:       "production",
+			env:       envProduction,
 			baseURL:   "http://notification.internal:8084",
 			s2sToken:  testCommsS2SToken,
 			wantErr:   true,
@@ -728,21 +735,21 @@ func TestLoad_CommsMailer(t *testing.T) {
 		},
 		{
 			name:     "non-dev valid 32-char token + https BaseURL passes",
-			env:      "production",
+			env:      envProduction,
 			baseURL:  "https://notification.internal:8084",
 			s2sToken: testCommsS2SToken,
 			wantErr:  false,
 		},
 		{
 			name:     "dev short token allowed",
-			env:      "development",
+			env:      envDevelopment,
 			baseURL:  "http://notification:8084",
 			s2sToken: "short",
 			wantErr:  false,
 		},
 		{
 			name:     "dev http BaseURL allowed",
-			env:      "development",
+			env:      envDevelopment,
 			baseURL:  "http://notification:8084",
 			s2sToken: testCommsS2SToken,
 			wantErr:  false,
@@ -751,16 +758,16 @@ func TestLoad_CommsMailer(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.env == "production" {
+			if tc.env == envProduction {
 				setBaseCommsEnv(t)
-				t.Setenv("USER_ENV", "production")
+				t.Setenv("USER_ENV", envProduction)
 			} else {
 				setEnv(
 					t,
 					"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
 					"USER_PORT", "8080",
 					"USER_LOG_LEVEL", "INFO",
-					"USER_ENV", "development",
+					"USER_ENV", envDevelopment,
 					"USER_MAILER_BACKEND", "comms",
 				)
 			}
@@ -772,6 +779,98 @@ func TestLoad_CommsMailer(t *testing.T) {
 			if tc.wantErr {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestLoad_DevConstantDenylist verifies that the denylist for well-known
+// development-default secret values is enforced in non-dev but allowed in dev.
+// Table: {field, env-var, dev-constant value} × {dev, production}.
+func TestLoad_DevConstantDenylist(t *testing.T) {
+	const devEventHMAC = "dev-shared-event-hmac-secret-min32-0123456789"
+	const devPIIKey = "Y292ZXJvbmVzLWRldi1waWkta2V5LTMyYnl0ZXNsZW4="
+
+	tests := []struct {
+		name        string
+		envOverride map[string]string
+		env         string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name: "prod: dev-constant EVENT_HMAC_SECRET rejected",
+			env:  envProduction,
+			envOverride: map[string]string{
+				"EVENT_HMAC_SECRET": devEventHMAC,
+			},
+			wantErr:     true,
+			errContains: "must not be a known development-default value",
+		},
+		{
+			name: "dev: dev-constant EVENT_HMAC_SECRET allowed",
+			env:  envDevelopment,
+			envOverride: map[string]string{
+				"EVENT_HMAC_SECRET": devEventHMAC,
+			},
+			wantErr: false,
+		},
+		{
+			name: "prod: dev-constant USER_PII_ENCRYPTION_KEY rejected",
+			env:  envProduction,
+			envOverride: map[string]string{
+				"USER_PII_ENCRYPTION_KEY": devPIIKey,
+			},
+			wantErr:     true,
+			errContains: "must not be a known development-default value",
+		},
+		{
+			name: "dev: dev-constant USER_PII_ENCRYPTION_KEY allowed (short-key dev path)",
+			env:  envDevelopment,
+			envOverride: map[string]string{
+				// dev-constant is base64-valid and is allowed in dev (non-empty passes)
+				"USER_PII_ENCRYPTION_KEY": devPIIKey,
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env == envProduction {
+				// Production needs all mandatory fields set; override only the field under test.
+				setEnv(
+					t,
+					"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+					"USER_PORT", "8080",
+					"USER_LOG_LEVEL", "INFO",
+					"USER_ENV", envProduction,
+					"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
+					"EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
+					"USER_GATEWAY_HMAC_SECRET", testGatewayHMACSecret,
+				)
+
+				setProdSecrets(t) // sets validPIIKeyB64 + SMTP host + APP_BASE_URL
+			} else {
+				setEnv(
+					t,
+					"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+					"USER_PORT", "8080",
+					"USER_LOG_LEVEL", "INFO",
+					"USER_ENV", envDevelopment,
+				)
+			}
+
+			for k, v := range tc.envOverride {
+				t.Setenv(k, v)
+			}
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errContains)
 			} else {
 				require.NoError(t, err)
 			}

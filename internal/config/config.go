@@ -24,6 +24,16 @@ const minEventHMACSecretLen = 32
 // piiKeyBytes is the required decoded length of USER_PII_ENCRYPTION_KEY (AES-256).
 const piiKeyBytes = 32
 
+// devEventHMACSecret is the publicly-known dev-default value of EVENT_HMAC_SECRET.
+// Any non-dev deployment that boots with this value uses a compromised HMAC key.
+//
+//nolint:gosec // G101: this constant is the known-bad value being BLOCKED, not a real credential.
+const devEventHMACSecret = "dev-shared-event-hmac-secret-min32-0123456789"
+
+// devPIIEncryptionKey is the publicly-known dev-default value of USER_PII_ENCRYPTION_KEY.
+// Any non-dev deployment that boots with this value encrypts PII with a compromised key.
+const devPIIEncryptionKey = "Y292ZXJvbmVzLWRldi1waWkta2V5LTMyYnl0ZXNsZW4="
+
 // mailerBackendComms is the USER_MAILER_BACKEND value that delegates email to the
 // notification comms service rather than SMTP-sending directly.
 const mailerBackendComms = "comms"
@@ -373,21 +383,36 @@ func (c *Config) validateCore() []string {
 		errs = append(errs, "USER_JWT_PRIVATE_KEY or USER_JWT_PRIVATE_KEY_PEM is required in production")
 	}
 
-	// P0: outside development, the event HMAC secret MUST be present and ≥32 chars.
-	// Without it, inbound kyc.tier_changed events cannot be authenticated and a
-	// forged Redis publish could elevate any user to Tier2. In development we allow
-	// an empty secret (the consumer then drops all signed events — fail-closed).
-	if !c.IsDev() {
-		if c.EventHMACSecret == "" {
-			errs = append(errs, "EVENT_HMAC_SECRET is required outside development")
-		} else if len(c.EventHMACSecret) < minEventHMACSecretLen {
-			errs = append(errs, "EVENT_HMAC_SECRET must be at least 32 characters")
-		}
-	}
-
+	errs = append(errs, c.validateEventHMAC()...)
 	errs = append(errs, c.validatePIIAndSMTP()...)
 	errs = append(errs, c.validateMFA()...)
 	errs = append(errs, c.validateGatewayHMAC()...)
+
+	return errs
+}
+
+// validateEventHMAC checks the EVENT_HMAC_SECRET field.
+//
+// P0: outside development, the event HMAC secret MUST be present, ≥32 chars, and
+// not a known development-default value. Without a valid secret, inbound
+// kyc.tier_changed events cannot be authenticated and a forged Redis publish
+// could elevate any user to Tier2. In development we allow an empty secret
+// (the consumer then drops all signed events — fail-closed).
+func (c *Config) validateEventHMAC() []string {
+	if c.IsDev() {
+		return nil
+	}
+
+	var errs []string
+
+	switch {
+	case c.EventHMACSecret == "":
+		errs = append(errs, "EVENT_HMAC_SECRET is required outside development")
+	case len(c.EventHMACSecret) < minEventHMACSecretLen:
+		errs = append(errs, "EVENT_HMAC_SECRET must be at least 32 characters")
+	case c.EventHMACSecret == devEventHMACSecret:
+		errs = append(errs, "EVENT_HMAC_SECRET must not be a known development-default value")
+	}
 
 	return errs
 }
@@ -474,6 +499,12 @@ func (c *Config) validatePIIKey() []string {
 		key, decErr := base64.StdEncoding.DecodeString(c.PIIEncryptionKey)
 		if decErr != nil || len(key) != piiKeyBytes {
 			return []string{fmt.Sprintf("USER_PII_ENCRYPTION_KEY must be base64 that decodes to exactly %d bytes", piiKeyBytes)}
+		}
+
+		// Reject the publicly-known dev-default value so a prod deploy that forgets
+		// to set the key never silently encrypts PII with a compromised key.
+		if c.PIIEncryptionKey == devPIIEncryptionKey {
+			return []string{"USER_PII_ENCRYPTION_KEY must not be a known development-default value"}
 		}
 	}
 
