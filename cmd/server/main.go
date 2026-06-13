@@ -361,11 +361,17 @@ func buildMailer(cfg *config.Config) (service.Mailer, error) {
 
 	slog.Warn("USER_SMTP_HOST not set; verification email path will be logged (dev only)")
 
-	return devLogMailer{appBaseURL: cfg.AppBaseURL}, nil
+	return devLogMailer{appBaseURL: cfg.AppBaseURL, isDev: true}, nil
 }
 
 type devLogMailer struct {
 	appBaseURL string
+	// isDev gates whether the full reset URL (containing the raw token) may be
+	// logged. config.validate() already rejects the devLogMailer path outside
+	// development, but this field adds a second, struct-level defense so that a
+	// staging misconfiguration (e.g. USER_APP_BASE_URL accidentally set) cannot
+	// surface raw tokens in log aggregators (defense in depth).
+	isDev bool
 }
 
 func (m devLogMailer) SendPasswordReset(ctx context.Context, to, token string) error {
@@ -378,12 +384,14 @@ func (m devLogMailer) SendPasswordReset(ctx context.Context, to, token string) e
 	base := strings.TrimRight(strings.TrimSpace(m.appBaseURL), "/")
 	attrs := []any{"to", to}
 
-	if base != "" {
-		// token embedded in reset URL (dev only); never enable this backend in staging/production.
+	if base != "" && m.isDev {
+		// Full reset URL (containing raw token) is only logged in verified dev
+		// mode. The isDev guard prevents accidental token exposure if this mailer
+		// were ever constructed outside development (defense-in-depth).
 		attrs = append(attrs, "reset_url", fmt.Sprintf("%s/reset-password?token=%s", base, neturl.QueryEscape(token)))
 	} else {
-		// Raw token MUST NOT appear in logs even in dev (credential in logs).
-		attrs = append(attrs, "reset_token", "[REDACTED]", "hint", "set USER_APP_BASE_URL to log a clickable password reset link")
+		// Raw token MUST NOT appear in logs (credential in logs).
+		attrs = append(attrs, "reset_token", "[REDACTED]", "hint", "set USER_APP_BASE_URL to log a clickable password reset link (dev only)")
 	}
 
 	slog.Warn(
