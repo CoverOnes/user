@@ -34,6 +34,12 @@ const verificationTokenTTL = 24 * time.Hour
 // verificationTokenBytes is the entropy of a raw verification token (256 bits).
 const verificationTokenBytes = 32
 
+// resetTokenTTL is how long a password-reset token stays valid (spec: 30 min).
+const resetTokenTTL = 30 * time.Minute
+
+// resetTokenBytes is the entropy of a raw password-reset token (256 bits).
+const resetTokenBytes = 32
+
 // Transactioner is implemented by store backends that support DB transactions.
 // The AuthService uses it for Register where user + company + verification token
 // must be created atomically.
@@ -54,10 +60,11 @@ type Encryptor interface {
 	Decrypt(data []byte) (string, error)
 }
 
-// Mailer sends the post-register verification email. Implemented by
-// internal/mailer; a spy is used in tests.
+// Mailer sends transactional emails. Implemented by internal/mailer; a spy is
+// used in tests.
 type Mailer interface {
 	SendVerification(ctx context.Context, to, token string) error
+	SendPasswordReset(ctx context.Context, to, token string) error
 }
 
 // EmailRateLimiter throttles per-email actions (resend-verification). Same
@@ -75,12 +82,25 @@ type LoginRateLimiter interface {
 	Allow(ctx context.Context, normalizedEmail string) bool
 }
 
+// ResetTransactioner is implemented by store backends that support the narrow
+// password-reset transaction (MarkUsed + SetPasswordHash + BumpTokenVersion).
+type ResetTransactioner interface {
+	WithResetTx(ctx context.Context, fn func(
+		ctx context.Context,
+		users store.UserStore,
+		resets store.PasswordResetTokenStore,
+	) error) error
+}
+
 // AuthService handles authentication business logic.
 type AuthService struct {
 	users         store.UserStore
 	companies     store.CompanyStore
 	refreshTokens store.RefreshTokenStore
 	verifications store.EmailVerificationTokenStore // may be nil (verify/resend disabled)
+	resets        store.PasswordResetTokenStore     // may be nil (forgot-password disabled)
+	resetTx       ResetTransactioner                // may be nil (sequential fallback)
+	resetLimiter  EmailRateLimiter                  // may be nil (reset throttling disabled)
 	tx            Transactioner                     // may be nil for stores that don't support tx
 	loginLimiter  LoginRateLimiter                  // may be nil (per-email login throttling disabled)
 	resendLimiter EmailRateLimiter                  // may be nil (resend throttling disabled)
@@ -90,8 +110,8 @@ type AuthService struct {
 	accessTTL     time.Duration
 	refreshTTLH   int
 
-	// sendWG tracks in-flight detached verification-email goroutines. The
-	// post-commit (Register) and resend sends run on a background context so all
+	// sendWG tracks in-flight detached email goroutines. The post-commit
+	// (Register/ForgotPassword) and resend sends run on a background context so all
 	// responses return in constant DB-only time — synchronous SMTP would make
 	// "exists+unverified" measurably slower than "unknown/verified" (timing
 	// enumeration oracle, FIX 2). WaitForPendingSends lets a graceful shutdown —
@@ -146,6 +166,22 @@ func (s *AuthService) WithVerification(
 	s.encryptor = encryptor
 	s.mailer = mailer
 	s.resendLimiter = resendLimiter
+
+	return s
+}
+
+// WithPasswordReset installs the password-reset dependencies (token store,
+// transactioner, and the reset rate limiter) and returns the service for
+// chaining. Mirrors WithVerification so existing call sites / tests that do
+// not need password reset are unaffected. Any argument may be nil.
+func (s *AuthService) WithPasswordReset(
+	resets store.PasswordResetTokenStore,
+	resetTx ResetTransactioner,
+	resetLimiter EmailRateLimiter,
+) *AuthService {
+	s.resets = resets
+	s.resetTx = resetTx
+	s.resetLimiter = resetLimiter
 
 	return s
 }
@@ -842,4 +878,191 @@ func (s *AuthService) issueTokenPair(
 // to prevent timing side-channels (F14).
 func subtleEqual(a, b []byte) bool {
 	return subtle.ConstantTimeCompare(a, b) == 1
+}
+
+// ForgotPassword initiates a password-reset flow for the given email. It is
+// enumeration-safe: the caller ALWAYS gets 202 regardless of whether the email
+// exists or its state, so this method returns no error to drive a different
+// response. It only actually sends when the email maps to an eligible user
+// (email_verified=true, password_hash NOT NULL, not SUSPENDED). An ineligible
+// user (unverified / oauth-only / suspended) is silently ignored — no send, no
+// reveal. A per-email rate limiter caps abuse; throttled callers are silently
+// dropped. Prior outstanding tokens are invalidated so each new request starts
+// fresh. The send runs detached (constant-time response).
+func (s *AuthService) ForgotPassword(ctx context.Context, email string) {
+	if s.resets == nil || s.mailer == nil {
+		return
+	}
+
+	normalizedEmail := strings.ToLower(strings.TrimSpace(email))
+
+	if s.resetLimiter != nil && !s.resetLimiter.Allow(ctx, normalizedEmail) {
+		// Over the rate cap — silently drop (handler still returns 202).
+		return
+	}
+
+	u, err := s.users.GetByEmail(ctx, normalizedEmail)
+	if err != nil {
+		// Unknown email or store error → no send, no leak.
+		return
+	}
+
+	// Policy gates — spec LOCKED decisions:
+	//   unverified  → silent no-op (email_verified=false)
+	//   oauth-only  → silent no-op (password_hash IS NULL)
+	//   suspended   → silent no-op
+	if !u.EmailVerified || u.PasswordHash == nil || u.Status == domain.UserStatusSuspended {
+		return
+	}
+
+	now := time.Now().UTC()
+
+	// Invalidate prior outstanding tokens so only the newest token is usable.
+	if err := s.resets.InvalidateForUser(ctx, u.ID, now); err != nil {
+		slog.Warn("forgot: invalidate prior reset tokens failed", "err", err, "userId", u.ID)
+		return
+	}
+
+	rawToken, tokenHash, err := newResetToken()
+	if err != nil {
+		slog.Warn("forgot: token generation failed", "err", err, "userId", u.ID)
+		return
+	}
+
+	rt := &domain.PasswordResetToken{
+		ID:        uuid.New(),
+		UserID:    u.ID,
+		TokenHash: tokenHash,
+		ExpiresAt: now.Add(resetTokenTTL),
+		CreatedAt: now,
+	}
+
+	if err := s.resets.Create(ctx, rt); err != nil {
+		slog.Warn("forgot: persist reset token failed", "err", err, "userId", u.ID)
+		return
+	}
+
+	// Detached send — constant-time response regardless of email path.
+	//
+	//nolint:contextcheck // intentional detach: the send goroutine MUST NOT inherit the
+	// request ctx (it is canceled when the handler returns) — backend-security-design §5.
+	s.dispatchPasswordResetEmail(u.Email, rawToken)
+}
+
+// dispatchPasswordResetEmail sends the password-reset email on a DETACHED goroutine
+// so the caller returns in constant DB-only time.
+func (s *AuthService) dispatchPasswordResetEmail(email, rawToken string) {
+	if s.mailer == nil {
+		return
+	}
+
+	s.sendWG.Add(1)
+
+	go func() {
+		defer s.sendWG.Done()
+
+		// Detached: do NOT inherit the request context.
+		if err := s.mailer.SendPasswordReset(context.Background(), email, rawToken); err != nil {
+			slog.Warn("password reset email send failed", "err", err)
+		}
+	}()
+}
+
+// ResetPassword consumes a single-use reset token: it hashes the presented raw
+// token, looks up an unused + unexpired row, validates the new password, then
+// atomically in a single DB transaction: marks the token used + sets the new
+// password hash + bumps token_version (revoking all existing sessions). No
+// tokens are issued (no auto-login). The raw token is NEVER logged.
+// All failure modes (not-found / expired / already-used) return the single
+// generic ErrInvalidResetToken — no oracle.
+func (s *AuthService) ResetPassword(ctx context.Context, rawToken, newPassword string) error {
+	if s.resets == nil {
+		return domain.ErrInvalidResetToken
+	}
+
+	if strings.TrimSpace(rawToken) == "" {
+		return domain.ErrInvalidResetToken
+	}
+
+	sum := sha256.Sum256([]byte(rawToken))
+
+	rt, err := s.resets.GetByHash(ctx, sum[:])
+	if err != nil {
+		// GetByHash already maps not-found to ErrInvalidResetToken.
+		return err
+	}
+
+	// Expired or already used → same generic error.
+	if rt.UsedAt != nil || time.Now().UTC().After(rt.ExpiresAt) {
+		return domain.ErrInvalidResetToken
+	}
+
+	// Validate new password complexity before touching DB.
+	if err := password.MeetsComplexity(newPassword); err != nil {
+		return domain.ErrWeakPassword
+	}
+
+	newHash, err := password.Hash(newPassword, password.DefaultParams)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+
+	// Atomic transaction: MarkUsed + SetPasswordHash + BumpTokenVersion.
+	// One tx ensures a crash between any two steps cannot leave a partial state.
+	if s.resetTx != nil {
+		return s.resetTx.WithResetTx(ctx, func(
+			txCtx context.Context,
+			txUsers store.UserStore,
+			txResets store.PasswordResetTokenStore,
+		) error {
+			// Atomic single-use: MarkUsed only updates when used_at IS NULL.
+			if txErr := txResets.MarkUsed(txCtx, rt.ID, now); txErr != nil {
+				return txErr
+			}
+
+			if txErr := txUsers.SetPasswordHash(txCtx, rt.UserID, newHash); txErr != nil {
+				return txErr
+			}
+
+			// Bump token_version to revoke all existing sessions (LogoutAll pattern).
+			if _, txErr := txUsers.BumpTokenVersion(txCtx, rt.UserID); txErr != nil {
+				return txErr
+			}
+
+			return nil
+		})
+	}
+
+	// Sequential fallback (no tx support — unit-test / dev path).
+	if err := s.resets.MarkUsed(ctx, rt.ID, now); err != nil {
+		return err
+	}
+
+	if err := s.users.SetPasswordHash(ctx, rt.UserID, newHash); err != nil {
+		return err
+	}
+
+	if _, err := s.users.BumpTokenVersion(ctx, rt.UserID); err != nil {
+		return err
+	}
+
+	slog.Info("auth.password_reset", "userId", rt.UserID)
+
+	return nil
+}
+
+// newResetToken returns (rawToken, sha256Hash, error). The raw token is
+// emailed; only its SHA-256 hash is stored.
+func newResetToken() (raw string, hash []byte, err error) {
+	b := make([]byte, resetTokenBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", nil, err
+	}
+
+	raw = base64.RawURLEncoding.EncodeToString(b)
+	sum := sha256.Sum256([]byte(raw))
+
+	return raw, sum[:], nil
 }

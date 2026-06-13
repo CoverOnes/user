@@ -1,3 +1,4 @@
+//nolint:dupl // intentional mirror of password_reset_store.go — same lifecycle pattern, different domain type and SQL constants
 package postgres
 
 import (

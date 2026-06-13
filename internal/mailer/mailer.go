@@ -22,6 +22,12 @@ type Mailer interface {
 	// caller decides whether to surface it (register does NOT — it logs and
 	// returns 201 so the account is still created).
 	SendVerification(ctx context.Context, to, token string) error
+
+	// SendPasswordReset delivers a password-reset message containing the
+	// (raw, single-use) token to the recipient address. The raw token is
+	// embedded in the reset URL (never sent plain). A transport failure is
+	// logged and swallowed — the handler still returns 202 (no enumeration).
+	SendPasswordReset(ctx context.Context, to, token string) error
 }
 
 // Config carries the SMTP connection parameters.
@@ -120,6 +126,41 @@ func (m *SMTPMailer) SendVerification(ctx context.Context, to, token string) err
 	return nil
 }
 
+// SendPasswordReset builds and sends the password-reset email.
+func (m *SMTPMailer) SendPasswordReset(ctx context.Context, to, token string) error {
+	msg := mail.NewMsg()
+	if err := msg.From(m.cfg.From); err != nil {
+		return fmt.Errorf("mailer: set from (reset): %w", err)
+	}
+
+	if err := msg.To(to); err != nil {
+		return fmt.Errorf("mailer: set recipient (reset): %w", err)
+	}
+
+	textBody, htmlBody := m.RenderPasswordReset(token)
+
+	msg.Subject("Reset your CoverOnes password")
+	msg.SetBodyString(mail.TypeTextPlain, textBody)
+	msg.AddAlternativeString(mail.TypeTextHTML, htmlBody)
+
+	sendCtx, cancel := context.WithTimeout(ctx, m.cfg.SendTimeout)
+	defer cancel()
+
+	if err := m.client.DialAndSendWithContext(sendCtx, msg); err != nil {
+		return fmt.Errorf("mailer: send password reset: %w", err)
+	}
+
+	return nil
+}
+
+// RenderPasswordReset renders the password-reset email bodies (plain-text and HTML)
+// for the given token using the mailer's configured AppBaseURL.
+func (m *SMTPMailer) RenderPasswordReset(token string) (textBody, htmlBody string) {
+	resetURL := passwordResetURL(m.cfg.AppBaseURL, token)
+
+	return passwordResetBody(resetURL), passwordResetBodyHTML(resetURL)
+}
+
 // RenderVerification renders the verification email bodies (plain-text and HTML)
 // for the given token using the mailer's configured AppBaseURL. It is the single
 // source of the email content — SendVerification calls it directly — so a test
@@ -180,5 +221,41 @@ func verificationBodyHTML(verifyURL, token string) string {
 		escURL,
 		escURL,
 		escToken,
+	)
+}
+
+// passwordResetURL builds the clickable password-reset link
+// <baseURL>/reset-password?token=<token>.
+func passwordResetURL(baseURL, token string) string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+
+	return fmt.Sprintf("%s/reset-password?token=%s", base, url.QueryEscape(token))
+}
+
+// passwordResetBody renders the plaintext password-reset email body.
+func passwordResetBody(resetURL string) string {
+	return fmt.Sprintf(
+		"You requested a password reset for your CoverOnes account.\n\n"+
+			"Click the link below to set a new password:\n\n"+
+			"%s\n\n"+
+			"This link is single-use and expires in 30 minutes.\n"+
+			"If you did not request this, you can safely ignore this message.\n",
+		resetURL,
+	)
+}
+
+// passwordResetBodyHTML renders the HTML alternative part for password-reset.
+func passwordResetBodyHTML(resetURL string) string {
+	escURL := html.EscapeString(resetURL)
+
+	return fmt.Sprintf(
+		"<p>You requested a password reset for your CoverOnes account.</p>"+
+			"<p>Click the button below to set a new password:</p>"+
+			"<p><a href=\"%s\">Reset my password</a></p>"+
+			"<p>If the button does not work, copy this link into your browser:<br>%s</p>"+
+			"<p>This link is single-use and expires in 30 minutes. "+
+			"If you did not request this, you can safely ignore this message.</p>",
+		escURL,
+		escURL,
 	)
 }

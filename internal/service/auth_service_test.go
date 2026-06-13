@@ -1069,3 +1069,320 @@ func TestAuthService_ResendVerification(t *testing.T) {
 		assert.Equal(t, 0, mailer.sendCount(), "throttled caller gets no email")
 	})
 }
+
+// --- Password Reset unit tests ---
+
+// newPasswordResetService wires an AuthService with password-reset deps only.
+func newPasswordResetService(
+	t *testing.T,
+	users *fakeUserStore,
+	resets *fakePasswordResetTokenStore,
+	mailer *spyMailer,
+	limiter service.EmailRateLimiter,
+) *service.AuthService {
+	t.Helper()
+
+	signer, err := jwt.NewEphemeralSigner(10 * time.Minute)
+	require.NoError(t, err)
+
+	svc := service.NewAuthService(users, &fakeCompanyStore{}, newFakeRefreshTokenStore(), nil, signer, 10*time.Minute, 24)
+	svc = svc.WithVerification(newFakeVerificationStore(), &noopEncryptor{}, mailer, nil)
+
+	rtx := &fakeResetTx{userStore: users, resetStore: resets}
+
+	return svc.WithPasswordReset(resets, rtx, limiter)
+}
+
+// seedResetToken inserts a PasswordResetToken keyed by sha256(rawToken).
+func seedResetToken(
+	t *testing.T,
+	resets *fakePasswordResetTokenStore,
+	userID uuid.UUID,
+	rawToken string,
+	expiresAt time.Time,
+	usedAt *time.Time,
+) {
+	t.Helper()
+
+	sum := sha256.Sum256([]byte(rawToken))
+	rt := &domain.PasswordResetToken{
+		ID:        uuid.New(),
+		UserID:    userID,
+		TokenHash: sum[:],
+		ExpiresAt: expiresAt,
+		UsedAt:    usedAt,
+		CreatedAt: time.Now().UTC(),
+	}
+	require.NoError(t, resets.Create(context.Background(), rt))
+}
+
+// A2: ForgotPassword must always return void regardless of whether the email exists.
+func TestAuthService_ForgotPassword_NoEnumeration(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		email       string
+		setupUsers  func(u *fakeUserStore) *domain.User
+		wantSendCnt int
+	}{
+		{
+			name:  "unknown email → 0 sends",
+			email: "ghost@example.com",
+			setupUsers: func(_ *fakeUserStore) *domain.User {
+				return nil
+			},
+			wantSendCnt: 0,
+		},
+		{
+			name:  "unverified-email user → 0 sends (silent no-op)",
+			email: "unverified@example.com",
+			setupUsers: func(u *fakeUserStore) *domain.User {
+				usr := seedUser(t, u, "unverified@example.com")
+				u.byID[usr.ID].EmailVerified = false
+				u.byID[usr.ID].Status = domain.UserStatusPendingVerification
+				return usr
+			},
+			wantSendCnt: 0,
+		},
+		{
+			name:  "oauth-only user (password_hash IS NULL) → 0 sends",
+			email: "oauth@example.com",
+			setupUsers: func(u *fakeUserStore) *domain.User {
+				usr := seedUser(t, u, "oauth@example.com")
+				u.byID[usr.ID].EmailVerified = true
+				u.byID[usr.ID].Status = domain.UserStatusActive
+				u.byID[usr.ID].PasswordHash = nil // oauth-only
+				return usr
+			},
+			wantSendCnt: 0,
+		},
+		{
+			name:  "suspended user → 0 sends",
+			email: "suspended@example.com",
+			setupUsers: func(u *fakeUserStore) *domain.User {
+				usr := seedUser(t, u, "suspended@example.com")
+				u.byID[usr.ID].EmailVerified = true
+				u.byID[usr.ID].Status = domain.UserStatusSuspended
+				return usr
+			},
+			wantSendCnt: 0,
+		},
+		{
+			name:  "rate-limited → 0 sends",
+			email: "ratelimited@example.com",
+			setupUsers: func(u *fakeUserStore) *domain.User {
+				usr := seedUser(t, u, "ratelimited@example.com")
+				u.byID[usr.ID].EmailVerified = true
+				u.byID[usr.ID].Status = domain.UserStatusActive
+				return usr
+			},
+			wantSendCnt: 0,
+		},
+		{
+			name:  "happy eligible user → 1 send",
+			email: "eligible@example.com",
+			setupUsers: func(u *fakeUserStore) *domain.User {
+				usr := seedUser(t, u, "eligible@example.com")
+				u.byID[usr.ID].EmailVerified = true
+				u.byID[usr.ID].Status = domain.UserStatusActive
+				return usr
+			},
+			wantSendCnt: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			users := newFakeUserStore()
+			tc.setupUsers(users)
+
+			resets := newFakePasswordResetTokenStore()
+			mailer := &spyMailer{}
+
+			// Only the rate-limited case uses denyAllLimiter; all others use allowAll.
+			var limiter service.EmailRateLimiter = allowAllLimiter{}
+			if tc.wantSendCnt == 0 && tc.email == "ratelimited@example.com" {
+				limiter = denyAllLimiter{}
+			}
+
+			svc := newPasswordResetService(t, users, resets, mailer, limiter)
+			// ForgotPassword always returns void.
+			svc.ForgotPassword(context.Background(), tc.email)
+			svc.WaitForPendingSends()
+
+			assert.Equal(t, tc.wantSendCnt, mailer.resetSendCount(), "reset send count mismatch")
+		})
+	}
+}
+
+// A3: ResetPassword happy path — changes password, revokes sessions.
+func TestAuthService_ResetPassword_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	users := newFakeUserStore()
+	u := seedUser(t, users, "reset-happy@example.com")
+	users.byID[u.ID].EmailVerified = true
+	users.byID[u.ID].Status = domain.UserStatusActive
+	initialVersion := u.TokenVersion
+
+	resets := newFakePasswordResetTokenStore()
+	seedResetToken(t, resets, u.ID, "good-token", time.Now().UTC().Add(time.Hour), nil)
+
+	svc := newPasswordResetService(t, users, resets, &spyMailer{}, allowAllLimiter{})
+	err := svc.ResetPassword(context.Background(), "good-token", "NewSecurePassword99!")
+	require.NoError(t, err)
+
+	// Password hash must be updated.
+	require.NotNil(t, users.byID[u.ID].PasswordHash)
+	assert.NotEqual(t, u.PasswordHash, *users.byID[u.ID].PasswordHash, "password hash must change")
+
+	// TokenVersion must be bumped (session revocation A7).
+	assert.Greater(t, users.byID[u.ID].TokenVersion, initialVersion, "token_version must be bumped to invalidate old sessions")
+}
+
+// A4: Expired token → ErrInvalidResetToken.
+func TestAuthService_ResetPassword_ExpiredToken(t *testing.T) {
+	t.Parallel()
+
+	users := newFakeUserStore()
+	u := seedUser(t, users, "expired-reset@example.com")
+	users.byID[u.ID].EmailVerified = true
+	users.byID[u.ID].Status = domain.UserStatusActive
+
+	resets := newFakePasswordResetTokenStore()
+	seedResetToken(t, resets, u.ID, "expired-token", time.Now().UTC().Add(-time.Hour), nil)
+
+	svc := newPasswordResetService(t, users, resets, &spyMailer{}, allowAllLimiter{})
+	err := svc.ResetPassword(context.Background(), "expired-token", "NewSecurePassword99!")
+	require.ErrorIs(t, err, domain.ErrInvalidResetToken, "expired token must return ErrInvalidResetToken")
+
+	// Password must be unchanged.
+	assert.Equal(t, u.PasswordHash, users.byID[u.ID].PasswordHash)
+}
+
+// A5: Single-use: second reset with same token fails.
+func TestAuthService_ResetPassword_SingleUse(t *testing.T) {
+	t.Parallel()
+
+	users := newFakeUserStore()
+	u := seedUser(t, users, "single-use@example.com")
+	users.byID[u.ID].EmailVerified = true
+	users.byID[u.ID].Status = domain.UserStatusActive
+
+	resets := newFakePasswordResetTokenStore()
+	seedResetToken(t, resets, u.ID, "use-once", time.Now().UTC().Add(time.Hour), nil)
+
+	svc := newPasswordResetService(t, users, resets, &spyMailer{}, allowAllLimiter{})
+
+	// First use: must succeed.
+	require.NoError(t, svc.ResetPassword(context.Background(), "use-once", "NewSecurePassword99!"))
+
+	// Second use: must fail with the same generic error.
+	err := svc.ResetPassword(context.Background(), "use-once", "AnotherSecurePassword99!")
+	require.ErrorIs(t, err, domain.ErrInvalidResetToken, "used token must return ErrInvalidResetToken")
+}
+
+// A8: Weak password → ErrWeakPassword; token must NOT be consumed.
+func TestAuthService_ResetPassword_WeakPassword(t *testing.T) {
+	t.Parallel()
+
+	users := newFakeUserStore()
+	u := seedUser(t, users, "weak-pw@example.com")
+	users.byID[u.ID].EmailVerified = true
+	users.byID[u.ID].Status = domain.UserStatusActive
+
+	resets := newFakePasswordResetTokenStore()
+	seedResetToken(t, resets, u.ID, "weak-pw-token", time.Now().UTC().Add(time.Hour), nil)
+
+	svc := newPasswordResetService(t, users, resets, &spyMailer{}, allowAllLimiter{})
+	err := svc.ResetPassword(context.Background(), "weak-pw-token", "short") // too short
+	require.ErrorIs(t, err, domain.ErrWeakPassword)
+
+	// Token must remain unused — user should be able to retry with a strong password.
+	sum := sha256.Sum256([]byte("weak-pw-token"))
+	tok, getErr := resets.GetByHash(context.Background(), sum[:])
+	require.NoError(t, getErr, "token must still exist")
+	assert.Nil(t, tok.UsedAt, "token must not be consumed on weak-password rejection")
+
+	// Password must be unchanged.
+	assert.Equal(t, u.PasswordHash, users.byID[u.ID].PasswordHash)
+}
+
+// A10: ForgotPassword invalidates prior tokens before issuing a new one.
+func TestAuthService_ForgotPassword_InvalidatesPriorTokens(t *testing.T) {
+	t.Parallel()
+
+	users := newFakeUserStore()
+	u := seedUser(t, users, "prior@example.com")
+	users.byID[u.ID].EmailVerified = true
+	users.byID[u.ID].Status = domain.UserStatusActive
+
+	resets := newFakePasswordResetTokenStore()
+	// Seed a prior token.
+	seedResetToken(t, resets, u.ID, "prior-token", time.Now().UTC().Add(time.Hour), nil)
+
+	svc := newPasswordResetService(t, users, resets, &spyMailer{}, allowAllLimiter{})
+	svc.ForgotPassword(context.Background(), "prior@example.com")
+	svc.WaitForPendingSends()
+
+	// Prior token must be invalidated (UsedAt set).
+	sum := sha256.Sum256([]byte("prior-token"))
+	tok, err := resets.GetByHash(context.Background(), sum[:])
+	require.NoError(t, err)
+	assert.NotNil(t, tok.UsedAt, "prior token must be invalidated before new token is issued")
+}
+
+// Unknown token → same generic ErrInvalidResetToken (no oracle).
+func TestAuthService_ResetPassword_UnknownToken(t *testing.T) {
+	t.Parallel()
+
+	users := newFakeUserStore()
+	resets := newFakePasswordResetTokenStore()
+	svc := newPasswordResetService(t, users, resets, &spyMailer{}, allowAllLimiter{})
+
+	err := svc.ResetPassword(context.Background(), "never-issued", "NewSecurePassword99!")
+	require.ErrorIs(t, err, domain.ErrInvalidResetToken)
+}
+
+// Already-used token → ErrInvalidResetToken.
+func TestAuthService_ResetPassword_AlreadyUsedToken(t *testing.T) {
+	t.Parallel()
+
+	users := newFakeUserStore()
+	u := seedUser(t, users, "already-used@example.com")
+	users.byID[u.ID].EmailVerified = true
+	users.byID[u.ID].Status = domain.UserStatusActive
+
+	resets := newFakePasswordResetTokenStore()
+	usedAt := time.Now().UTC().Add(-time.Minute)
+	seedResetToken(t, resets, u.ID, "used-token", time.Now().UTC().Add(time.Hour), &usedAt)
+
+	svc := newPasswordResetService(t, users, resets, &spyMailer{}, allowAllLimiter{})
+	err := svc.ResetPassword(context.Background(), "used-token", "NewSecurePassword99!")
+	require.ErrorIs(t, err, domain.ErrInvalidResetToken)
+}
+
+// Store failure during SetPasswordHash: returns error, token not consumed.
+func TestAuthService_ResetPassword_SetPasswordHashFailure(t *testing.T) {
+	t.Parallel()
+
+	users := newFakeUserStore()
+	u := seedUser(t, users, "sph-fail@example.com")
+	users.byID[u.ID].EmailVerified = true
+	users.byID[u.ID].Status = domain.UserStatusActive
+
+	resets := newFakePasswordResetTokenStore()
+	seedResetToken(t, resets, u.ID, "sph-token", time.Now().UTC().Add(time.Hour), nil)
+
+	users.setPasswordHashErr = errInjected
+
+	svc := newPasswordResetService(t, users, resets, &spyMailer{}, allowAllLimiter{})
+	err := svc.ResetPassword(context.Background(), "sph-token", "NewSecurePassword99!")
+
+	require.Error(t, err)
+	// Password must not have changed (still old hash).
+	assert.Equal(t, u.PasswordHash, users.byID[u.ID].PasswordHash)
+}

@@ -84,6 +84,8 @@ var fixedErrorMappings = []errMapping{
 	{domain.ErrOAuthOneTimeCodeInvalid, "OAUTH_CODE_INVALID", http.StatusBadRequest, "oauth one-time code invalid or expired"},
 	{domain.ErrIdentityAlreadyBound, "IDENTITY_ALREADY_BOUND", http.StatusConflict, "oauth identity already bound to an account"},
 	{domain.ErrLastLoginMethod, "LAST_LOGIN_METHOD", http.StatusConflict, "cannot remove last login method"},
+	// Single generic code for password-reset not-found / expired / already-used — no oracle.
+	{domain.ErrInvalidResetToken, "INVALID_RESET_TOKEN", http.StatusBadRequest, "invalid or expired password reset token"},
 }
 
 // passthroughValidationErrors are validation sentinels whose own Error() text is

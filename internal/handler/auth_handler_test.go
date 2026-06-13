@@ -182,6 +182,18 @@ func (f *fakeUserStore) SetMFABackupCodes(_ context.Context, id uuid.UUID, backu
 	return domain.ErrNotFound
 }
 
+func (f *fakeUserStore) SetPasswordHash(_ context.Context, id uuid.UUID, hash string) error {
+	for _, u := range f.users {
+		if u.ID == id {
+			u.PasswordHash = &hash
+
+			return nil
+		}
+	}
+
+	return domain.ErrNotFound
+}
+
 type fakeCompanyStore struct{}
 
 func (f *fakeCompanyStore) Create(_ context.Context, _ *domain.Company) error { return nil }

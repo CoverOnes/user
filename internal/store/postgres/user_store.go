@@ -295,6 +295,27 @@ func (s *UserStore) SetMFABackupCodes(ctx context.Context, id uuid.UUID, backupC
 	return nil
 }
 
+// SetPasswordHash replaces the stored Argon2id hash for the given user.
+// Returns ErrNotFound if no live row matches (mirrors SetEmailVerified pattern).
+func (s *UserStore) SetPasswordHash(ctx context.Context, id uuid.UUID, hash string) error {
+	q := `
+	UPDATE users
+	SET password_hash = $2, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL
+	`
+
+	tag, err := s.pool.Exec(ctx, q, id, hash)
+	if err != nil {
+		return fmt.Errorf("set password hash: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
 func scanUser(row pgx.Row) (*domain.User, error) {
 	var u domain.User
 	// password_hash is nullable since migration 000007 (OAuth-only accounts).

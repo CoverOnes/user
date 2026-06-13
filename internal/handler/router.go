@@ -82,6 +82,8 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	authGroup.POST("/refresh", authH.Refresh)
 	authGroup.POST("/verify-email", authH.VerifyEmail)
 	authGroup.POST("/resend-verification", authH.ResendVerification)
+	authGroup.POST("/forgot-password", authH.ForgotPassword)
+	authGroup.POST("/reset-password", authH.ResetPassword)
 	// Logout requires access token.
 	authGroup.POST("/logout", middleware.Auth(cfg.Signer), authH.Logout)
 

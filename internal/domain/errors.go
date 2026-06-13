@@ -66,4 +66,9 @@ var (
 	// ErrLastLoginMethod is returned by Unbind when removing the identity would leave
 	// the user with no remaining login method. Maps to HTTP 409.
 	ErrLastLoginMethod = errors.New("cannot remove last login method")
+
+	// ErrInvalidResetToken is the single generic error for ALL password-reset
+	// failure modes (not-found / expired / already-used). One code, no oracle
+	// that would let a caller distinguish the cases.
+	ErrInvalidResetToken = errors.New("invalid password reset token")
 )

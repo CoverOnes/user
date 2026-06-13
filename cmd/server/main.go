@@ -178,6 +178,7 @@ func run() error {
 	companyStore := postgres.NewCompanyStore(pool)
 	rtStore := postgres.NewRefreshTokenStore(pool)
 	verificationStore := postgres.NewVerificationStore(pool)
+	resetStore := postgres.NewPasswordResetStore(pool)
 	txMgr := postgres.NewTxManager(pool)
 
 	// PII encryptor — config.validate() guarantees a usable key (32 bytes outside
@@ -204,6 +205,10 @@ func run() error {
 	// callers are silently dropped). Fails safe (allows) when Redis is unavailable.
 	resendLimiter := middleware.NewEmailVerificationLimiter(redisClient, 3, time.Hour)
 
+	// Per-email password-reset limit: 3 per hour (separate key namespace from resend).
+	// Fails safe (allows) when Redis is unavailable.
+	resetLimiter := middleware.NewEmailPasswordResetLimiter(redisClient, 3, time.Hour)
+
 	authSvc := service.NewAuthService(
 		userStore, companyStore, rtStore,
 		txMgr,
@@ -211,7 +216,8 @@ func run() error {
 		accessTTL,
 		cfg.RefreshTokenTTLHours,
 	).WithLoginRateLimiter(emailLoginLimiter).
-		WithVerification(verificationStore, encryptor, verificationMailer, resendLimiter)
+		WithVerification(verificationStore, encryptor, verificationMailer, resendLimiter).
+		WithPasswordReset(resetStore, txMgr, resetLimiter)
 	profileSvc := service.NewProfileService(userStore)
 
 	// MFA (TOTP 2FA) service — Increment 3 primitives. Reuses the SAME PII encryptor
@@ -360,6 +366,32 @@ func buildMailer(cfg *config.Config) (service.Mailer, error) {
 
 type devLogMailer struct {
 	appBaseURL string
+}
+
+func (m devLogMailer) SendPasswordReset(ctx context.Context, to, token string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	base := strings.TrimRight(strings.TrimSpace(m.appBaseURL), "/")
+	attrs := []any{"to", to}
+
+	if base != "" {
+		// token embedded in reset URL (dev only); never enable this backend in staging/production.
+		attrs = append(attrs, "reset_url", fmt.Sprintf("%s/reset-password?token=%s", base, neturl.QueryEscape(token)))
+	} else {
+		// Raw token MUST NOT appear in logs even in dev (credential in logs).
+		attrs = append(attrs, "reset_token", "[REDACTED]", "hint", "set USER_APP_BASE_URL to log a clickable password reset link")
+	}
+
+	slog.Warn(
+		"DEV PASSWORD RESET LINK",
+		attrs...,
+	)
+
+	return nil
 }
 
 func (m devLogMailer) SendVerification(ctx context.Context, to, token string) error {

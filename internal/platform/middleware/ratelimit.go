@@ -189,6 +189,21 @@ func NewEmailVerificationLimiter(rdb *redis.Client, limit int, window time.Durat
 	}
 }
 
+// NewEmailPasswordResetLimiter builds a per-email limiter for the forgot-password
+// endpoint (default 3/hour — set by the caller). It uses a distinct Redis key
+// namespace ("rl:reset:email:") so password-reset throttling is independent of
+// login and resend throttling. A nil rdb disables the control (Allow always returns
+// true) — same dev-mode contract.
+func NewEmailPasswordResetLimiter(rdb *redis.Client, limit int, window time.Duration) *EmailLimiter {
+	return &EmailLimiter{
+		rdb:       rdb,
+		script:    redis.NewScript(slidingWindowScript),
+		limit:     limit,
+		window:    window,
+		keyPrefix: "rl:reset:email:",
+	}
+}
+
 // Allow reports whether an attempt for the given normalized email is admitted.
 // On a nil Redis client or any Redis error it returns true (fail-safe).
 func (l *EmailLimiter) Allow(ctx context.Context, normalizedEmail string) bool {

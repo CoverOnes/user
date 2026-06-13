@@ -112,10 +112,7 @@ func NewCommsMailer(cfg *CommsConfig) (*CommsMailer, error) {
 func (m *CommsMailer) SendVerification(ctx context.Context, to, token string) error {
 	verifyURL := buildVerifyURL(m.cfg.AppBaseURL, token)
 
-	// Idempotency key: deterministic per-token so a re-dispatch deduplicates.
-	idempKey := idempotencyKey(token)
-
-	req := CommsSendRequest{
+	return m.sendEmail(ctx, &CommsSendRequest{
 		Channel:    "EMAIL",
 		To:         to,
 		TemplateID: "email_verify",
@@ -124,9 +121,41 @@ func (m *CommsMailer) SendVerification(ctx context.Context, to, token string) er
 			"verifyURL": verifyURL,
 			// Raw token is deliberately absent: verifyURL is the canonical carrier.
 		},
-		IdempotencyKey: idempKey,
-	}
+		// Idempotency key: deterministic per-token so a re-dispatch deduplicates.
+		IdempotencyKey: idempotencyKey(token),
+	})
+}
 
+// SendPasswordReset delivers a password-reset message through the comms service.
+// The comms service renders the password_reset template with:
+//
+//	resetURL — the full clickable reset link (canonical delivery vehicle)
+//
+// The raw token is deliberately NOT forwarded across the S2S boundary; resetURL
+// is the only token carrier so the raw secret never leaves the user service.
+// The idempotency key is a SHA-256 of the token so a duplicate notification
+// dispatch is safely deduplicated by the comms send log.
+func (m *CommsMailer) SendPasswordReset(ctx context.Context, to, token string) error {
+	resetURL := buildResetURL(m.cfg.AppBaseURL, token)
+
+	return m.sendEmail(ctx, &CommsSendRequest{
+		Channel:    "EMAIL",
+		To:         to,
+		TemplateID: "password_reset",
+		Locale:     "en",
+		Vars: map[string]string{
+			"resetURL": resetURL,
+			// Raw token is deliberately absent: resetURL is the canonical carrier.
+		},
+		IdempotencyKey: resetIdempotencyKey(token),
+	})
+}
+
+// sendEmail is the shared HTTP send helper. It marshals req, posts to the
+// comms /v1/comms/send endpoint with S2S auth headers, and returns an error
+// for any non-202 response. It is called by SendVerification and
+// SendPasswordReset to avoid duplicating the HTTP plumbing.
+func (m *CommsMailer) sendEmail(ctx context.Context, req *CommsSendRequest) error {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("comms mailer: marshal request: %w", err)
@@ -136,7 +165,7 @@ func (m *CommsMailer) SendVerification(ctx context.Context, to, token string) er
 
 	// Derive a child context from ctx (satisfies contextcheck) but cap it with the
 	// configured send timeout so a hung comms service does not block indefinitely.
-	// The caller (auth_service) already dispatches SendVerification from a
+	// The caller (auth_service) already dispatches sends from a
 	// context.Background()-derived detached goroutine (backend-security-design §goroutine).
 	sendCtx, cancel := context.WithTimeout(ctx, m.cfg.SendTimeout)
 	defer cancel()
@@ -185,6 +214,20 @@ func buildVerifyURL(baseURL, token string) string {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 
 	return fmt.Sprintf("%s/verify-email?token=%s", base, url.QueryEscape(token))
+}
+
+// buildResetURL constructs <baseURL>/reset-password?token=<token>.
+func buildResetURL(baseURL, token string) string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+
+	return fmt.Sprintf("%s/reset-password?token=%s", base, url.QueryEscape(token))
+}
+
+// resetIdempotencyKey builds a deterministic idempotency key for a reset token.
+func resetIdempotencyKey(token string) string {
+	h := sha256.Sum256([]byte(token))
+
+	return fmt.Sprintf("user:reset:%x", h[:8])
 }
 
 // idempotencyKey builds a deterministic idempotency key from the token so

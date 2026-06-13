@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/CoverOnes/user/internal/domain"
+	"github.com/CoverOnes/user/internal/store"
 	"github.com/google/uuid"
 )
 
@@ -32,6 +33,7 @@ type fakeUserStore struct {
 	enableMFAErr        error
 	disableMFAErr       error
 	setBackupCodesErr   error
+	setPasswordHashErr  error
 }
 
 func newFakeUserStore() *fakeUserStore {
@@ -198,6 +200,19 @@ func (f *fakeUserStore) SetMFABackupCodes(_ context.Context, id uuid.UUID, backu
 		return domain.ErrNotFound
 	}
 	u.MFABackupCodesEnc = backupCodesEnc
+
+	return nil
+}
+
+func (f *fakeUserStore) SetPasswordHash(_ context.Context, id uuid.UUID, hash string) error {
+	if f.setPasswordHashErr != nil {
+		return f.setPasswordHashErr
+	}
+	u, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	u.PasswordHash = &hash
 
 	return nil
 }
@@ -389,12 +404,17 @@ func (f *fakeVerificationStore) InvalidateForUser(_ context.Context, userID uuid
 
 // --- spyMailer ---
 
-// spyMailer records SendVerification calls so tests can assert send count +
+// spyMailer records Send* calls so tests can assert send count +
 // recipient without touching SMTP.
 type spyMailer struct {
-	sendErr    error
+	sendErr error
+	// verification fields
 	sentTo     []string
 	sentTokens []string
+	// reset fields
+	sentResetTo     []string
+	sentResetTokens []string
+	resetErr        error
 }
 
 func (m *spyMailer) SendVerification(_ context.Context, to, token string) error {
@@ -404,7 +424,113 @@ func (m *spyMailer) SendVerification(_ context.Context, to, token string) error 
 	return m.sendErr
 }
 
-func (m *spyMailer) sendCount() int { return len(m.sentTo) }
+func (m *spyMailer) SendPasswordReset(_ context.Context, to, token string) error {
+	m.sentResetTo = append(m.sentResetTo, to)
+	m.sentResetTokens = append(m.sentResetTokens, token)
+
+	if m.resetErr != nil {
+		return m.resetErr
+	}
+
+	return m.sendErr
+}
+
+func (m *spyMailer) sendCount() int      { return len(m.sentTo) }
+func (m *spyMailer) resetSendCount() int { return len(m.sentResetTo) }
+
+// --- fakePasswordResetTokenStore ---
+
+// fakePasswordResetTokenStore is an in-memory PasswordResetTokenStore for unit tests.
+type fakePasswordResetTokenStore struct {
+	byHash map[string]*domain.PasswordResetToken
+
+	createErr     error
+	getByHashErr  error
+	markUsedErr   error
+	invalidateErr error
+}
+
+func newFakePasswordResetTokenStore() *fakePasswordResetTokenStore {
+	return &fakePasswordResetTokenStore{
+		byHash: make(map[string]*domain.PasswordResetToken),
+	}
+}
+
+func (f *fakePasswordResetTokenStore) Create(_ context.Context, t *domain.PasswordResetToken) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
+
+	cp := *t
+	f.byHash[string(t.TokenHash)] = &cp
+
+	return nil
+}
+
+func (f *fakePasswordResetTokenStore) GetByHash(_ context.Context, tokenHash []byte) (*domain.PasswordResetToken, error) {
+	if f.getByHashErr != nil {
+		return nil, f.getByHashErr
+	}
+
+	t, ok := f.byHash[string(tokenHash)]
+	if !ok {
+		return nil, domain.ErrInvalidResetToken
+	}
+
+	cp := *t
+
+	return &cp, nil
+}
+
+func (f *fakePasswordResetTokenStore) MarkUsed(_ context.Context, id uuid.UUID, now time.Time) error {
+	if f.markUsedErr != nil {
+		return f.markUsedErr
+	}
+
+	for _, t := range f.byHash {
+		if t.ID == id {
+			if t.UsedAt != nil {
+				return domain.ErrInvalidResetToken
+			}
+
+			t.UsedAt = &now
+
+			return nil
+		}
+	}
+
+	return domain.ErrInvalidResetToken
+}
+
+func (f *fakePasswordResetTokenStore) InvalidateForUser(_ context.Context, userID uuid.UUID, now time.Time) error {
+	if f.invalidateErr != nil {
+		return f.invalidateErr
+	}
+
+	for _, t := range f.byHash {
+		if t.UserID == userID && t.UsedAt == nil {
+			t.UsedAt = &now
+		}
+	}
+
+	return nil
+}
+
+// --- fakeResetTx ---
+
+// fakeResetTx is a no-tx-support ResetTransactioner that executes fn sequentially
+// (mirrors fakeTransactioner pattern for unit tests).
+type fakeResetTx struct {
+	userStore  store.UserStore
+	resetStore store.PasswordResetTokenStore
+}
+
+func (f *fakeResetTx) WithResetTx(
+	ctx context.Context,
+	fn func(ctx context.Context, users store.UserStore, resets store.PasswordResetTokenStore) error,
+) error {
+	return fn(ctx, f.userStore, f.resetStore)
+}
 
 // --- fakeAuthIdentityStore ---
 

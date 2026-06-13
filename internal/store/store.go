@@ -26,6 +26,10 @@ type UserStore interface {
 	// at least Tier 1. Idempotent; returns ErrNotFound if no live row matches.
 	SetEmailVerified(ctx context.Context, id uuid.UUID) error
 
+	// SetPasswordHash replaces the stored password hash for the given user.
+	// Returns ErrNotFound if no live row matches.
+	SetPasswordHash(ctx context.Context, id uuid.UUID, hash string) error
+
 	// SetPendingTOTPSecret stores the (encrypted) PENDING TOTP secret for enroll,
 	// WITHOUT enabling MFA. Overwrites any prior pending/active secret so a re-enroll
 	// supersedes the previous one. Returns ErrNotFound if no live row matches.
@@ -109,6 +113,26 @@ type AuthIdentityStore interface {
 	// DeleteByUserAndProvider removes a single identity row.
 	// Returns domain.ErrNotFound when no matching row exists.
 	DeleteByUserAndProvider(ctx context.Context, userID uuid.UUID, provider string) error
+}
+
+// PasswordResetTokenStore defines DB operations for single-use password-reset tokens.
+// Only the SHA-256 hash of a token is ever stored.
+type PasswordResetTokenStore interface {
+	// Create inserts a new (hashed) password-reset token row.
+	Create(ctx context.Context, t *domain.PasswordResetToken) error
+
+	// GetByHash fetches a token row by its SHA-256 hash. Returns
+	// ErrInvalidResetToken when no row matches (no oracle).
+	GetByHash(ctx context.Context, tokenHash []byte) (*domain.PasswordResetToken, error)
+
+	// MarkUsed atomically sets used_at on the token row IFF it is still unused
+	// (used_at IS NULL). Returns ErrInvalidResetToken when the row was already used
+	// (atomic single-use guard — prevents a concurrent double-reset race).
+	MarkUsed(ctx context.Context, id uuid.UUID, now time.Time) error
+
+	// InvalidateForUser marks all of a user's outstanding (unused) tokens as used
+	// so a new forgot-password request supersedes prior tokens.
+	InvalidateForUser(ctx context.Context, userID uuid.UUID, now time.Time) error
 }
 
 // IssueTokensInput groups the parameters needed to atomically create a new token pair.

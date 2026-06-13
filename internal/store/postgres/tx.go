@@ -68,6 +68,45 @@ func (m *TxManager) WithTx(
 	return nil
 }
 
+// WithResetTx runs fn inside a single DB transaction that touches only the
+// users store and the password-reset-token store. It is intentionally narrower
+// than WithTx (which also carries companies + email verifications) so that the
+// password-reset critical path (MarkUsed + SetPasswordHash + BumpTokenVersion)
+// cannot accidentally mutate unrelated tables.
+func (m *TxManager) WithResetTx(
+	ctx context.Context,
+	fn func(
+		ctx context.Context,
+		users store.UserStore,
+		resets store.PasswordResetTokenStore,
+	) error,
+) error {
+	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin reset transaction: %w", err)
+	}
+
+	defer func() {
+		// Rollback is a no-op after Commit.
+		if rbErr := tx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			_ = rbErr
+		}
+	}()
+
+	txUsers := &txUserStore{tx: tx}
+	txResets := &txPasswordResetStore{tx: tx}
+
+	if fnErr := fn(ctx, txUsers, txResets); fnErr != nil {
+		return fnErr
+	}
+
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		return fmt.Errorf("commit reset transaction: %w", commitErr)
+	}
+
+	return nil
+}
+
 // txExecer is the minimal interface satisfied by both pgx.Tx and pgxpool.Pool.
 type txExecer interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
@@ -272,6 +311,25 @@ func (s *txUserStore) SetMFABackupCodes(ctx context.Context, id uuid.UUID, backu
 	tag, err := s.tx.Exec(ctx, q, id, backupCodesEnc)
 	if err != nil {
 		return fmt.Errorf("set mfa backup codes (tx): %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+
+	return nil
+}
+
+func (s *txUserStore) SetPasswordHash(ctx context.Context, id uuid.UUID, hash string) error {
+	q := `
+	UPDATE users
+	SET password_hash = $2, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL
+	`
+
+	tag, err := s.tx.Exec(ctx, q, id, hash)
+	if err != nil {
+		return fmt.Errorf("set password hash (tx): %w", err)
 	}
 
 	if tag.RowsAffected() == 0 {

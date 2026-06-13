@@ -107,3 +107,17 @@ tasks:
           DELETE FROM email_verification_tokens
           WHERE expires_at < now() - INTERVAL '7 days';
         "
+
+  "db:gc:password-reset-tokens":
+    desc: |
+      Retention GC for password_reset_tokens (backend-security-design §1.3).
+      Deletes rows whose expires_at is older than 7 days, leaving a short forensic
+      grace window past expiry (30 min TTL + 7 day grace). Run periodically via
+      cron or manually.
+      Requires USER_POSTGRES_DSN to be set in the environment.
+    cmds:
+      - |
+        psql "$USER_POSTGRES_DSN" -v ON_ERROR_STOP=1 -c "
+          DELETE FROM password_reset_tokens
+          WHERE expires_at < now() - INTERVAL '7 days';
+        "

@@ -265,3 +265,58 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 
 	httpx.NoContent(c)
 }
+
+// ForgotPasswordRequest is the forgot-password endpoint request body.
+type ForgotPasswordRequest struct {
+	Email string `json:"email" binding:"required,email,max=254"`
+}
+
+// forgotPasswordMessage is the constant, enumeration-safe response message.
+//
+//nolint:gosec // G101 false positive: this is a UI response message, not a credential or password value
+const forgotPasswordMessage = "If an account exists for that email, a password reset link has been sent."
+
+// ForgotPassword handles POST /v1/auth/forgot-password.
+// ALWAYS returns 202 with a constant message regardless of account existence or
+// state (no enumeration). The actual send (if any) happens in the service.
+func (h *AuthHandler) ForgotPassword(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
+	var req ForgotPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	// Fire-and-forget at the response level: the service swallows all outcomes so
+	// the response is identical whether or not anything was sent.
+	h.auth.ForgotPassword(c.Request.Context(), req.Email)
+
+	httpx.Accepted(c, gin.H{"message": forgotPasswordMessage})
+}
+
+// ResetPasswordRequest is the reset-password endpoint request body.
+type ResetPasswordRequest struct {
+	Token       string `json:"token" binding:"required,max=512"`
+	NewPassword string `json:"newPassword" binding:"required,min=12,max=128"`
+}
+
+// ResetPassword handles POST /v1/auth/reset-password.
+// Returns 200 {"reset":true} on success, 400 INVALID_RESET_TOKEN on bad/expired
+// token, 422 WEAK_PASSWORD if the new password is too weak.
+func (h *AuthHandler) ResetPassword(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
+	var req ResetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	if err := h.auth.ResetPassword(c.Request.Context(), req.Token, req.NewPassword); err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, gin.H{"reset": true})
+}
