@@ -27,11 +27,13 @@ const (
 		WHERE token_hash = $1`
 
 	// resetMarkUsedSQL is atomic single-use: it only updates rows where used_at IS
-	// NULL, so two concurrent resets cannot both succeed.
+	// NULL AND expires_at > $2 (same now timestamp), so two concurrent resets
+	// cannot both succeed and an expired token cannot slip through a sub-ms window
+	// between the service-layer expiry check and the DB write.
 	resetMarkUsedSQL = `
 		UPDATE password_reset_tokens
 		SET used_at = $2
-		WHERE id = $1 AND used_at IS NULL`
+		WHERE id = $1 AND used_at IS NULL AND expires_at > $2`
 
 	resetInvalidateForUserSQL = `
 		UPDATE password_reset_tokens

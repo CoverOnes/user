@@ -137,6 +137,22 @@ func TestPasswordResetStore_Integration(t *testing.T) {
 		assert.NotNil(t, got2.UsedAt, "prior token 2 must be invalidated")
 	})
 
+	t.Run("mark used on expired token returns ErrInvalidResetToken (atomic expiry guard)", func(t *testing.T) {
+		// Token whose expires_at is in the past — the SQL CAS (AND expires_at > $2)
+		// must reject it atomically even if used_at IS NULL.
+		rt := &domain.PasswordResetToken{
+			ID:        uuid.New(),
+			UserID:    uuid.New(),
+			TokenHash: hashReset("raw-reset-expired-atomic"),
+			ExpiresAt: time.Now().UTC().Add(-1 * time.Minute), // already expired
+			CreatedAt: time.Now().UTC().Add(-31 * time.Minute),
+		}
+		require.NoError(t, rs.Create(ctx, rt))
+
+		err := rs.MarkUsed(ctx, rt.ID, time.Now().UTC())
+		require.ErrorIs(t, err, domain.ErrInvalidResetToken, "MarkUsed on expired token must return ErrInvalidResetToken (0 rows updated)")
+	})
+
 	t.Run("duplicate token_hash rejected by unique index", func(t *testing.T) {
 		rt := &domain.PasswordResetToken{
 			ID:        uuid.New(),

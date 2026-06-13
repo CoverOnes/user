@@ -1031,6 +1031,10 @@ func (s *AuthService) ResetPassword(ctx context.Context, rawToken, newPassword s
 				return txErr
 			}
 
+			// Audit log inside the tx closure so it is emitted on every
+			// successful reset — including the production tx path.
+			slog.Info("auth.password_reset", "userId", rt.UserID)
+
 			return nil
 		})
 	}
