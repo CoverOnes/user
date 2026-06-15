@@ -115,6 +115,13 @@ type Config struct {
 	// Sourced from USER_COMMS_S2S_TOKEN (env-only, never committed).
 	CommsS2SToken string `mapstructure:"comms_s2s_token"`
 
+	// KycS2SToken is the shared bearer token that the kyc service presents when
+	// calling the S2S identity-match endpoint (POST /internal/v1/users/:id/verify-identity-match).
+	// When non-empty the endpoint is registered; when empty it is not registered (404).
+	// In non-dev, must be at least minKycS2STokenLen characters.
+	// Sourced from USER_KYC_S2S_TOKEN.
+	KycS2SToken string `mapstructure:"kyc_s2s_token"`
+
 	// GatewayHMACSecret is the shared secret used to verify the gateway-origin
 	// identity signature (conventions §24.1). It MUST equal the gateway's
 	// GATEWAY_HMAC_SECRET. Non-dev (production/staging) fails fast at boot if
@@ -228,6 +235,7 @@ func Load() (*Config, error) {
 		"mailer_backend":                "USER_MAILER_BACKEND",
 		"comms_base_url":                "USER_COMMS_BASE_URL",
 		"comms_s2s_token":               "USER_COMMS_S2S_TOKEN",
+		"kyc_s2s_token":                 "USER_KYC_S2S_TOKEN",
 		"access_token_ttl_sec":          "USER_ACCESS_TOKEN_TTL_SEC",
 		"refresh_token_ttl_hours":       "USER_REFRESH_TOKEN_TTL_HOURS",
 		"mfa_enforced":                  "USER_MFA_ENFORCED",
@@ -282,6 +290,7 @@ func (c *Config) validate() error {
 	errs = append(errs, c.validateDB()...)
 	errs = append(errs, c.validateUserRateLimit()...)
 	errs = append(errs, c.validateOAuth()...)
+	errs = append(errs, c.validateKycS2SToken()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -569,6 +578,25 @@ func (c *Config) validateCommsBackend() []string {
 	}
 
 	return errs
+}
+
+// minKycS2STokenLen is the minimum length of the USER_KYC_S2S_TOKEN bearer secret
+// when set in non-dev. Mirrors minCommsS2STokenLen.
+const minKycS2STokenLen = 24
+
+// validateKycS2SToken enforces a minimum length for USER_KYC_S2S_TOKEN when set.
+// An empty token means the S2S identity-match endpoint is not registered (fine).
+// When non-empty in non-dev, the token must be at least minKycS2STokenLen characters.
+func (c *Config) validateKycS2SToken() []string {
+	if c.KycS2SToken == "" {
+		return nil
+	}
+
+	if !c.IsDev() && len(strings.TrimSpace(c.KycS2SToken)) < minKycS2STokenLen {
+		return []string{fmt.Sprintf("USER_KYC_S2S_TOKEN must be at least %d characters when set", minKycS2STokenLen)}
+	}
+
+	return nil
 }
 
 // validateDB checks Postgres schema and connection-pool sizing fields.

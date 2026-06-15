@@ -262,6 +262,12 @@ func run() error {
 		UserRateLimitPerMin:       cfg.UserRateLimitPerMin,
 		UserRateLimitBurst:        cfg.UserRateLimitBurst,
 		OAuthFrontendPostLoginURL: cfg.OAuthFrontendPostLoginURL,
+		// S2S identity-match endpoint for kyc service (USER_KYC_S2S_TOKEN).
+		// KycUserStore and KycEncryptor reuse the same pool and PII key so there
+		// is no additional credential requirement beyond what is already wired.
+		KycS2SToken:  cfg.KycS2SToken,
+		KycEncryptor: encryptor,
+		KycUserStore: userStore,
 	})
 
 	srv := &http.Server{
