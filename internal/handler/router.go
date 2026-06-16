@@ -6,9 +6,11 @@ import (
 	"time"
 
 	"github.com/CoverOnes/user/internal/auth/jwt"
+	"github.com/CoverOnes/user/internal/crypto/pii"
 	"github.com/CoverOnes/user/internal/platform/health"
 	"github.com/CoverOnes/user/internal/platform/middleware"
 	"github.com/CoverOnes/user/internal/service"
+	"github.com/CoverOnes/user/internal/store"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -41,6 +43,20 @@ type RouterConfig struct {
 	// OAuthFrontendPostLoginURL is passed to OAuthHandler for callback redirects.
 	// Required when OAuth != nil.
 	OAuthFrontendPostLoginURL string
+
+	// KycS2SToken is the bearer token the kyc service presents on the S2S
+	// identity-match endpoint. When non-empty, POST /internal/v1/users/:userId/verify-identity-match
+	// is registered. When empty, the endpoint is not registered.
+	// Source: config.KycS2SToken (USER_KYC_S2S_TOKEN).
+	KycS2SToken string
+
+	// KycEncryptor is the PII encryptor used by the identity-match endpoint.
+	// Must be non-nil when KycS2SToken is non-empty.
+	KycEncryptor *pii.Encryptor
+
+	// KycUserStore is the user store used by the identity-match endpoint.
+	// Must be non-nil when KycS2SToken is non-empty.
+	KycUserStore store.UserStore
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -178,6 +194,18 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 		totp.POST("/disable", mfaCodeRL.Handler(), mfaH.Disable)
 		// DELETE alias for disable (same {code}-verified semantics + same code limiter).
 		totp.DELETE("", mfaCodeRL.Handler(), mfaH.Disable)
+	}
+
+	// Internal S2S identity-match endpoint for the kyc service.
+	// Registered only when USER_KYC_S2S_TOKEN is set; otherwise the endpoint returns 404.
+	if cfg.KycS2SToken != "" {
+		matchH := NewIdentityMatchHandler(cfg.KycUserStore, cfg.KycEncryptor)
+		internal := r.Group("/internal/v1/users")
+		internal.Use(middleware.RequireServiceIdentity(cfg.KycS2SToken))
+		// NoCache prevents any intermediate proxy / CDN from caching identity-match responses.
+		// Identity match results are user-specific and must never be shared across callers.
+		internal.Use(middleware.NoCache())
+		internal.POST("/:userId/verify-identity-match", matchH.VerifyIdentityMatch)
 	}
 
 	return r

@@ -629,6 +629,9 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 // testCommsS2SToken is a valid 32-char test token — not a real credential.
 const testCommsS2SToken = "0123456789abcdef0123456789abcdef"
 
+// testKycS2SToken is a valid 32-char placeholder kyc S2S token — not a real credential.
+const testKycS2SToken = "kyc-service-s2s-token-0123456789a" //nolint:gosec // G101: test fixture placeholder, not a real credential
+
 // setBaseCommsEnv configures the minimal production environment with
 // USER_MAILER_BACKEND=comms, so individual tests can vary comms-specific fields.
 func setBaseCommsEnv(t *testing.T) {
@@ -891,6 +894,89 @@ func TestLoad_DevConstantDenylist(t *testing.T) {
 
 			for k, v := range tc.envOverride {
 				t.Setenv(k, v)
+			}
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errContains)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestLoad_KycS2SToken validates USER_KYC_S2S_TOKEN enforcement.
+// When absent, the endpoint is simply not registered — no error.
+// When present in non-dev, must be at least minKycS2STokenLen characters.
+func TestLoad_KycS2SToken(t *testing.T) {
+	tests := []struct {
+		name        string
+		env         string
+		token       string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:    "absent in dev: allowed (endpoint not registered)",
+			env:     envDevelopment,
+			token:   "",
+			wantErr: false,
+		},
+		{
+			name:    "absent in prod: allowed (endpoint not registered)",
+			env:     envProduction,
+			token:   "",
+			wantErr: false,
+		},
+		{
+			name:        "non-dev too-short token rejected",
+			env:         envProduction,
+			token:       "too-short",
+			wantErr:     true,
+			errContains: "USER_KYC_S2S_TOKEN must be at least",
+		},
+		{
+			name:    "non-dev valid token accepted",
+			env:     envProduction,
+			token:   testKycS2SToken,
+			wantErr: false,
+		},
+		{
+			name:    "dev short token allowed",
+			env:     envDevelopment,
+			token:   "short",
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env == envProduction {
+				setEnv(
+					t,
+					"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+					"USER_PORT", "8080",
+					"USER_LOG_LEVEL", "INFO",
+					"USER_ENV", envProduction,
+					"USER_JWT_PRIVATE_KEY", "dGVzdC1zZWVkLTMyLWJ5dGVzLXh4eHh4eHh4eHg=",
+					"EVENT_HMAC_SECRET", "this-is-a-32-byte-test-secret-xx",
+					"USER_GATEWAY_HMAC_SECRET", testGatewayHMACSecret,
+				)
+				setProdSecrets(t)
+			} else {
+				setEnv(
+					t,
+					"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+					"USER_PORT", "8080",
+					"USER_LOG_LEVEL", "INFO",
+					"USER_ENV", envDevelopment,
+				)
+			}
+
+			if tc.token != "" {
+				t.Setenv("USER_KYC_S2S_TOKEN", tc.token)
 			}
 
 			_, err := config.Load()
