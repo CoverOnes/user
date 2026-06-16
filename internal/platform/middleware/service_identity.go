@@ -14,6 +14,10 @@ import (
 //
 // Security:
 //   - Uses subtle.ConstantTimeCompare to prevent timing side-channels.
+//   - The expected token is trimmed of surrounding whitespace at construction time (once),
+//     but the submitted header is compared RAW — trimming the submitted value before comparison
+//     would leak the token length via timing (a caller submitting " token" would reveal that
+//     "token" is the correct length).
 //   - Returns 401 without revealing whether the token is wrong vs absent.
 //   - Tokens are NEVER logged (only "service authentication required" generic message).
 func RequireServiceIdentity(expectedToken string) gin.HandlerFunc {
@@ -21,10 +25,14 @@ func RequireServiceIdentity(expectedToken string) gin.HandlerFunc {
 		panic("middleware: RequireServiceIdentity called with empty expectedToken — route must not be registered when token is absent")
 	}
 
-	expected := []byte(expectedToken)
+	// Trim the expected token ONCE at construction to avoid operator misconfiguration;
+	// the submitted header is compared without trimming to prevent length-leak.
+	expected := []byte(strings.TrimSpace(expectedToken))
 
 	return func(c *gin.Context) {
-		token := strings.TrimSpace(c.GetHeader("X-Service-Token"))
+		// Do NOT trim the submitted header — comparing a trimmed submitted value leaks
+		// the token length via timing side-channel (CWE-208).
+		token := c.GetHeader("X-Service-Token")
 		if subtle.ConstantTimeCompare([]byte(token), expected) != 1 {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"error": gin.H{

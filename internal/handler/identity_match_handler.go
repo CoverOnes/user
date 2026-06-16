@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"crypto/subtle"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -44,6 +45,9 @@ func NewIdentityMatchHandler(users store.UserStore, encryptor *pii.Encryptor) *I
 //
 // Returns {idMatch:bool, nameMatch:bool}. Decrypted PII NEVER leaves this handler.
 func (h *IdentityMatchHandler) VerifyIdentityMatch(c *gin.Context) {
+	// Body limit: cap at maxBodyBytes (1 MiB) before binding to prevent DoS.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
 	userIDStr := c.Param("userId")
 
 	userID, err := uuid.Parse(userIDStr)
@@ -80,7 +84,7 @@ func (h *IdentityMatchHandler) VerifyIdentityMatch(c *gin.Context) {
 	idMatch := matchNationalID(h.encryptor, u.NationalIDEnc, req.NationalID)
 	nameMatch := matchLegalName(h.encryptor, u.LegalNameEnc, req.LegalName)
 
-	slog.Info(
+	slog.Debug(
 		"identity match checked",
 		"user_id", userID,
 		"id_match", idMatch,
@@ -94,7 +98,8 @@ func (h *IdentityMatchHandler) VerifyIdentityMatch(c *gin.Context) {
 	})
 }
 
-// matchNationalID decrypts the stored national_id ciphertext and compares byte-exact.
+// matchNationalID decrypts the stored national_id ciphertext and compares byte-exact
+// using constant-time comparison to prevent timing side-channel leaks.
 // Returns false on decryption failure (wrong key / no PII set / ciphertext tampered).
 // The decrypted plaintext is never exposed outside this function.
 func matchNationalID(enc *pii.Encryptor, ciphertext []byte, candidate string) bool {
@@ -109,11 +114,13 @@ func matchNationalID(enc *pii.Encryptor, ciphertext []byte, candidate string) bo
 		return false
 	}
 
-	return plaintext == candidate
+	return subtle.ConstantTimeCompare([]byte(plaintext), []byte(candidate)) == 1
 }
 
-// matchLegalName decrypts the stored legal_name ciphertext and compares with normalization:
-// both sides are Unicode-NFC-normalized, then whitespace-trimmed and collapsed.
+// matchLegalName decrypts the stored legal_name ciphertext and compares with normalization
+// using constant-time comparison to prevent timing side-channel leaks.
+// Both sides are Unicode-NFC-normalized (not NFKC — NFC preserves full-width CJK characters
+// that are legally significant on Taiwan government documents), then whitespace-trimmed and collapsed.
 // Returns false on decryption failure.
 // The decrypted plaintext is never exposed outside this function.
 func matchLegalName(enc *pii.Encryptor, ciphertext []byte, candidate string) bool {
@@ -127,11 +134,15 @@ func matchLegalName(enc *pii.Encryptor, ciphertext []byte, candidate string) boo
 		return false
 	}
 
-	return normalizeName(plaintext) == normalizeName(candidate)
+	a := normalizeName(plaintext)
+	b := normalizeName(candidate)
+
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 // normalizeName applies NFC unicode normalization then collapses whitespace.
-// This makes "王 小明" == "王小明" and handles different Unicode representations.
+// NFC is used (not NFKC) to preserve full-width CJK characters that are legally
+// significant on Taiwan government-issued identity documents.
 func normalizeName(s string) string {
 	nfc := norm.NFC.String(s)
 	return strings.Join(strings.FieldsFunc(nfc, unicode.IsSpace), " ")

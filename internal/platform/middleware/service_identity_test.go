@@ -67,9 +67,10 @@ func TestRequireServiceIdentity(t *testing.T) {
 			wantStatus:  http.StatusUnauthorized,
 		},
 		{
-			name:        "token with leading whitespace still passes (header trimmed)",
+			name: "token with surrounding whitespace returns 401 (submitted header is not trimmed" +
+				" — trimming would leak token length via timing)",
 			headerValue: "  " + expectedToken + "  ",
-			wantStatus:  http.StatusOK,
+			wantStatus:  http.StatusUnauthorized,
 		},
 		{
 			name:        "empty string in header returns 401",

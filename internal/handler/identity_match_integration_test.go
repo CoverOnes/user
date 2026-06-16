@@ -276,6 +276,12 @@ func TestVerifyIdentityMatch_Integration(t *testing.T) {
 
 			assert.Equal(t, *tc.wantIDMatch, envelope.Data["idMatch"], "idMatch mismatch for %q", tc.name)
 			assert.Equal(t, *tc.wantNameMatch, envelope.Data["nameMatch"], "nameMatch mismatch for %q", tc.name)
+
+			// PII non-leak: decrypted national_id and legal_name MUST NOT appear in
+			// any 200 response body — only boolean results are returned.
+			body := resp.Body.String()
+			assert.NotContains(t, body, "A123456789", "response must not contain plaintext national_id")
+			assert.NotContains(t, body, "王小明", "response must not contain plaintext legal_name")
 		})
 	}
 }

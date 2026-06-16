@@ -202,6 +202,9 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 		matchH := NewIdentityMatchHandler(cfg.KycUserStore, cfg.KycEncryptor)
 		internal := r.Group("/internal/v1/users")
 		internal.Use(middleware.RequireServiceIdentity(cfg.KycS2SToken))
+		// NoCache prevents any intermediate proxy / CDN from caching identity-match responses.
+		// Identity match results are user-specific and must never be shared across callers.
+		internal.Use(middleware.NoCache())
 		internal.POST("/:userId/verify-identity-match", matchH.VerifyIdentityMatch)
 	}
 

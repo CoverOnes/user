@@ -581,19 +581,32 @@ func (c *Config) validateCommsBackend() []string {
 }
 
 // minKycS2STokenLen is the minimum length of the USER_KYC_S2S_TOKEN bearer secret
-// when set in non-dev. Mirrors minCommsS2STokenLen.
-const minKycS2STokenLen = 24
+// when set in non-dev. 32 characters = 192 bits of entropy minimum.
+const minKycS2STokenLen = 32
+
+// devKycS2SToken is the well-known development placeholder for USER_KYC_S2S_TOKEN.
+// Any non-dev deployment that boots with this value uses a compromised S2S secret.
+//
+//nolint:gosec // G101: this constant is the known-bad value being BLOCKED, not a real credential.
+const devKycS2SToken = "dev-kyc-s2s-token-replace-in-prod"
 
 // validateKycS2SToken enforces a minimum length for USER_KYC_S2S_TOKEN when set.
 // An empty token means the S2S identity-match endpoint is not registered (fine).
-// When non-empty in non-dev, the token must be at least minKycS2STokenLen characters.
+// When non-empty in non-dev, the token must be at least minKycS2STokenLen characters
+// and must not be the well-known development placeholder.
 func (c *Config) validateKycS2SToken() []string {
 	if c.KycS2SToken == "" {
 		return nil
 	}
 
-	if !c.IsDev() && len(strings.TrimSpace(c.KycS2SToken)) < minKycS2STokenLen {
-		return []string{fmt.Sprintf("USER_KYC_S2S_TOKEN must be at least %d characters when set", minKycS2STokenLen)}
+	if !c.IsDev() {
+		if c.KycS2SToken == devKycS2SToken {
+			return []string{"USER_KYC_S2S_TOKEN must not be the development placeholder in non-dev environments"}
+		}
+
+		if len(strings.TrimSpace(c.KycS2SToken)) < minKycS2STokenLen {
+			return []string{fmt.Sprintf("USER_KYC_S2S_TOKEN must be at least %d characters when set", minKycS2STokenLen)}
+		}
 	}
 
 	return nil
