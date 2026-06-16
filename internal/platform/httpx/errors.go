@@ -61,6 +61,7 @@ type errMapping struct {
 var fixedErrorMappings = []errMapping{
 	{domain.ErrNotFound, "USER_NOT_FOUND", http.StatusNotFound, "user not found"},
 	{domain.ErrEmailTaken, "EMAIL_TAKEN", http.StatusConflict, "email is already registered"},
+	{domain.ErrHandleTaken, "HANDLE_TAKEN", http.StatusConflict, "handle is already taken"},
 	{domain.ErrInvalidCredentials, "INVALID_CREDENTIALS", http.StatusUnauthorized, "invalid email or password"},
 	{domain.ErrLoginRateLimited, "RATE_LIMITED", http.StatusTooManyRequests, "too many login attempts, please try again later"},
 	{domain.ErrAccountSuspended, "ACCOUNT_SUSPENDED", http.StatusForbidden, "account is suspended"},

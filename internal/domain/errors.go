@@ -6,6 +6,7 @@ import "errors"
 var (
 	ErrNotFound            = errors.New("not found")
 	ErrEmailTaken          = errors.New("email already taken")
+	ErrHandleTaken         = errors.New("handle already taken")
 	ErrInvalidCredentials  = errors.New("invalid credentials")
 	ErrAccountSuspended    = errors.New("account suspended")
 	ErrLoginRateLimited    = errors.New("too many login attempts")

@@ -10,12 +10,31 @@ import (
 	"github.com/google/uuid"
 )
 
+// ProfileUpdate is the full editable public-profile field set written by
+// UpdateProfile. DisplayName is always replaced; the *string fields are written
+// as-is (nil clears the column to NULL — the PUT contract is a full replace of
+// editable fields). Handle is expected to be already validated + lowercased by
+// the service layer; the DB partial-unique index is the race-safe authority on
+// uniqueness (a 23505 violation maps to domain.ErrHandleTaken).
+type ProfileUpdate struct {
+	DisplayName string
+	Handle      *string
+	Headline    *string
+	Bio         *string
+	Location    *string
+	AvatarURL   *string
+	CoverURL    *string
+}
+
 // UserStore defines DB operations for user records.
 type UserStore interface {
 	Create(ctx context.Context, u *domain.User) error
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error)
 	GetByEmail(ctx context.Context, email string) (*domain.User, error)
-	UpdateProfile(ctx context.Context, id uuid.UUID, displayName string, avatarURL *string) error
+	// UpdateProfile replaces the editable public-profile fields for a live user.
+	// Returns domain.ErrHandleTaken on a handle uniqueness violation and
+	// domain.ErrNotFound when no live row matches.
+	UpdateProfile(ctx context.Context, id uuid.UUID, in ProfileUpdate) error
 	// UpdateKYCTier sets kyc_tier for the given user (called by the Redis consumer on kyc.tier_changed).
 	UpdateKYCTier(ctx context.Context, id uuid.UUID, tier int16) error
 	// BumpTokenVersion atomically increments token_version and returns the new value.

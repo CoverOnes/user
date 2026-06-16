@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/CoverOnes/user/internal/handler"
 	"github.com/CoverOnes/user/internal/platform/middleware"
 	"github.com/CoverOnes/user/internal/service"
+	"github.com/CoverOnes/user/internal/store"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -67,14 +69,31 @@ func (f *fakeUserStore) GetByEmail(_ context.Context, email string) (*domain.Use
 	return u, nil
 }
 
-func (f *fakeUserStore) UpdateProfile(_ context.Context, id uuid.UUID, displayName string, avatarURL *string) error {
-	for _, u := range f.users {
-		if u.ID == id {
-			u.DisplayName = displayName
-			u.AvatarURL = avatarURL
-
-			return nil
+func (f *fakeUserStore) UpdateProfile(_ context.Context, id uuid.UUID, in store.ProfileUpdate) error {
+	// Mirror the Postgres partial-unique index: a non-nil handle already held by a
+	// DIFFERENT live user yields ErrHandleTaken (case-insensitive).
+	if in.Handle != nil {
+		for _, other := range f.users {
+			if other.ID != id && other.Handle != nil && strings.EqualFold(*other.Handle, *in.Handle) {
+				return domain.ErrHandleTaken
+			}
 		}
+	}
+
+	for _, u := range f.users {
+		if u.ID != id {
+			continue
+		}
+
+		u.DisplayName = in.DisplayName
+		u.Handle = in.Handle
+		u.Headline = in.Headline
+		u.Bio = in.Bio
+		u.Location = in.Location
+		u.AvatarURL = in.AvatarURL
+		u.CoverURL = in.CoverURL
+
+		return nil
 	}
 
 	return domain.ErrNotFound
