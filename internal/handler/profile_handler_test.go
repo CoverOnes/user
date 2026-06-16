@@ -326,6 +326,85 @@ func TestProfileHandler_Update_InvalidHandleValidationError(t *testing.T) {
 	assert.Equal(t, "VALIDATION_ERROR", errCode(t, w))
 }
 
+// TestProfileHandler_Update_ControlCharsRejected is the M-2 HTTP-boundary guard:
+// stored free-text fields carrying a null byte, a C0 control char, or an ANSI
+// escape sequence MUST be rejected with 400 VALIDATION_ERROR (backend-security
+// §5.4 — prevents stored-XSS / log-injection / terminal-hijack downstream).
+func TestProfileHandler_Update_ControlCharsRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		body handler.UpdateProfileRequest
+	}{
+		{
+			name: "null byte in displayName",
+			body: handler.UpdateProfileRequest{DisplayName: "Eve\x00il"},
+		},
+		{
+			name: "control char in headline",
+			body: handler.UpdateProfileRequest{DisplayName: "Valid", Headline: strp("Lead\x07Eng")},
+		},
+		{
+			name: "ANSI escape in bio",
+			body: handler.UpdateProfileRequest{DisplayName: "Valid", Bio: strp("hi\x1b[31mred")},
+		},
+		{
+			name: "newline in location",
+			body: handler.UpdateProfileRequest{DisplayName: "Valid", Location: strp("Taipei\nTaiwan")},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r, signer, store := buildProfileRouter(t)
+			u := seedProfileUser(t, store, nil)
+
+			token, err := signer.Issue(u.ID.String(), domain.AccountTypePersonal, u.KYCTier, 0, true)
+			require.NoError(t, err)
+
+			w := putMyProfile(t, r, token, tc.body)
+			require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+			assert.Equal(t, "VALIDATION_ERROR", errCode(t, w))
+		})
+	}
+}
+
+// TestProfileHandler_Update_InternalHostURLRejected is the S-1 HTTP-boundary guard:
+// avatarUrl / coverUrl pointing at an IP-literal internal/metadata host MUST be
+// rejected with 400 VALIDATION_ERROR (defense-in-depth against future SSRF).
+func TestProfileHandler_Update_InternalHostURLRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		body handler.UpdateProfileRequest
+	}{
+		{
+			name: "coverUrl cloud metadata IP",
+			body: handler.UpdateProfileRequest{DisplayName: "Valid", CoverURL: strp("https://169.254.169.254/x")},
+		},
+		{
+			name: "avatarUrl private RFC1918 IP",
+			body: handler.UpdateProfileRequest{DisplayName: "Valid", AvatarURL: strp("https://10.0.0.1/x")},
+		},
+		{
+			name: "avatarUrl IPv6 loopback literal",
+			body: handler.UpdateProfileRequest{DisplayName: "Valid", AvatarURL: strp("https://[::1]/x")},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r, signer, store := buildProfileRouter(t)
+			u := seedProfileUser(t, store, nil)
+
+			token, err := signer.Issue(u.ID.String(), domain.AccountTypePersonal, u.KYCTier, 0, true)
+			require.NoError(t, err)
+
+			w := putMyProfile(t, r, token, tc.body)
+			require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+			assert.Equal(t, "VALIDATION_ERROR", errCode(t, w))
+		})
+	}
+}
+
 func keysOf(m map[string]any) []string {
 	ks := make([]string, 0, len(m))
 	for k := range m {

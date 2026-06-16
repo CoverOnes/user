@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -83,6 +84,13 @@ func (s *ProfileService) UpdateProfile(ctx context.Context, in *UpdateProfileInp
 	if len([]rune(name)) < 1 || len([]rune(name)) > 80 {
 		// F7: use ErrValidation for input validation, not ErrInvalidCredentials (which maps to 401).
 		return nil, fmt.Errorf("%w: displayName must be 1-80 characters", domain.ErrValidation)
+	}
+	// M-2: reject control chars / null bytes / ANSI escapes in stored free-text
+	// (backend-security §5.4). displayName is rendered in web UI, CLI listings and
+	// logs by consumers; untrusted control chars enable stored-XSS, log-injection
+	// and terminal-hijack downstream.
+	if err := rejectControlChars("displayName", name); err != nil {
+		return nil, err
 	}
 
 	handle, err := normalizeHandle(in.Handle)
@@ -180,7 +188,38 @@ func validateOptionalText(field string, raw *string, maxLen int) (*string, error
 		return nil, fmt.Errorf("%w: %s must be at most %d characters", domain.ErrValidation, field, maxLen)
 	}
 
+	// M-2: reject control chars / null bytes / ANSI escapes (backend-security §5.4).
+	if err := rejectControlChars(field, v); err != nil {
+		return nil, err
+	}
+
 	return &v, nil
+}
+
+// rejectControlChars enforces that a stored free-text field contains no characters
+// that are unsafe to push to downstream consumers (web UI / CLI listings / logs):
+// null bytes, C0 control chars (< 0x20) other than TAB, the DEL char (0x7f), and
+// the ANSI escape introducer (0x1b). This is the backend-security §5.4 sanitization
+// applied to every stored profile free-text field (displayName, headline, bio,
+// location). It does NOT alter the value — it rejects with domain.ErrValidation so
+// the client sees a clear 400 rather than silently mangled data. Newline (\n),
+// carriage return (\r) and the null byte are all < 0x20 and thus covered here.
+func rejectControlChars(field, v string) error {
+	for _, r := range v {
+		switch {
+		case r == '\t':
+			// Tab is the single allowed C0 control char.
+			continue
+		case r == 0x1b:
+			// ANSI escape introducer — terminal-hijack vector.
+			return fmt.Errorf("%w: %s contains control characters", domain.ErrValidation, field)
+		case r < 0x20 || r == 0x7f:
+			// C0 controls (incl. \x00, \r, \n) and DEL.
+			return fmt.Errorf("%w: %s contains control characters", domain.ErrValidation, field)
+		}
+	}
+
+	return nil
 }
 
 // validateOptionalImageURL trims an optional image URL and validates it against the
@@ -211,6 +250,18 @@ func validateOptionalImageURL(field string, raw *string) (*string, error) {
 //   - http is allowed only for localhost / 127.0.0.1 (dev use)
 //   - file://, data:, ftp:, and any other scheme are rejected
 //   - host must be non-empty
+//
+// S-1 (defense-in-depth, backend-security adversarial-input): when the host is an
+// IP LITERAL, reject any private / loopback / link-local / unspecified address so a
+// stored URL can never point at a cloud metadata endpoint (169.254.169.254), an
+// internal RFC1918 host (10.x/172.16-31.x/192.168.x), or [::1]. No server-side fetch
+// of these URLs exists today (no live SSRF), but hardening at write time prevents a
+// future fetcher from being weaponised by already-stored data. Hostname hosts (not IP
+// literals) are intentionally NOT resolved here — DNS-rebinding defense belongs at
+// fetch time, which does not exist in this service.
+//
+// The dev http-localhost exemption (127.0.0.1 / ::1) is applied BEFORE the IP-literal
+// rejection so loopback dev origins remain usable.
 func validateAvatarURL(raw string) (string, error) {
 	u, err := url.ParseRequestURI(raw)
 	if err != nil {
@@ -225,11 +276,23 @@ func validateAvatarURL(raw string) (string, error) {
 		return "", fmt.Errorf("avatarUrl must have a host")
 	}
 
-	// Restrict http to localhost only.
+	host := u.Hostname()
+
+	// Restrict http to localhost only. These loopback hosts are the ONLY exemption
+	// from the IP-literal rejection below (they are explicitly an allowed dev origin).
 	if u.Scheme == "http" {
-		host := u.Hostname()
 		if host != "localhost" && host != "127.0.0.1" && host != "::1" {
 			return "", fmt.Errorf("http avatarUrl is only allowed for localhost; use https for remote hosts")
+		}
+
+		return raw, nil
+	}
+
+	// https path: if the host is an IP literal, reject internal/metadata ranges.
+	if addr, perr := netip.ParseAddr(host); perr == nil {
+		if addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() ||
+			addr.IsLinkLocalMulticast() || addr.IsUnspecified() {
+			return "", fmt.Errorf("avatarUrl must not point at a private, loopback, or link-local address")
 		}
 	}
 

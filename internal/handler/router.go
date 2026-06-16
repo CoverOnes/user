@@ -82,7 +82,16 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	jwksH := NewJWKSHandler(cfg.Signer)
 	r.GET("/jwks", jwksH.Get)
 
-	// Rate limiter — 60 req/min per IP applied to all routes registered below.
+	// Rate limiter — 60 req/min per c.ClientIP() applied to all routes registered below.
+	//
+	// M-1 (scope clarification, NOT a behavior change): because SetTrustedProxies(nil)
+	// is set above, gin does NOT trust X-Forwarded-For, so c.ClientIP() resolves to the
+	// gateway's internal IP — the same value for every downstream client. This in-service
+	// ipRL is therefore a COARSE SHARED BACKSTOP (a service-wide req-rate ceiling), NOT
+	// per-client rate limiting. Real per-client rate-limiting is enforced at the gateway,
+	// which terminates the client connection and sees the true source IP. This is
+	// pre-existing platform behavior shared by login/register (tracked by a separate
+	// platform task); the public profile group inherits the same backstop intentionally.
 	ipRL := middleware.NewIPRateLimiter(cfg.Redis, 60, time.Minute)
 	r.Use(ipRL.Handler())
 

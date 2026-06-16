@@ -313,6 +313,94 @@ func TestProfileService_UpdateProfile_PublicFields(t *testing.T) {
 			in:      service.UpdateProfileInput{DisplayName: validName, CoverURL: strptr("http://evil.example.com/c.png")},
 			wantErr: domain.ErrValidation,
 		},
+		// M-2: control-char / null-byte / ANSI rejection across stored free-text fields.
+		{
+			name:    "M-2 displayName with null byte rejected",
+			in:      service.UpdateProfileInput{DisplayName: "Eve\x00il"},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name:    "M-2 headline with control char rejected",
+			in:      service.UpdateProfileInput{DisplayName: validName, Headline: strptr("Senior\x07Engineer")},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name:    "M-2 bio with newline rejected",
+			in:      service.UpdateProfileInput{DisplayName: validName, Bio: strptr("line one\nline two")},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name:    "M-2 bio with carriage return rejected",
+			in:      service.UpdateProfileInput{DisplayName: validName, Bio: strptr("a\rb")},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name:    "M-2 location with ANSI escape sequence rejected",
+			in:      service.UpdateProfileInput{DisplayName: validName, Location: strptr("Taipei\x1b[31m")},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name:    "M-2 location with DEL char rejected",
+			in:      service.UpdateProfileInput{DisplayName: validName, Location: strptr("Tai\x7fpei")},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name: "M-2 tab inside bio is allowed",
+			in: service.UpdateProfileInput{
+				DisplayName: validName,
+				Bio:         strptr("col1\tcol2"),
+			},
+			assertOK: func(t *testing.T, got *domain.User) {
+				t.Helper()
+				require.NotNil(t, got.Bio)
+				assert.Equal(t, "col1\tcol2", *got.Bio)
+			},
+		},
+		// S-1: validateAvatarURL/coverUrl reject IP-literal internal/metadata hosts.
+		{
+			name:    "S-1 coverUrl cloud metadata IP rejected",
+			in:      service.UpdateProfileInput{DisplayName: validName, CoverURL: strptr("https://169.254.169.254/latest/meta-data")},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name:    "S-1 coverUrl private RFC1918 IP rejected",
+			in:      service.UpdateProfileInput{DisplayName: validName, CoverURL: strptr("https://10.0.0.1/x")},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name:    "S-1 avatarUrl IPv6 loopback literal rejected",
+			in:      service.UpdateProfileInput{DisplayName: validName, AvatarURL: strptr("https://[::1]/x")},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name:    "S-1 avatarUrl unspecified IP rejected",
+			in:      service.UpdateProfileInput{DisplayName: validName, AvatarURL: strptr("https://0.0.0.0/x")},
+			wantErr: domain.ErrValidation,
+		},
+		{
+			name: "S-1 coverUrl public hostname allowed",
+			in: service.UpdateProfileInput{
+				DisplayName: validName,
+				CoverURL:    strptr("https://cdn.example.com/x.png"),
+			},
+			assertOK: func(t *testing.T, got *domain.User) {
+				t.Helper()
+				require.NotNil(t, got.CoverURL)
+				assert.Equal(t, "https://cdn.example.com/x.png", *got.CoverURL)
+			},
+		},
+		{
+			name: "S-1 avatarUrl public IP literal allowed",
+			in: service.UpdateProfileInput{
+				DisplayName: validName,
+				AvatarURL:   strptr("https://8.8.8.8/x.png"),
+			},
+			assertOK: func(t *testing.T, got *domain.User) {
+				t.Helper()
+				require.NotNil(t, got.AvatarURL)
+				assert.Equal(t, "https://8.8.8.8/x.png", *got.AvatarURL)
+			},
+		},
 	}
 
 	for _, tc := range tests {
