@@ -84,13 +84,10 @@ func (h *IdentityMatchHandler) VerifyIdentityMatch(c *gin.Context) {
 	idMatch := matchNationalID(h.encryptor, u.NationalIDEnc, req.NationalID)
 	nameMatch := matchLegalName(h.encryptor, u.LegalNameEnc, req.LegalName)
 
-	slog.Debug(
-		"identity match checked",
-		"user_id", userID,
-		"id_match", idMatch,
-		"name_match", nameMatch,
-		// Raw PII fields NEVER appear here — only boolean outcomes.
-	)
+	// Match outcome (id_match/name_match) intentionally NOT logged: correlating the
+	// boolean result with user_id would create a PII-match oracle in logs. The caller
+	// already receives the booleans in the response; raw PII never appears here.
+	slog.Debug("identity match checked", "user_id", userID)
 
 	httpx.OK(c, gin.H{
 		"idMatch":   idMatch,
