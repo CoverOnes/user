@@ -87,6 +87,11 @@ var fixedErrorMappings = []errMapping{
 	{domain.ErrLastLoginMethod, "LAST_LOGIN_METHOD", http.StatusConflict, "cannot remove last login method"},
 	// Single generic code for password-reset not-found / expired / already-used — no oracle.
 	{domain.ErrInvalidResetToken, "INVALID_RESET_TOKEN", http.StatusBadRequest, "invalid or expired password reset token"},
+	// Connections (P4 Network). CONNECTION_NOT_FOUND is the IDOR-safe 404 for both
+	// "no such connection" and "you are not the addressee" (no 403 oracle).
+	{domain.ErrConnectionExists, "CONNECTION_EXISTS", http.StatusConflict, "a connection already exists with this user"},
+	{domain.ErrConnectionNotFound, "CONNECTION_NOT_FOUND", http.StatusNotFound, "connection not found"},
+	{domain.ErrConnectionNotPending, "CONNECTION_NOT_PENDING", http.StatusConflict, "connection is no longer pending"},
 }
 
 // passthroughValidationErrors are validation sentinels whose own Error() text is

@@ -134,6 +134,56 @@ type AuthIdentityStore interface {
 	DeleteByUserAndProvider(ctx context.Context, userID uuid.UUID, provider string) error
 }
 
+// ConnectionWithUser is the read-side carrier for a connection edge joined to the
+// OTHER party's PII-SAFE public projection. It holds ONLY the non-PII display
+// columns (mirrors the public-profile allowlist): email / national_id / kyc_tier
+// and any other sensitive column are deliberately absent so a connection card can
+// never leak them, even if domain.User grows new fields. Timestamp carries the
+// edge time relevant to the list (updated_at for accepted, created_at for pending).
+type ConnectionWithUser struct {
+	ID uuid.UUID
+
+	// OtherUserID is the id of the party that is NOT the caller.
+	OtherUserID uuid.UUID
+	DisplayName string
+	Handle      *string
+	Headline    *string
+	AvatarURL   *string
+	AccountType string
+
+	Timestamp time.Time
+}
+
+// ConnectionStore defines DB operations for the connections aggregate (migration
+// 000010). Referential integrity (target user exists/live) is validated in the
+// service layer — there is no FK (red-line #9).
+type ConnectionStore interface {
+	// Create inserts a new pending connection edge. A live (pending|accepted) edge
+	// already covering the unordered pair triggers the partial-unique index 23505,
+	// which is mapped to domain.ErrConnectionExists (no check-then-insert race).
+	Create(ctx context.Context, c *domain.Connection) error
+
+	// ListAcceptedForUser returns every ACCEPTED connection for uid, projecting the
+	// OTHER party's PII-safe public columns (live users only). Newest first.
+	ListAcceptedForUser(ctx context.Context, uid uuid.UUID) ([]ConnectionWithUser, error)
+
+	// ListPendingForUser returns the user's pending invites split into incoming
+	// (uid is the addressee) and outgoing (uid is the requester), each projecting
+	// the OTHER party's PII-safe public columns (live users only). Newest first.
+	ListPendingForUser(ctx context.Context, uid uuid.UUID) (incoming, outgoing []ConnectionWithUser, err error)
+
+	// AcceptInvite flips a PENDING invite addressed to addresseeID to 'accepted'
+	// via a SQL-guarded UPDATE (id + addressee_id + status='pending'). The guard is
+	// the authorization boundary (IDOR + TOCTOU safe). Returns:
+	//   - domain.ErrConnectionNotFound   — no row with this id is addressed to addresseeID
+	//   - domain.ErrConnectionNotPending — addressed to addresseeID but already resolved
+	//   - nil                            — flipped to accepted
+	AcceptInvite(ctx context.Context, id, addresseeID uuid.UUID) error
+
+	// DeclineInvite is identical to AcceptInvite but flips to 'declined'.
+	DeclineInvite(ctx context.Context, id, addresseeID uuid.UUID) error
+}
+
 // PasswordResetTokenStore defines DB operations for single-use password-reset tokens.
 // Only the SHA-256 hash of a token is ever stored.
 type PasswordResetTokenStore interface {

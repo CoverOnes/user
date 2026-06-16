@@ -18,13 +18,14 @@ import (
 
 // RouterConfig holds all handler-level dependencies.
 type RouterConfig struct {
-	Auth    *service.AuthService
-	Profile *service.ProfileService
-	MFA     *service.MFAService
-	OAuth   *service.OAuthService // may be nil when OAuth is not configured
-	Signer  *jwt.Signer
-	Pool    *pgxpool.Pool
-	Redis   *redis.Client // may be nil in dev
+	Auth        *service.AuthService
+	Profile     *service.ProfileService
+	MFA         *service.MFAService
+	OAuth       *service.OAuthService // may be nil when OAuth is not configured
+	Connections *service.ConnectionService
+	Signer      *jwt.Signer
+	Pool        *pgxpool.Pool
+	Redis       *redis.Client // may be nil in dev
 
 	// GatewayHMACSecret is the §24.1 shared secret used to verify the
 	// gateway-origin identity signature. Empty == dev posture (verification
@@ -174,6 +175,20 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// Session management.
 	sessH := NewSessionHandler(cfg.Auth)
 	me.POST("/sessions/revoke-all", sessH.RevokeAll)
+
+	// Connections (P4 Network). No RequireTier — viewing / managing your own network
+	// is not a KYC-gated action (resolved-decision #3). Registered only when the
+	// ConnectionService is wired (always in main.go; the nil-guard keeps minimal
+	// test routers from panicking).
+	if cfg.Connections != nil {
+		connH := NewConnectionHandler(cfg.Connections)
+		conns := me.Group("/connections")
+		conns.GET("", connH.List)
+		conns.GET("/pending", connH.ListPending)
+		conns.POST("", connH.Send)
+		conns.POST("/:id/accept", connH.Accept)
+		conns.PATCH("/:id/decline", connH.Decline)
+	}
 
 	// OAuth identity bind/unbind (Increment 4) — protected, same Auth chain as /v1/me.
 	// POST  /v1/me/identities/:provider — start bind flow (returns authorize URL).

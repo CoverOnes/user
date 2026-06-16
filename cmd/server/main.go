@@ -220,6 +220,11 @@ func run() error {
 		WithPasswordReset(resetStore, txMgr, resetLimiter)
 	profileSvc := service.NewProfileService(userStore)
 
+	// Connections (P4 Network) — the userStore is reused for referential-integrity
+	// validation on SendInvite (no FK; the addressee must be a live user).
+	connStore := postgres.NewConnectionStore(pool)
+	connSvc := service.NewConnectionService(userStore, connStore)
+
 	// MFA (TOTP 2FA) service — Increment 3 primitives. Reuses the SAME PII encryptor
 	// so the TOTP secret + backup codes are AES-256-GCM at rest. cfg.MFAEnforced is
 	// intentionally NOT read here: login is unchanged this wave (enforcement is a
@@ -255,6 +260,7 @@ func run() error {
 		Profile:                   profileSvc,
 		MFA:                       mfaSvc,
 		OAuth:                     oauthSvc,
+		Connections:               connSvc,
 		Signer:                    signer,
 		Pool:                      pool,
 		Redis:                     redisClient,

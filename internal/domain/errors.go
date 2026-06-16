@@ -72,4 +72,24 @@ var (
 	// failure modes (not-found / expired / already-used). One code, no oracle
 	// that would let a caller distinguish the cases.
 	ErrInvalidResetToken = errors.New("invalid password reset token")
+
+	// Connection errors (P4 Network, migration 000010).
+
+	// ErrConnectionExists is returned when a live (pending|accepted) edge already
+	// exists for the unordered pair of users — surfaced from the partial-unique
+	// index 23505 on connections_pair_live_uniq. Maps to HTTP 409.
+	ErrConnectionExists = errors.New("connection already exists")
+
+	// ErrConnectionNotFound is returned when an accept/decline targets a connection
+	// id that has no PENDING row addressed to the caller. It is intentionally the
+	// SAME error for "id does not exist" and "id exists but you are not the
+	// addressee" — IDOR-safe (404, no 403 oracle that would leak edge existence).
+	// Maps to HTTP 404.
+	ErrConnectionNotFound = errors.New("connection not found")
+
+	// ErrConnectionNotPending is returned when the caller IS the addressee of the
+	// targeted connection but it has already been resolved (accepted/declined), so
+	// the guarded UPDATE matched no pending row. Distinct from ErrConnectionNotFound
+	// so a legitimate owner gets a precise 409 rather than a misleading 404.
+	ErrConnectionNotPending = errors.New("connection is not pending")
 )
