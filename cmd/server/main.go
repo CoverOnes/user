@@ -225,6 +225,11 @@ func run() error {
 	connStore := postgres.NewConnectionStore(pool)
 	connSvc := service.NewConnectionService(userStore, connStore)
 
+	// Company (P4 Company) — reuses the existing companyStore (Create/GetByID +
+	// Update/ListMembers) and userStore for caller→company resolution + owner-gating
+	// (no FK; referential integrity in the service layer).
+	companySvc := service.NewCompanyService(companyStore, userStore)
+
 	// MFA (TOTP 2FA) service — Increment 3 primitives. Reuses the SAME PII encryptor
 	// so the TOTP secret + backup codes are AES-256-GCM at rest. cfg.MFAEnforced is
 	// intentionally NOT read here: login is unchanged this wave (enforcement is a
@@ -261,6 +266,7 @@ func run() error {
 		MFA:                       mfaSvc,
 		OAuth:                     oauthSvc,
 		Connections:               connSvc,
+		Company:                   companySvc,
 		Signer:                    signer,
 		Pool:                      pool,
 		Redis:                     redisClient,

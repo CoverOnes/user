@@ -111,6 +111,7 @@ func (m *TxManager) WithResetTx(
 type txExecer interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 // txUserStore is a UserStore that operates within a pgx.Tx.
@@ -365,25 +366,44 @@ func (s *txCompanyStore) Create(ctx context.Context, c *domain.Company) error {
 }
 
 func (s *txCompanyStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.Company, error) {
-	q := `
-	SELECT id, name, registration_no, owner_user_id, status, created_at, updated_at
-	FROM companies
-	WHERE id = $1
-	`
+	q := `SELECT ` + companySelectColumns + ` FROM companies WHERE id = $1`
 
-	var co domain.Company
+	return scanCompany(s.tx.QueryRow(ctx, q, id))
+}
 
-	err := s.tx.QueryRow(ctx, q, id).Scan(
-		&co.ID, &co.Name, &co.RegistrationNo, &co.OwnerUserID,
-		&co.Status, &co.CreatedAt, &co.UpdatedAt,
+// Update mirrors CompanyStore.Update within a transaction, reusing the shared
+// updateCompanySQL const + companies_handle_unique 23505 mapping. The carrier is
+// taken by pointer (gocritic hugeParam: CompanyUpdate is >80 bytes).
+func (s *txCompanyStore) Update(ctx context.Context, id uuid.UUID, in *store.CompanyUpdate) error {
+	tag, err := s.tx.Exec(
+		ctx, updateCompanySQL,
+		id, in.Name, in.Handle, in.Tagline, in.About, in.Location,
+		in.Website, in.Industry, in.CompanySize, in.FoundedYear, in.LogoURL, in.CoverURL,
 	)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrNotFound
+		if isCompanyHandleTaken(err) {
+			return domain.ErrHandleTaken
 		}
 
-		return nil, fmt.Errorf("scan company (tx): %w", err)
+		return fmt.Errorf("update company (tx): %w", err)
 	}
 
-	return &co, nil
+	if tag.RowsAffected() == 0 {
+		return domain.ErrCompanyNotFound
+	}
+
+	return nil
+}
+
+// ListMembers mirrors CompanyStore.ListMembers within a transaction, reusing the
+// shared listMembersSQL const + scanCompanyMembers PII-safe projection.
+func (s *txCompanyStore) ListMembers(ctx context.Context, companyID uuid.UUID) ([]store.CompanyMember, error) {
+	rows, err := s.tx.Query(ctx, listMembersSQL, companyID)
+	if err != nil {
+		return nil, fmt.Errorf("query company members (tx): %w", err)
+	}
+
+	defer rows.Close()
+
+	return scanCompanyMembers(rows)
 }

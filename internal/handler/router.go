@@ -23,6 +23,7 @@ type RouterConfig struct {
 	MFA         *service.MFAService
 	OAuth       *service.OAuthService // may be nil when OAuth is not configured
 	Connections *service.ConnectionService
+	Company     *service.CompanyService
 	Signer      *jwt.Signer
 	Pool        *pgxpool.Pool
 	Redis       *redis.Client // may be nil in dev
@@ -140,6 +141,19 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	pubProfileH := NewPublicProfileHandler(cfg.Profile)
 	pub.GET("/:userId/profile", pubProfileH.Get)
 
+	// Public company profile (P4 Company) — GET company + GET members by companyId.
+	// No Auth (anyone can view a public company), under the global ipRL backstop.
+	// The handler returns ONLY PII-safe explicit projections (companyPublic /
+	// companyMember — no registration_no / owner_user_id / member PII). Registered
+	// only when the CompanyService is wired (always in main.go; the nil-guard keeps
+	// minimal test routers from panicking).
+	if cfg.Company != nil {
+		pubCompanyH := NewPublicCompanyHandler(cfg.Company)
+		pubCompanies := r.Group("/v1/companies")
+		pubCompanies.GET("/:companyId", pubCompanyH.Get)
+		pubCompanies.GET("/:companyId/members", pubCompanyH.Members)
+	}
+
 	// Protected routes — require valid access token, Tier >= 0.
 	//
 	// /v1/auth vs /v1/me identity-source split (security note):
@@ -188,6 +202,17 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 		conns.POST("", connH.Send)
 		conns.POST("/:id/accept", connH.Accept)
 		conns.PATCH("/:id/decline", connH.Decline)
+	}
+
+	// My company (P4 Company) — authed owner-gated. GET is readable by any member of
+	// the company (owner view incl. registrationNo); PUT requires Tier >= 1 AND is
+	// owner-gated in the service (non-owner → 403 NOT_COMPANY_OWNER). Registered only
+	// when the CompanyService is wired (always in main.go; nil-guard for minimal test
+	// routers).
+	if cfg.Company != nil {
+		companyH := NewCompanyHandler(cfg.Company)
+		me.GET("/company", companyH.Get)
+		me.PUT("/company", middleware.RequireTier(1), companyH.Update)
 	}
 
 	// OAuth identity bind/unbind (Increment 4) — protected, same Auth chain as /v1/me.

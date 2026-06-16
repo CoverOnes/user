@@ -90,10 +90,64 @@ type EmailVerificationTokenStore interface {
 	InvalidateForUser(ctx context.Context, userID uuid.UUID, now time.Time) error
 }
 
-// CompanyStore defines DB operations for company records.
+// CompanyUpdate is the full editable company public-profile field set written by
+// Update (PUT /v1/me/company, full-replace semantics). Name is always replaced; the
+// *string / *int16 fields are written as-is (nil clears the column to NULL). Handle
+// is expected to be already validated + lowercased by the service layer; the DB
+// partial-unique index companies_handle_unique is the race-safe authority on
+// uniqueness (a 23505 violation maps to domain.ErrHandleTaken — no check-then-insert).
+// registration_no is intentionally NOT part of this struct: it is set at register
+// time (000002) and is NOT a client-editable profile field.
+type CompanyUpdate struct {
+	Name        string
+	Handle      *string
+	Tagline     *string
+	About       *string
+	Location    *string
+	Website     *string
+	Industry    *string
+	CompanySize *string
+	FoundedYear *int16
+	LogoURL     *string
+	CoverURL    *string
+}
+
+// CompanyMember is the read-side carrier for a company team-roster entry: a user
+// row joined for the public members list. It holds ONLY the non-PII display columns
+// (mirrors the connection-card / public-profile allowlist): email / national_id /
+// kyc_tier / status are deliberately absent so a members list can never leak them,
+// even if domain.User grows new fields later. IsOwner is derived in SQL
+// (user.id == company.owner_user_id).
+type CompanyMember struct {
+	UserID      uuid.UUID
+	DisplayName string
+	Handle      *string
+	Headline    *string
+	AvatarURL   *string
+	IsOwner     bool
+}
+
+// CompanyStore defines DB operations for company records (migration 000002 base +
+// 000011 profile columns). Referential integrity (owner exists, members link via
+// users.company_id) is enforced in the service/handler layer — there is no FK
+// (red-line #9).
 type CompanyStore interface {
 	Create(ctx context.Context, c *domain.Company) error
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.Company, error)
+
+	// Update replaces the editable public-profile fields for the company id,
+	// bumping updated_at. Returns domain.ErrHandleTaken on a handle uniqueness
+	// violation (23505 on companies_handle_unique) and domain.ErrCompanyNotFound
+	// when no row matches the id. The carrier is passed by pointer (it is >80 bytes;
+	// gocritic hugeParam).
+	Update(ctx context.Context, id uuid.UUID, in *CompanyUpdate) error
+
+	// ListMembers returns the company's team roster: users WHERE company_id = id AND
+	// deleted_at IS NULL, ordered created_at ASC, projecting the PII-safe member
+	// columns with IsOwner derived from companies.owner_user_id. An unknown company
+	// id simply yields an empty slice (membership presence is not an existence oracle;
+	// the public GET company endpoint is the canonical existence check).
+	ListMembers(ctx context.Context, companyID uuid.UUID) ([]CompanyMember, error)
 }
 
 // RefreshTokenStore defines DB operations for refresh token lifecycle.

@@ -92,6 +92,10 @@ var fixedErrorMappings = []errMapping{
 	{domain.ErrConnectionExists, "CONNECTION_EXISTS", http.StatusConflict, "a connection already exists with this user"},
 	{domain.ErrConnectionNotFound, "CONNECTION_NOT_FOUND", http.StatusNotFound, "connection not found"},
 	{domain.ErrConnectionNotPending, "CONNECTION_NOT_PENDING", http.StatusConflict, "connection is no longer pending"},
+	// Company (P4 Company). COMPANY_NOT_FOUND is a distinct 404 (not USER_NOT_FOUND,
+	// resolved-decision #1); NOT_COMPANY_OWNER is the owner-gate 403 on PUT /me/company.
+	{domain.ErrCompanyNotFound, "COMPANY_NOT_FOUND", http.StatusNotFound, "company not found"},
+	{domain.ErrNotCompanyOwner, "NOT_COMPANY_OWNER", http.StatusForbidden, "you are not the owner of this company"},
 }
 
 // passthroughValidationErrors are validation sentinels whose own Error() text is
