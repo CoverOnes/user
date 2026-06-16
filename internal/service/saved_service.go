@@ -27,6 +27,16 @@ func NewSavedService(companies store.CompanyStore, saved store.SavedItemStore) *
 	return &SavedService{companies: companies, saved: saved}
 }
 
+// maxSavedPerUserPerType is the hard ceiling on how many bookmarks a single user may
+// hold for one item_type. It is an application-layer guard against unbounded growth of
+// the shared saved_items table (OWASP API4): an authenticated client can script
+// POST /v1/me/saved with random job item_ids (job targets are never existence-checked,
+// they live in the delegated marketplace DB), so without a per-user ceiling the table
+// can be grown without limit. This guard is INDEPENDENT of the request rate limiter —
+// it cannot be disabled by config (e.g. USER_USER_RATE_LIMIT_PER_MIN=0) — so it holds
+// even when the rate limiter is off.
+const maxSavedPerUserPerType = 1000
+
 // validItemType reports whether t is an accepted bookmark item_type. It mirrors the
 // DB CHECK(item_type IN (...)) value allowlist (a value check, NOT a foreign key);
 // the service rejects an unknown type BEFORE any DB hit so the caller gets a precise
@@ -43,7 +53,10 @@ func validItemType(t string) bool {
 //     companies.GetByID (absent → ErrSavedTargetNotFound, 404); job targets are NOT
 //     checked (the delegated marketplace DB is unreachable from this service; a stale
 //     id resolves to nothing on read and is skipped — no fake data, no FK).
-//  3. saved.Create — the unique index is the race-safe authority for the
+//  3. per-user-per-type ceiling: CountByUserAndType must be < maxSavedPerUserPerType,
+//     else ErrValidation (400) — the OWASP API4 unbounded-growth guard, independent of
+//     the rate limiter (config cannot disable it).
+//  4. saved.Create — the unique index is the race-safe authority for the
 //     "already saved" case (→ ErrSavedItemExists / 409); we never check-then-insert.
 //
 // Returns the created bookmark on success.
@@ -63,6 +76,19 @@ func (s *SavedService) Save(ctx context.Context, callerID uuid.UUID, itemType st
 
 			return nil, fmt.Errorf("lookup saved company target: %w", err)
 		}
+	}
+
+	// Unbounded-growth guard (OWASP API4): cap the number of bookmarks a single user
+	// may hold per item_type. This is intentionally enforced here in the service — NOT
+	// at the rate limiter — so it cannot be disabled by config and holds even when the
+	// per-user rate limiter is off.
+	n, err := s.saved.CountByUserAndType(ctx, callerID, itemType)
+	if err != nil {
+		return nil, fmt.Errorf("count saved items for cap check: %w", err)
+	}
+
+	if n >= maxSavedPerUserPerType {
+		return nil, fmt.Errorf("%w: saved limit reached (max %d %s items)", domain.ErrValidation, maxSavedPerUserPerType, itemType)
 	}
 
 	si := &domain.SavedItem{

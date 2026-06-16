@@ -218,4 +218,30 @@ func TestSavedItemStore_Integration(t *testing.T) {
 		require.Len(t, jobs, 1, "job list must contain only job bookmarks")
 		assert.Equal(t, domain.SavedItemTypeJob, jobs[0].ItemType)
 	})
+
+	t.Run("CountByUserAndType is scoped per (user, item_type)", func(t *testing.T) {
+		userA := seedConnUser(t, ctx, us, "count-a@saved.test", "CountA")
+		userB := seedConnUser(t, ctx, us, "count-b@saved.test", "CountB")
+
+		// Save N=3 distinct job bookmarks for user A.
+		const n = 3
+		for i := 0; i < n; i++ {
+			require.NoError(t, ss.Create(ctx, newSavedItem(userA.ID, domain.SavedItemTypeJob, uuid.New(), time.Now().UTC())))
+		}
+
+		// (A, job) sees exactly the 3 saved jobs.
+		gotAJob, err := ss.CountByUserAndType(ctx, userA.ID, domain.SavedItemTypeJob)
+		require.NoError(t, err)
+		assert.Equal(t, n, gotAJob, "count must equal the number of A's job bookmarks")
+
+		// (A, company) is a DIFFERENT item_type → not counted.
+		gotACompany, err := ss.CountByUserAndType(ctx, userA.ID, domain.SavedItemTypeCompany)
+		require.NoError(t, err)
+		assert.Equal(t, 0, gotACompany, "A's job bookmarks must not count toward the company type")
+
+		// (B, job) is a DIFFERENT user → not counted (identity-scoped).
+		gotBJob, err := ss.CountByUserAndType(ctx, userB.ID, domain.SavedItemTypeJob)
+		require.NoError(t, err)
+		assert.Equal(t, 0, gotBJob, "A's job bookmarks must not count toward another user")
+	})
 }

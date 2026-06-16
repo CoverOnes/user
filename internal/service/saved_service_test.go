@@ -21,6 +21,7 @@ type fakeSavedItemStore struct {
 	createErr error
 	deleteErr error
 	listErr   error
+	countErr  error
 
 	created *domain.SavedItem
 
@@ -28,6 +29,13 @@ type fakeSavedItemStore struct {
 	deletedType string
 	deletedID   uuid.UUID
 	deleteRet   bool
+
+	// countRet is what CountByUserAndType returns; countCalled / counted* record the
+	// last call so a test can assert the cap check ran with the caller's id + type.
+	countRet    int
+	countCalled bool
+	countedUser uuid.UUID
+	countedType string
 
 	jobRefs   []domain.SavedItem
 	companies []store.SavedCompanyRow
@@ -54,6 +62,18 @@ func (f *fakeSavedItemStore) DeleteByUserAndItem(_ context.Context, userID uuid.
 	f.deletedID = itemID
 
 	return f.deleteRet, nil
+}
+
+func (f *fakeSavedItemStore) CountByUserAndType(_ context.Context, userID uuid.UUID, itemType string) (int, error) {
+	if f.countErr != nil {
+		return 0, f.countErr
+	}
+
+	f.countCalled = true
+	f.countedUser = userID
+	f.countedType = itemType
+
+	return f.countRet, nil
 }
 
 func (f *fakeSavedItemStore) ListJobRefs(_ context.Context, _ uuid.UUID) ([]domain.SavedItem, error) {
@@ -175,6 +195,55 @@ func TestSavedService_Save(t *testing.T) {
 		require.Error(t, err)
 		assert.NotErrorIs(t, err, domain.ErrSavedTargetNotFound, "a generic backend error must not masquerade as 404")
 		assert.Nil(t, saved.created)
+	})
+
+	t.Run("save at the per-user-per-type ceiling is rejected with ErrValidation (no Create)", func(t *testing.T) {
+		t.Parallel()
+
+		companies := newFakeCompanyStore()
+		// count == maxSavedPerUserPerType (1000): the cap is inclusive (n >= max), so
+		// the very next save must be rejected and MUST NOT reach Create.
+		saved := &fakeSavedItemStore{countRet: 1000}
+		svc := service.NewSavedService(companies, saved)
+
+		caller := uuid.New()
+		_, err := svc.Save(context.Background(), caller, domain.SavedItemTypeJob, uuid.New())
+		require.ErrorIs(t, err, domain.ErrValidation, "hitting the cap must map to a 400 VALIDATION_ERROR")
+		assert.Nil(t, saved.created, "a save at the cap must short-circuit before Create")
+		assert.True(t, saved.countCalled, "the cap check must have run")
+		assert.Equal(t, caller, saved.countedUser, "the cap must be scoped to the caller id")
+		assert.Equal(t, domain.SavedItemTypeJob, saved.countedType, "the cap must be scoped to the item_type")
+	})
+
+	t.Run("save just below the ceiling proceeds to Create", func(t *testing.T) {
+		t.Parallel()
+
+		companies := newFakeCompanyStore()
+		// count == 999 (max-1): still under the cap, so the save proceeds.
+		saved := &fakeSavedItemStore{countRet: 999}
+		svc := service.NewSavedService(companies, saved)
+
+		caller := uuid.New()
+		jobID := uuid.New()
+		got, err := svc.Save(context.Background(), caller, domain.SavedItemTypeJob, jobID)
+		require.NoError(t, err, "a save below the cap must succeed")
+		require.NotNil(t, got)
+		assert.Equal(t, jobID, got.ItemID)
+		require.NotNil(t, saved.created, "Create must have been called when under the cap")
+		assert.Equal(t, jobID, saved.created.ItemID)
+	})
+
+	t.Run("cap-count backend error is wrapped and short-circuits before Create", func(t *testing.T) {
+		t.Parallel()
+
+		companies := newFakeCompanyStore()
+		saved := &fakeSavedItemStore{countErr: errInjected}
+		svc := service.NewSavedService(companies, saved)
+
+		_, err := svc.Save(context.Background(), uuid.New(), domain.SavedItemTypeJob, uuid.New())
+		require.ErrorIs(t, err, errInjected, "a count backend error must propagate")
+		assert.NotErrorIs(t, err, domain.ErrValidation, "a backend error must not masquerade as a cap rejection")
+		assert.Nil(t, saved.created, "a count error must short-circuit before Create")
 	})
 }
 

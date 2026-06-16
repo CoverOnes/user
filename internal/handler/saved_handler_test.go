@@ -31,6 +31,11 @@ type fakeSavedStore struct {
 	createErr error
 	deleteErr error
 	listErr   error
+	countErr  error
+
+	// countRet is what CountByUserAndType returns (zero value 0 keeps existing
+	// save-path tests well under the per-user-per-type cap).
+	countRet int
 
 	created   *domain.SavedItem
 	deleteRet bool
@@ -61,6 +66,14 @@ func (f *fakeSavedStore) DeleteByUserAndItem(_ context.Context, userID uuid.UUID
 	f.lastDeletedID = itemID
 
 	return f.deleteRet, nil
+}
+
+func (f *fakeSavedStore) CountByUserAndType(_ context.Context, _ uuid.UUID, _ string) (int, error) {
+	if f.countErr != nil {
+		return 0, f.countErr
+	}
+
+	return f.countRet, nil
 }
 
 func (f *fakeSavedStore) ListJobRefs(_ context.Context, _ uuid.UUID) ([]domain.SavedItem, error) {

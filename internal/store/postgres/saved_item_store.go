@@ -78,6 +78,22 @@ func (s *SavedItemStore) DeleteByUserAndItem(ctx context.Context, userID uuid.UU
 	return tag.RowsAffected() > 0, nil
 }
 
+// CountByUserAndType returns how many bookmarks the caller holds for itemType. It is
+// the read side of the service's per-user-per-type save ceiling (OWASP API4): the
+// service calls this BEFORE Create and rejects the save once the count hits the cap.
+// The saved_items_user_type_created_idx (user_id, item_type, created_at DESC) covers
+// the count via its leading (user_id, item_type) columns.
+func (s *SavedItemStore) CountByUserAndType(ctx context.Context, userID uuid.UUID, itemType string) (int, error) {
+	q := `SELECT count(*) FROM saved_items WHERE user_id = $1 AND item_type = $2`
+
+	var n int
+	if err := s.pool.QueryRow(ctx, q, userID, itemType).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count saved items by user and type: %w", err)
+	}
+
+	return n, nil
+}
+
 // ListJobRefs returns the caller's saved 'job' bookmarks as bare references (no
 // cross-call to the delegated marketplace), ordered newest-saved-first. The index
 // saved_items_user_type_created_idx backs this hot path.

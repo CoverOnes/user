@@ -276,6 +276,14 @@ type SavedItemStore interface {
 	// double-unsave race). removed reports whether a row was actually deleted.
 	DeleteByUserAndItem(ctx context.Context, userID uuid.UUID, itemType string, itemID uuid.UUID) (removed bool, err error)
 
+	// CountByUserAndType returns how many live bookmarks the caller holds for the
+	// given item_type. It backs the per-user-per-type save ceiling the service
+	// enforces BEFORE Create (OWASP API4 unbounded-growth guard) — a guard that is
+	// independent of any rate limiter and cannot be disabled by config. The
+	// saved_items_user_type_created_idx (user_id, item_type, created_at DESC) covers
+	// this count via its leading columns.
+	CountByUserAndType(ctx context.Context, userID uuid.UUID, itemType string) (int, error)
+
 	// ListJobRefs returns the caller's saved 'job' bookmarks as BARE references
 	// (no cross-call to the delegated marketplace), newest-saved-first. The frontend
 	// hydrates each via marketplaceApi.getListing(itemId).
