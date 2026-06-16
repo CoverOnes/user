@@ -230,6 +230,12 @@ func run() error {
 	// (no FK; referential integrity in the service layer).
 	companySvc := service.NewCompanyService(companyStore, userStore)
 
+	// Saved bookmarks (P4 Saved) — reuses the existing companyStore for the company
+	// existence check on save (no FK; referential integrity in the service layer). Job
+	// targets are not existence-checked (the marketplace is a delegated service).
+	savedStore := postgres.NewSavedItemStore(pool)
+	savedSvc := service.NewSavedService(companyStore, savedStore)
+
 	// MFA (TOTP 2FA) service — Increment 3 primitives. Reuses the SAME PII encryptor
 	// so the TOTP secret + backup codes are AES-256-GCM at rest. cfg.MFAEnforced is
 	// intentionally NOT read here: login is unchanged this wave (enforcement is a
@@ -267,6 +273,7 @@ func run() error {
 		OAuth:                     oauthSvc,
 		Connections:               connSvc,
 		Company:                   companySvc,
+		Saved:                     savedSvc,
 		Signer:                    signer,
 		Pool:                      pool,
 		Redis:                     redisClient,

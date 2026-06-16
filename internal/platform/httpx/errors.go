@@ -96,6 +96,11 @@ var fixedErrorMappings = []errMapping{
 	// resolved-decision #1); NOT_COMPANY_OWNER is the owner-gate 403 on PUT /me/company.
 	{domain.ErrCompanyNotFound, "COMPANY_NOT_FOUND", http.StatusNotFound, "company not found"},
 	{domain.ErrNotCompanyOwner, "NOT_COMPANY_OWNER", http.StatusForbidden, "you are not the owner of this company"},
+	// Saved items (P4 Saved). SAVED_ITEM_EXISTS is the 409 dup-bookmark path (23505 on
+	// saved_items_user_item_uniq); SAVED_TARGET_NOT_FOUND is the 404 for a save whose
+	// company target does not resolve (job targets are never existence-checked).
+	{domain.ErrSavedItemExists, "SAVED_ITEM_EXISTS", http.StatusConflict, "item already saved"},
+	{domain.ErrSavedTargetNotFound, "SAVED_TARGET_NOT_FOUND", http.StatusNotFound, "saved target not found"},
 }
 
 // passthroughValidationErrors are validation sentinels whose own Error() text is

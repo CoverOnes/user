@@ -24,6 +24,7 @@ type RouterConfig struct {
 	OAuth       *service.OAuthService // may be nil when OAuth is not configured
 	Connections *service.ConnectionService
 	Company     *service.CompanyService
+	Saved       *service.SavedService
 	Signer      *jwt.Signer
 	Pool        *pgxpool.Pool
 	Redis       *redis.Client // may be nil in dev
@@ -202,6 +203,19 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 		conns.POST("", connH.Send)
 		conns.POST("/:id/accept", connH.Accept)
 		conns.PATCH("/:id/decline", connH.Decline)
+	}
+
+	// Saved bookmarks (P4 Saved). No RequireTier — bookmarking is not a KYC-gated
+	// action (resolved-decision #3, mirrors network). GET lists by ?type; POST saves;
+	// DELETE unsaves (idempotent). Identity is always the JWT subject (callerID()).
+	// Registered only when the SavedService is wired (always in main.go; the nil-guard
+	// keeps minimal test routers from panicking).
+	if cfg.Saved != nil {
+		savedH := NewSavedHandler(cfg.Saved)
+		saved := me.Group("/saved")
+		saved.GET("", savedH.List)
+		saved.POST("", savedH.Save)
+		saved.DELETE("", savedH.Unsave)
 	}
 
 	// My company (P4 Company) — authed owner-gated. GET is readable by any member of

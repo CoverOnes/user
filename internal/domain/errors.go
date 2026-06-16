@@ -108,4 +108,19 @@ var (
 	// the caller legitimately knows the company exists (it is their own membership),
 	// they just may not mutate it. Maps to HTTP 403.
 	ErrNotCompanyOwner = errors.New("caller is not the company owner")
+
+	// Saved-item errors (P4 Saved, migration 000012).
+
+	// ErrSavedItemExists is returned when a live bookmark already covers the
+	// (user, item_type, item_id) triple — surfaced from the unique index 23505 on
+	// saved_items_user_item_uniq (no check-then-insert). Maps to HTTP 409.
+	ErrSavedItemExists = errors.New("item already saved")
+
+	// ErrSavedTargetNotFound is returned by Save when the bookmark target does not
+	// resolve to a live row (referential integrity in code, no FK). It is raised ONLY
+	// for item_type='company' (verified via companies.GetByID); item_type='job' is
+	// intentionally NOT verified (the marketplace is a delegated service the user DB
+	// does not cross-call — a stale job id resolves to nothing on read and is skipped).
+	// Maps to HTTP 404.
+	ErrSavedTargetNotFound = errors.New("saved target not found")
 )
