@@ -10,15 +10,22 @@ import (
 
 // User represents a registered user account.
 type User struct {
-	ID           uuid.UUID  `json:"id"`
-	Email        string     `json:"email"`
-	PasswordHash *string    `json:"-"` // NULL for OAuth-only accounts (migration 000007)
-	DisplayName  string     `json:"displayName"`
-	AvatarURL    *string    `json:"avatarUrl"`
-	AccountType  string     `json:"accountType"`
-	KYCTier      int16      `json:"kycTier"`
-	CompanyID    *uuid.UUID `json:"companyId"`
-	Status       string     `json:"status"`
+	ID           uuid.UUID `json:"id"`
+	Email        string    `json:"email"`
+	PasswordHash *string   `json:"-"` // NULL for OAuth-only accounts (migration 000007)
+	DisplayName  string    `json:"displayName"`
+	AvatarURL    *string   `json:"avatarUrl"`
+	// Public-profile display fields (migration 000009). All nullable, non-PII.
+	// Handle is the case-insensitive public username (citext), unique among live rows.
+	Handle      *string    `json:"handle"`
+	Headline    *string    `json:"headline"`
+	Bio         *string    `json:"bio"`
+	Location    *string    `json:"location"`
+	CoverURL    *string    `json:"coverUrl"`
+	AccountType string     `json:"accountType"`
+	KYCTier     int16      `json:"kycTier"`
+	CompanyID   *uuid.UUID `json:"companyId"`
+	Status      string     `json:"status"`
 	// EmailVerified reflects users.email_verified — whether the account has
 	// completed email verification. Lifted by POST /v1/auth/verify-email.
 	EmailVerified bool `json:"emailVerified"`

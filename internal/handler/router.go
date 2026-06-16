@@ -123,6 +123,13 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 		r.POST("/v1/auth/oauth/register", middleware.NoCache(), oauthH.Register)
 	}
 
+	// Public end-user content — GET profile by userId. No Auth (anyone can view a
+	// public profile), but still under the global ipRL IP rate limiter applied above.
+	// The handler returns ONLY a PII-safe explicit projection (see PublicProfileHandler).
+	pub := r.Group("/v1/users")
+	pubProfileH := NewPublicProfileHandler(cfg.Profile)
+	pub.GET("/:userId/profile", pubProfileH.Get)
+
 	// Protected routes — require valid access token, Tier >= 0.
 	//
 	// /v1/auth vs /v1/me identity-source split (security note):

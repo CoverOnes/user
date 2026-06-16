@@ -85,16 +85,31 @@ func (f *fakeUserStore) GetByEmail(_ context.Context, email string) (*domain.Use
 	return u, nil
 }
 
-func (f *fakeUserStore) UpdateProfile(_ context.Context, id uuid.UUID, displayName string, avatarURL *string) error {
+func (f *fakeUserStore) UpdateProfile(_ context.Context, id uuid.UUID, in store.ProfileUpdate) error {
 	if f.updateProfileErr != nil {
 		return f.updateProfileErr
+	}
+	// Mirror the Postgres partial-unique index: a non-nil handle already held by a
+	// DIFFERENT live user yields ErrHandleTaken (case-insensitive). The service
+	// lowercases before calling, so a simple equality check suffices here.
+	if in.Handle != nil {
+		for otherID, other := range f.byID {
+			if otherID != id && other.Handle != nil && strings.EqualFold(*other.Handle, *in.Handle) {
+				return domain.ErrHandleTaken
+			}
+		}
 	}
 	u, ok := f.byID[id]
 	if !ok {
 		return domain.ErrNotFound
 	}
-	u.DisplayName = displayName
-	u.AvatarURL = avatarURL
+	u.DisplayName = in.DisplayName
+	u.Handle = in.Handle
+	u.Headline = in.Headline
+	u.Bio = in.Bio
+	u.Location = in.Location
+	u.AvatarURL = in.AvatarURL
+	u.CoverURL = in.CoverURL
 
 	return nil
 }

@@ -149,15 +149,16 @@ func (s *txUserStore) GetByEmail(ctx context.Context, email string) (*domain.Use
 	return scanUser(s.tx.QueryRow(ctx, q, email))
 }
 
-func (s *txUserStore) UpdateProfile(ctx context.Context, id uuid.UUID, displayName string, avatarURL *string) error {
-	q := `
-	UPDATE users
-	SET display_name = $2, avatar_url = $3, updated_at = now()
-	WHERE id = $1 AND deleted_at IS NULL
-	`
-
-	tag, err := s.tx.Exec(ctx, q, id, displayName, avatarURL)
+func (s *txUserStore) UpdateProfile(ctx context.Context, id uuid.UUID, in store.ProfileUpdate) error {
+	tag, err := s.tx.Exec(
+		ctx, updateProfileSQL,
+		id, in.DisplayName, in.Handle, in.Headline, in.Bio, in.Location, in.AvatarURL, in.CoverURL,
+	)
 	if err != nil {
+		if isHandleTaken(err) {
+			return domain.ErrHandleTaken
+		}
+
 		return fmt.Errorf("update user profile (tx): %w", err)
 	}
 

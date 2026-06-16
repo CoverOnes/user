@@ -7,11 +7,40 @@ import (
 	"time"
 
 	"github.com/CoverOnes/user/internal/domain"
+	"github.com/CoverOnes/user/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// handleUniqueIndex is the name of the partial-unique index on users.handle
+// (migration 000009). A 23505 violation carrying this constraint name is mapped
+// to domain.ErrHandleTaken; any other 23505 is surfaced as a wrapped error.
+const handleUniqueIndex = "users_handle_unique"
+
+// updateProfileSQL is the shared UPDATE used by both the pool-backed UserStore and
+// the transactional txUserStore so the column list stays in lockstep. It performs a
+// FULL replace of the editable public-profile fields (nil *string clears the column).
+const updateProfileSQL = `
+	UPDATE users
+	SET display_name = $2, handle = $3, headline = $4, bio = $5,
+	    location = $6, avatar_url = $7, cover_url = $8, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL
+	`
+
+// isHandleTaken reports whether err is a Postgres 23505 unique-violation on the
+// users_handle_unique index. Matching on the constraint name (not just the SQLSTATE)
+// keeps the mapping precise: an unrelated future unique constraint won't be
+// misreported as ErrHandleTaken.
+func isHandleTaken(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return pgErr.ConstraintName == handleUniqueIndex
+	}
+
+	return false
+}
 
 // UserStore implements store.UserStore backed by Postgres.
 type UserStore struct {
@@ -35,12 +64,15 @@ const userInsertSQL = `
 	`
 
 // userSelectColumns is the shared SELECT column list consumed by scanUser.
+// The trailing public-profile columns (handle..cover_url) were added in 000009;
+// they MUST stay in lockstep with scanUser's Scan call below.
 const userSelectColumns = `
 		id, email, password_hash, display_name, avatar_url, account_type,
 		kyc_tier, company_id, status, email_verified,
 		legal_name_enc, national_id_enc,
 		mfa_enabled, totp_secret_enc, mfa_backup_codes_enc, mfa_enrolled_at,
-		token_version, deleted_at, created_at, updated_at`
+		token_version, deleted_at, created_at, updated_at,
+		handle, headline, bio, location, cover_url`
 
 // Create inserts a new user row.
 func (s *UserStore) Create(ctx context.Context, u *domain.User) error {
@@ -76,16 +108,20 @@ func (s *UserStore) GetByEmail(ctx context.Context, email string) (*domain.User,
 	return scanUser(s.pool.QueryRow(ctx, q, email))
 }
 
-// UpdateProfile updates displayName and avatarUrl, bumping updated_at.
-func (s *UserStore) UpdateProfile(ctx context.Context, id uuid.UUID, displayName string, avatarURL *string) error {
-	q := `
-	UPDATE users
-	SET display_name = $2, avatar_url = $3, updated_at = now()
-	WHERE id = $1 AND deleted_at IS NULL
-	`
-
-	tag, err := s.pool.Exec(ctx, q, id, displayName, avatarURL)
+// UpdateProfile replaces the editable public-profile fields, bumping updated_at.
+// A 23505 unique-violation on users_handle_unique maps to domain.ErrHandleTaken
+// (the partial-unique index is the race-safe authority — we never pre-check then
+// insert). RowsAffected()==0 means no live row matched → domain.ErrNotFound.
+func (s *UserStore) UpdateProfile(ctx context.Context, id uuid.UUID, in store.ProfileUpdate) error {
+	tag, err := s.pool.Exec(
+		ctx, updateProfileSQL,
+		id, in.DisplayName, in.Handle, in.Headline, in.Bio, in.Location, in.AvatarURL, in.CoverURL,
+	)
 	if err != nil {
+		if isHandleTaken(err) {
+			return domain.ErrHandleTaken
+		}
+
 		return fmt.Errorf("update user profile: %w", err)
 	}
 
@@ -326,6 +362,7 @@ func scanUser(row pgx.Row) (*domain.User, error) {
 		&u.MFAEnabled, &u.TOTPSecretEnc, &u.MFABackupCodesEnc, &u.MFAEnrolledAt,
 		&u.TokenVersion,
 		&u.DeletedAt, &u.CreatedAt, &u.UpdatedAt,
+		&u.Handle, &u.Headline, &u.Bio, &u.Location, &u.CoverURL,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

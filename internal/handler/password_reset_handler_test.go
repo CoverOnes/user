@@ -61,7 +61,7 @@ func (s *resetUserStore) GetByEmail(_ context.Context, email string) (*domain.Us
 	return nil, domain.ErrNotFound
 }
 
-func (s *resetUserStore) UpdateProfile(_ context.Context, _ uuid.UUID, _ string, _ *string) error {
+func (s *resetUserStore) UpdateProfile(_ context.Context, _ uuid.UUID, _ store.ProfileUpdate) error {
 	return nil
 }
 

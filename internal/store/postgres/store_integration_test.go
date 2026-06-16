@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/CoverOnes/user/internal/domain"
+	"github.com/CoverOnes/user/internal/store"
 	"github.com/CoverOnes/user/internal/store/postgres"
 	migrations "github.com/CoverOnes/user/migrations"
 	"github.com/google/uuid"
@@ -221,7 +222,7 @@ func TestUserStore_Integration(t *testing.T) {
 		require.NoError(t, userStore.Create(ctx, u))
 
 		newName := "Dave Updated"
-		require.NoError(t, userStore.UpdateProfile(ctx, u.ID, newName, nil))
+		require.NoError(t, userStore.UpdateProfile(ctx, u.ID, store.ProfileUpdate{DisplayName: newName}))
 
 		got, err := userStore.GetByID(ctx, u.ID)
 		require.NoError(t, err)
