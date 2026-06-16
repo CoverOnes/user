@@ -234,9 +234,37 @@ func (f *fakeUserStore) SetPasswordHash(_ context.Context, id uuid.UUID, hash st
 
 // --- fakeCompanyStore ---
 
+// fakeCompanyStore is an in-memory CompanyStore. It now backs both the AuthService
+// tests (Create) and the CompanyService tests (GetByID/Update/ListMembers), with a
+// keyed store + per-method error injection. The partial-unique handle index is
+// mirrored: a non-nil handle held by a DIFFERENT company yields ErrHandleTaken.
 type fakeCompanyStore struct {
-	createErr error
-	created   []*domain.Company
+	byID map[uuid.UUID]*domain.Company
+
+	createErr  error
+	getByIDErr error
+	updateErr  error
+
+	created []*domain.Company
+
+	// members keyed by company id, returned verbatim by ListMembers.
+	members        map[uuid.UUID][]store.CompanyMember
+	listMembersErr error
+}
+
+func newFakeCompanyStore() *fakeCompanyStore {
+	return &fakeCompanyStore{
+		byID:    make(map[uuid.UUID]*domain.Company),
+		members: make(map[uuid.UUID][]store.CompanyMember),
+	}
+}
+
+func (f *fakeCompanyStore) put(c *domain.Company) {
+	if f.byID == nil {
+		f.byID = make(map[uuid.UUID]*domain.Company)
+	}
+	cp := *c
+	f.byID[c.ID] = &cp
 }
 
 func (f *fakeCompanyStore) Create(_ context.Context, c *domain.Company) error {
@@ -244,12 +272,62 @@ func (f *fakeCompanyStore) Create(_ context.Context, c *domain.Company) error {
 		return f.createErr
 	}
 	f.created = append(f.created, c)
+	f.put(c)
 
 	return nil
 }
 
-func (f *fakeCompanyStore) GetByID(_ context.Context, _ uuid.UUID) (*domain.Company, error) {
-	return nil, domain.ErrNotFound
+func (f *fakeCompanyStore) GetByID(_ context.Context, id uuid.UUID) (*domain.Company, error) {
+	if f.getByIDErr != nil {
+		return nil, f.getByIDErr
+	}
+	c, ok := f.byID[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+
+	return c, nil
+}
+
+func (f *fakeCompanyStore) Update(_ context.Context, id uuid.UUID, in *store.CompanyUpdate) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	// Mirror the Postgres partial-unique index: a non-nil handle already held by a
+	// DIFFERENT company yields ErrHandleTaken (case-insensitive). The service
+	// lowercases before calling, so a simple equality check suffices here.
+	if in.Handle != nil {
+		for otherID, other := range f.byID {
+			if otherID != id && other.Handle != nil && strings.EqualFold(*other.Handle, *in.Handle) {
+				return domain.ErrHandleTaken
+			}
+		}
+	}
+	c, ok := f.byID[id]
+	if !ok {
+		return domain.ErrCompanyNotFound
+	}
+	c.Name = in.Name
+	c.Handle = in.Handle
+	c.Tagline = in.Tagline
+	c.About = in.About
+	c.Location = in.Location
+	c.Website = in.Website
+	c.Industry = in.Industry
+	c.CompanySize = in.CompanySize
+	c.FoundedYear = in.FoundedYear
+	c.LogoURL = in.LogoURL
+	c.CoverURL = in.CoverURL
+
+	return nil
+}
+
+func (f *fakeCompanyStore) ListMembers(_ context.Context, companyID uuid.UUID) ([]store.CompanyMember, error) {
+	if f.listMembersErr != nil {
+		return nil, f.listMembersErr
+	}
+
+	return f.members[companyID], nil
 }
 
 // --- fakeRefreshTokenStore ---

@@ -220,6 +220,14 @@ func (f *fakeCompanyStore) GetByID(_ context.Context, _ uuid.UUID) (*domain.Comp
 	return nil, domain.ErrNotFound
 }
 
+func (f *fakeCompanyStore) Update(_ context.Context, _ uuid.UUID, _ *store.CompanyUpdate) error {
+	return domain.ErrCompanyNotFound
+}
+
+func (f *fakeCompanyStore) ListMembers(_ context.Context, _ uuid.UUID) ([]store.CompanyMember, error) {
+	return nil, nil
+}
+
 type fakeRefreshTokenStore struct {
 	tokens map[uuid.UUID]*domain.RefreshToken
 }

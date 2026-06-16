@@ -92,4 +92,20 @@ var (
 	// the guarded UPDATE matched no pending row. Distinct from ErrConnectionNotFound
 	// so a legitimate owner gets a precise 409 rather than a misleading 404.
 	ErrConnectionNotPending = errors.New("connection is not pending")
+
+	// Company errors (P4 Company, migration 000011).
+
+	// ErrCompanyNotFound is returned when a company lookup (by id, or via the
+	// caller's company_id) matches no row — including the case where the caller has
+	// no company_id set. A DISTINCT 404 code (COMPANY_NOT_FOUND) rather than reusing
+	// USER_NOT_FOUND (resolved-decision #1), so the frontend can render a
+	// company-specific not-found state. Maps to HTTP 404.
+	ErrCompanyNotFound = errors.New("company not found")
+
+	// ErrNotCompanyOwner is returned by UpdateMyCompany when the authenticated caller
+	// is NOT the company's owner_user_id. Owner-gating is an authorization boundary on
+	// a resource the caller can otherwise read, so it is a precise 403 (not a 404):
+	// the caller legitimately knows the company exists (it is their own membership),
+	// they just may not mutate it. Maps to HTTP 403.
+	ErrNotCompanyOwner = errors.New("caller is not the company owner")
 )
