@@ -238,6 +238,56 @@ type ConnectionStore interface {
 	DeclineInvite(ctx context.Context, id, addresseeID uuid.UUID) error
 }
 
+// SavedCompanyRow is the read-side carrier for a saved 'company' bookmark joined to
+// the companies table (migration 000012 + 000002/000011). It holds ONLY the PII-safe
+// public company columns (mirrors the public CompanyProfile allowlist): the
+// high-sensitivity registration_no, the internal owner_user_id, and the lifecycle
+// status are deliberately ABSENT so a saved-companies list can never leak them, even
+// if domain.Company grows new sensitive fields later. SavedID/SavedAt carry the
+// bookmark row identity (used for unsave + React key) + its created_at.
+type SavedCompanyRow struct {
+	SavedID uuid.UUID
+	SavedAt time.Time
+
+	// CompanyID is companies.id (== the saved item_id).
+	CompanyID   uuid.UUID
+	Handle      *string
+	Name        string
+	Tagline     *string
+	Location    *string
+	Industry    *string
+	CompanySize *string
+	LogoURL     *string
+}
+
+// SavedItemStore defines DB operations for the saved_items aggregate (migration
+// 000012). Referential integrity (the company target exists) is validated in the
+// service layer — there is no FK (red-line #9). Job targets are intentionally NOT
+// existence-checked (they live in the delegated marketplace DB).
+type SavedItemStore interface {
+	// Create inserts a new bookmark. A live bookmark already covering the
+	// (user, item_type, item_id) triple triggers the unique index 23505, which is
+	// mapped to domain.ErrSavedItemExists (no check-then-insert race).
+	Create(ctx context.Context, s *domain.SavedItem) error
+
+	// DeleteByUserAndItem hard-deletes the caller's bookmark identified by
+	// (userID, itemType, itemID). It is IDEMPOTENT: removing an absent bookmark
+	// returns (false, nil) rather than an error (toggle UX must survive a
+	// double-unsave race). removed reports whether a row was actually deleted.
+	DeleteByUserAndItem(ctx context.Context, userID uuid.UUID, itemType string, itemID uuid.UUID) (removed bool, err error)
+
+	// ListJobRefs returns the caller's saved 'job' bookmarks as BARE references
+	// (no cross-call to the delegated marketplace), newest-saved-first. The frontend
+	// hydrates each via marketplaceApi.getListing(itemId).
+	ListJobRefs(ctx context.Context, userID uuid.UUID) ([]domain.SavedItem, error)
+
+	// ListCompaniesForUser returns the caller's saved 'company' bookmarks JOINed to
+	// the in-service companies table, projecting the PII-safe company card, newest
+	// first. A saved company whose row is gone simply does not JOIN (resolve-on-read
+	// skip — no fabricated placeholder).
+	ListCompaniesForUser(ctx context.Context, userID uuid.UUID) ([]SavedCompanyRow, error)
+}
+
 // PasswordResetTokenStore defines DB operations for single-use password-reset tokens.
 // Only the SHA-256 hash of a token is ever stored.
 type PasswordResetTokenStore interface {
