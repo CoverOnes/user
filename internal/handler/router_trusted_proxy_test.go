@@ -99,6 +99,9 @@ func TestNewRouter_TrustedProxy_ClientIPResolution(t *testing.T) {
 		name string
 		// gatewayCIDR: when non-empty, Gin trusts XFF from IPs within this CIDR.
 		gatewayCIDR string
+		// peerAddr overrides the RemoteAddr of every request. When empty, defaults
+		// to gatewayPeer (10.1.2.3:54321 — inside 10.0.0.0/8).
+		peerAddr string
 		// distinctXFF: when true, each of the N requests carries a different
 		// X-Forwarded-For client IP; when false, all share one XFF value.
 		distinctXFF bool
@@ -153,11 +156,33 @@ func TestNewRouter_TrustedProxy_ClientIPResolution(t *testing.T) {
 			wantFinal429: false,
 			reason:       "distinct clients under the per-IP burst are always served",
 		},
+		{
+			// Adversarial: a peer OUTSIDE the configured GatewayCIDR (203.0.113.1 —
+			// RFC 5737 TEST-NET-3) sends an X-Forwarded-For header claiming to be a
+			// different internal client on each request. Because the peer is NOT in
+			// 10.0.0.0/8, Gin must NOT trust the XFF header — the spoofed XFF must
+			// be ignored and all requests must collapse to the peer's real IP bucket.
+			// The 11th request must be rate-limited (429), proving the spoof did NOT
+			// escape the limiter: the rate limiter keyed on the peer's actual IP, not
+			// the attacker-controlled XFF value.
+			name:         "outside_cidr_xff_spoof_ignored_peer_bucket_throttled",
+			gatewayCIDR:  "10.0.0.0/8",
+			peerAddr:     "203.0.113.1:12345",        // RFC 5737 TEST-NET-3 — outside 10.0.0.0/8
+			distinctXFF:  true,                       // each request claims a distinct spoofed XFF
+			requests:     proxyTestFallbackBurst + 1, // 11 requests from the untrusted peer
+			wantFinal429: true,
+			reason:       "spoofed XFF from outside-CIDR peer is ignored; all requests share the real peer IP bucket",
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			r := handler.NewRouter(newTrustProxyRouterCfg(t, tc.gatewayCIDR))
+
+			peer := gatewayPeer
+			if tc.peerAddr != "" {
+				peer = tc.peerAddr
+			}
 
 			var lastCode int
 			for i := range tc.requests {
@@ -166,7 +191,7 @@ func TestNewRouter_TrustedProxy_ClientIPResolution(t *testing.T) {
 					xff = fmt.Sprintf("203.0.113.%d", i+1)
 				}
 
-				lastCode = getPublicProfile(t, r, gatewayPeer, xff)
+				lastCode = getPublicProfile(t, r, peer, xff)
 			}
 
 			if tc.wantFinal429 {
