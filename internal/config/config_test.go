@@ -989,3 +989,70 @@ func TestLoad_KycS2SToken(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_GatewayCIDR covers all branches of validateGatewayCIDR:
+// empty (dev ok), valid CIDR passes, invalid CIDR rejected, wildcard rejected.
+func TestLoad_GatewayCIDR(t *testing.T) {
+	tests := []struct {
+		name      string
+		cidr      string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			// Empty is the safe dev default: SetTrustedProxies(nil) fires.
+			name:    "empty CIDR is allowed (dev fallback)",
+			cidr:    "",
+			wantErr: false,
+		},
+		{
+			// Valid non-wildcard CIDR passes.
+			name:    "valid CIDR 10.0.0.0/16 passes",
+			cidr:    "10.0.0.0/16",
+			wantErr: false,
+		},
+		{
+			// Non-CIDR string is rejected.
+			name:      "invalid CIDR string is rejected",
+			cidr:      "not-a-cidr",
+			wantErr:   true,
+			errSubstr: "USER_GATEWAY_CIDR must be a valid CIDR block",
+		},
+		{
+			// Wildcard IPv4 CIDR is rejected: trusting all peers collapses per-IP
+			// rate limiters — any client can spoof its IP via X-Forwarded-For.
+			name:      "wildcard 0.0.0.0/0 rejected (XFF spoof risk)",
+			cidr:      "0.0.0.0/0",
+			wantErr:   true,
+			errSubstr: "USER_GATEWAY_CIDR must not be a wildcard",
+		},
+		{
+			// Wildcard IPv6 CIDR is rejected for the same reason.
+			name:      "wildcard ::/0 rejected (XFF spoof risk)",
+			cidr:      "::/0",
+			wantErr:   true,
+			errSubstr: "USER_GATEWAY_CIDR must not be a wildcard",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setEnv(
+				t,
+				"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+				"USER_PORT", "8080",
+				"USER_LOG_LEVEL", "INFO",
+				"USER_ENV", envDevelopment,
+			)
+			t.Setenv("USER_GATEWAY_CIDR", tc.cidr)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

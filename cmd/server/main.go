@@ -280,6 +280,7 @@ func run() error {
 		GatewayHMACSecret:         cfg.GatewayHMACSecret,
 		UserRateLimitPerMin:       cfg.UserRateLimitPerMin,
 		UserRateLimitBurst:        cfg.UserRateLimitBurst,
+		GatewayCIDR:               cfg.GatewayCIDR,
 		OAuthFrontendPostLoginURL: cfg.OAuthFrontendPostLoginURL,
 		// S2S identity-match endpoint for kyc service (USER_KYC_S2S_TOKEN).
 		// KycUserStore and KycEncryptor reuse the same pool and PII key so there

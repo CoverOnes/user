@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
 
@@ -155,6 +156,20 @@ type Config struct {
 	// Sourced from USER_USER_RATE_LIMIT_BURST. Default: 20.
 	UserRateLimitBurst int `mapstructure:"user_rate_limit_burst"`
 
+	// GatewayCIDR is the IP CIDR of the API gateway/load-balancer that forwards
+	// requests to this service. When set, Gin is told to trust X-Forwarded-For
+	// only from this source, so c.ClientIP() returns the real end-user IP rather
+	// than the gateway's egress IP. Without it, every request appears to come from
+	// the gateway IP and the per-IP rate limiters (ipRL 60/min, authRL 20/min)
+	// collapse to a single per-gateway global bucket — real per-client rate limiting
+	// is lost and all clients can throttle each other.
+	// Example: "10.0.0.0/16" (k8s cluster CIDR), "172.16.0.0/12" (VPC internal).
+	// Empty (default): trusted-proxy list is nil — c.ClientIP() returns RemoteAddr
+	// (safe fallback; use when the gateway forwards no X-Forwarded-For, e.g. dev).
+	// NEVER set to "0.0.0.0/0"/"::/0": that lets any client spoof its IP via XFF.
+	// Env: USER_GATEWAY_CIDR
+	GatewayCIDR string `mapstructure:"gateway_cidr"`
+
 	// OAuthGoogleClientID / OAuthGoogleClientSecret are the Google OIDC app credentials.
 	// Required when OAuth is enabled (USER_OAUTH_GOOGLE_CLIENT_ID != "").
 	OAuthGoogleClientID     string `mapstructure:"oauth_google_client_id"`
@@ -242,6 +257,7 @@ func Load() (*Config, error) {
 		"totp_issuer":                   "USER_TOTP_ISSUER",
 		"user_rate_limit_per_min":       "USER_USER_RATE_LIMIT_PER_MIN",
 		"user_rate_limit_burst":         "USER_USER_RATE_LIMIT_BURST",
+		"gateway_cidr":                  "USER_GATEWAY_CIDR",
 		"oauth_google_client_id":        "USER_OAUTH_GOOGLE_CLIENT_ID",
 		"oauth_google_client_secret":    "USER_OAUTH_GOOGLE_CLIENT_SECRET",
 		"oauth_line_channel_id":         "USER_OAUTH_LINE_CHANNEL_ID",
@@ -291,6 +307,7 @@ func (c *Config) validate() error {
 	errs = append(errs, c.validateUserRateLimit()...)
 	errs = append(errs, c.validateOAuth()...)
 	errs = append(errs, c.validateKycS2SToken()...)
+	errs = append(errs, c.validateGatewayCIDR()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -606,6 +623,34 @@ func (c *Config) validateKycS2SToken() []string {
 
 		if len(strings.TrimSpace(c.KycS2SToken)) < minKycS2STokenLen {
 			return []string{fmt.Sprintf("USER_KYC_S2S_TOKEN must be at least %d characters when set", minKycS2STokenLen)}
+		}
+	}
+
+	return nil
+}
+
+// validateGatewayCIDR validates USER_GATEWAY_CIDR and returns any error messages.
+// An empty CIDR is valid (the trusted-proxy list falls back to nil, safe for local dev
+// where the gateway forwards no X-Forwarded-For).
+// A non-empty value must be a valid CIDR block (e.g. "10.0.0.0/16").
+// NEVER set to "0.0.0.0/0" / "::/0" — a wildcard trusts every peer, letting any client
+// spoof its source IP via X-Forwarded-For and defeating per-IP rate limiting.
+func (c *Config) validateGatewayCIDR() []string {
+	if c.GatewayCIDR == "" {
+		return nil
+	}
+
+	_, ipNet, err := net.ParseCIDR(c.GatewayCIDR)
+	if err != nil {
+		return []string{fmt.Sprintf("USER_GATEWAY_CIDR must be a valid CIDR block (e.g. 10.0.0.0/16): %v", err)}
+	}
+
+	// Reject wildcard CIDRs (0.0.0.0/0, ::/0): trusting all peers lets any client
+	// spoof its IP via X-Forwarded-For, collapsing the per-IP rate limiters.
+	if ones, _ := ipNet.Mask.Size(); ones == 0 {
+		return []string{
+			"USER_GATEWAY_CIDR must not be a wildcard (0.0.0.0/0 or ::/0): " +
+				"it lets any client spoof its IP via X-Forwarded-For",
 		}
 	}
 
