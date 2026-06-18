@@ -60,6 +60,14 @@ type RouterConfig struct {
 	// KycUserStore is the user store used by the identity-match endpoint.
 	// Must be non-nil when KycS2SToken is non-empty.
 	KycUserStore store.UserStore
+
+	// GatewayCIDR is the CIDR of the API gateway/LB that forwards requests.
+	// When non-empty, Gin trusts X-Forwarded-For from this source so c.ClientIP()
+	// returns the real end-user IP. This is required for the per-IP rate limiters
+	// (ipRL 60/min AND authRL 20/min) to key per client rather than collapsing to
+	// a single per-gateway bucket.
+	// Empty (dev/unset): SetTrustedProxies(nil) — safe fallback (RemoteAddr).
+	GatewayCIDR string
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -67,7 +75,29 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
-	r.SetTrustedProxies(nil) //nolint:errcheck // nil proxy list disables proxy trust; gin docs confirm error is always nil for nil argument
+
+	// Trust the gateway proxy CIDR so c.ClientIP() returns the real end-user IP
+	// from X-Forwarded-For rather than the gateway's egress IP.
+	//
+	// When GatewayCIDR is set (non-dev): Gin honors X-Forwarded-For only from the
+	// gateway CIDR, so the per-IP rate limiters (ipRL 60/min AND authRL 20/min) key
+	// per client rather than collapsing to a single per-gateway bucket. When
+	// GatewayCIDR is empty (dev/unset): SetTrustedProxies(nil) disables proxy trust
+	// entirely — c.ClientIP() returns RemoteAddr (safe fallback).
+	//
+	// We must NOT trust XFF blindly (SetTrustedProxies([]string{"0.0.0.0/0"})) as
+	// that lets any client spoof its IP via the header; config.validateGatewayCIDR
+	// rejects wildcard CIDRs at boot.
+	if cfg.GatewayCIDR != "" {
+		if err := r.SetTrustedProxies([]string{cfg.GatewayCIDR}); err != nil {
+			// SetTrustedProxies only fails on an invalid CIDR, which config.validate()
+			// already rejects at boot. Panic here to surface a config bug fast rather
+			// than silently running without proxy trust.
+			panic("router: invalid GatewayCIDR: " + err.Error())
+		}
+	} else {
+		r.SetTrustedProxies(nil) //nolint:errcheck // nil proxy list disables proxy trust; gin docs confirm error is always nil for nil argument
+	}
 
 	// Global middleware chain (order per CONVENTIONS.md).
 	r.Use(middleware.Recover())
@@ -87,14 +117,10 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 
 	// Rate limiter — 60 req/min per c.ClientIP() applied to all routes registered below.
 	//
-	// M-1 (scope clarification, NOT a behavior change): because SetTrustedProxies(nil)
-	// is set above, gin does NOT trust X-Forwarded-For, so c.ClientIP() resolves to the
-	// gateway's internal IP — the same value for every downstream client. This in-service
-	// ipRL is therefore a COARSE SHARED BACKSTOP (a service-wide req-rate ceiling), NOT
-	// per-client rate limiting. Real per-client rate-limiting is enforced at the gateway,
-	// which terminates the client connection and sees the true source IP. This is
-	// pre-existing platform behavior shared by login/register (tracked by a separate
-	// platform task); the public profile group inherits the same backstop intentionally.
+	// M-1 (behavior updated by gateway-CIDR fix): when GatewayCIDR is set, Gin trusts
+	// X-Forwarded-For from the gateway CIDR and c.ClientIP() resolves to the real
+	// end-user IP — ipRL and authRL each key per client as intended. When GatewayCIDR
+	// is empty (dev), c.ClientIP() returns RemoteAddr (safe fallback, no XFF trust).
 	ipRL := middleware.NewIPRateLimiter(cfg.Redis, 60, time.Minute)
 	r.Use(ipRL.Handler())
 
