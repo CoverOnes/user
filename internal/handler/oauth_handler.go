@@ -22,11 +22,22 @@ const maxOAuthBodyBytes = 8 << 10 // 8 KiB
 type OAuthHandler struct {
 	svc                  *service.OAuthService
 	frontendPostLoginURL string
+	// cookieDomain is the Domain attribute for the refresh-token cookie set on a
+	// successful OAuth exchange. Empty string omits the attribute (dev).
+	cookieDomain string
+	// refreshTTLHours is the refresh-token TTL in hours; drives the cookie MaxAge.
+	refreshTTLHours int
 }
 
-// NewOAuthHandler returns an OAuthHandler.
-func NewOAuthHandler(svc *service.OAuthService, frontendPostLoginURL string) *OAuthHandler {
-	return &OAuthHandler{svc: svc, frontendPostLoginURL: frontendPostLoginURL}
+// NewOAuthHandler returns an OAuthHandler. cookieDomain and refreshTTLHours
+// configure the refresh-token cookie written on a successful OAuth exchange.
+func NewOAuthHandler(svc *service.OAuthService, frontendPostLoginURL, cookieDomain string, refreshTTLHours int) *OAuthHandler {
+	return &OAuthHandler{
+		svc:                  svc,
+		frontendPostLoginURL: frontendPostLoginURL,
+		cookieDomain:         cookieDomain,
+		refreshTTLHours:      refreshTTLHours,
+	}
 }
 
 // Start handles GET /v1/auth/oauth/:provider/start.
@@ -127,10 +138,13 @@ func (h *OAuthHandler) Exchange(c *gin.Context) {
 		return
 	}
 
+	// Deliver the refresh token as an HttpOnly cookie (never in the body), mirroring
+	// the password-login flow.
+	setRefreshCookie(c, pair.RefreshToken, h.refreshTTLHours*secondsPerHour, h.cookieDomain)
+
 	httpx.OK(c, gin.H{
-		"accessToken":  pair.AccessToken,
-		"refreshToken": pair.RefreshToken,
-		"expiresIn":    pair.ExpiresIn,
+		"accessToken": pair.AccessToken,
+		"expiresIn":   pair.ExpiresIn,
 	})
 }
 

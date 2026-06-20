@@ -102,6 +102,41 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, "", cfg.PostgresSchema)
 }
 
+func TestLoad_RefreshTokenCookieDomain(t *testing.T) {
+	tests := []struct {
+		name   string
+		setVal bool
+		value  string
+		want   string
+	}{
+		{name: "unset → empty (dev default, no Domain attr)", setVal: false, want: ""},
+		{name: "explicitly empty → empty", setVal: true, value: "", want: ""},
+		{name: "prod apex domain", setVal: true, value: "coverones.com", want: "coverones.com"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setEnv(
+				t,
+				"USER_POSTGRES_DSN", "postgres://user:pass@localhost/testdb",
+				"USER_PORT", "8080",
+				"USER_LOG_LEVEL", "INFO",
+				"USER_ENV", envDevelopment,
+			)
+
+			if tc.setVal {
+				t.Setenv("USER_REFRESH_TOKEN_COOKIE_DOMAIN", tc.value)
+			} else {
+				os.Unsetenv("USER_REFRESH_TOKEN_COOKIE_DOMAIN") //nolint:errcheck // test cleanup
+			}
+
+			cfg, err := config.Load()
+			require.NoError(t, err, "empty domain must be valid (no validation)")
+			assert.Equal(t, tc.want, cfg.RefreshTokenCookieDomain)
+		})
+	}
+}
+
 func TestLoad_AppBaseURL_DevCanBeEmptyWhenSMTPUnset(t *testing.T) {
 	setEnv(
 		t,

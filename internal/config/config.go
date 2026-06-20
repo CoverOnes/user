@@ -82,6 +82,16 @@ type Config struct {
 	// Refresh token TTL in hours (default 24)
 	RefreshTokenTTLHours int `mapstructure:"refresh_token_ttl_hours"`
 
+	// RefreshTokenCookieDomain is the Domain attribute for the refresh-token
+	// HttpOnly cookie set by the token-issuing endpoints (login/refresh/oauth
+	// exchange). Sourced from USER_REFRESH_TOKEN_COOKIE_DOMAIN.
+	//   - Production: "coverones.com" (apex domain so all subdomains that need
+	//     auth can reach /v1/auth) → cookie is SameSite=Strict, Secure, HttpOnly.
+	//   - Dev: empty is OK and recommended — no Domain attribute is set, so the
+	//     browser scopes the cookie to the request host (localhost).
+	// No validation needed: empty is a valid value (dev default).
+	RefreshTokenCookieDomain string `mapstructure:"refresh_token_cookie_domain"`
+
 	// PIIEncryptionKey is the base64-encoded AES-256 key (must decode to exactly
 	// 32 bytes) used to encrypt HIGH-sensitivity PII columns (legal_name_enc,
 	// national_id_enc). Sourced from USER_PII_ENCRYPTION_KEY. Required outside
@@ -253,6 +263,7 @@ func Load() (*Config, error) {
 		"kyc_s2s_token":                 "USER_KYC_S2S_TOKEN",
 		"access_token_ttl_sec":          "USER_ACCESS_TOKEN_TTL_SEC",
 		"refresh_token_ttl_hours":       "USER_REFRESH_TOKEN_TTL_HOURS",
+		"refresh_token_cookie_domain":   "USER_REFRESH_TOKEN_COOKIE_DOMAIN",
 		"mfa_enforced":                  "USER_MFA_ENFORCED",
 		"totp_issuer":                   "USER_TOTP_ISSUER",
 		"user_rate_limit_per_min":       "USER_USER_RATE_LIMIT_PER_MIN",

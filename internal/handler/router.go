@@ -47,6 +47,17 @@ type RouterConfig struct {
 	// Required when OAuth != nil.
 	OAuthFrontendPostLoginURL string
 
+	// RefreshTokenCookieDomain is the Domain attribute for the refresh-token
+	// HttpOnly cookie set by login / refresh / oauth-exchange. Empty (dev) omits
+	// the Domain attribute so the cookie is scoped to the request host.
+	// Source: config.RefreshTokenCookieDomain (USER_REFRESH_TOKEN_COOKIE_DOMAIN).
+	RefreshTokenCookieDomain string
+
+	// RefreshTokenTTLHours is the refresh-token TTL in hours, used to compute the
+	// refresh-token cookie MaxAge (hours * 3600 seconds).
+	// Source: config.RefreshTokenTTLHours (USER_REFRESH_TOKEN_TTL_HOURS).
+	RefreshTokenTTLHours int
+
 	// KycS2SToken is the bearer token the kyc service presents on the S2S
 	// identity-match endpoint. When non-empty, POST /internal/v1/users/:userId/verify-identity-match
 	// is registered. When empty, the endpoint is not registered.
@@ -126,7 +137,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 
 	// Auth routes — public, but with no-cache + tighter rate limit.
 	authRL := middleware.NewAccountRateLimiter(cfg.Redis, 20, time.Minute)
-	authH := NewAuthHandler(cfg.Auth, cfg.Signer)
+	authH := NewAuthHandler(cfg.Auth, cfg.Signer, cfg.RefreshTokenCookieDomain, cfg.RefreshTokenTTLHours)
 
 	authGroup := r.Group("/v1/auth")
 	authGroup.Use(middleware.NoCache())
@@ -147,7 +158,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// POST /v1/auth/oauth/exchange — public, consumes one-time code → token pair.
 	// Only registered when the OAuthService is wired (non-nil).
 	if cfg.OAuth != nil {
-		oauthH := NewOAuthHandler(cfg.OAuth, cfg.OAuthFrontendPostLoginURL)
+		oauthH := NewOAuthHandler(cfg.OAuth, cfg.OAuthFrontendPostLoginURL, cfg.RefreshTokenCookieDomain, cfg.RefreshTokenTTLHours)
 		// Start + callback share authRL (they're in the public auth surface).
 		authGroup.GET("/oauth/:provider/start", oauthH.Start)
 		authGroup.GET("/oauth/:provider/callback", oauthH.Callback)
@@ -259,7 +270,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// POST  /v1/me/identities/:provider — start bind flow (returns authorize URL).
 	// DELETE /v1/me/identities/:provider — unbind (guarded: last-method check).
 	if cfg.OAuth != nil {
-		oauthH := NewOAuthHandler(cfg.OAuth, cfg.OAuthFrontendPostLoginURL)
+		oauthH := NewOAuthHandler(cfg.OAuth, cfg.OAuthFrontendPostLoginURL, cfg.RefreshTokenCookieDomain, cfg.RefreshTokenTTLHours)
 		identities := me.Group("/identities")
 		// GET /v1/me/identities — list bound OAuth identities + hasPassword.
 		identities.GET("", oauthH.ListIdentities)

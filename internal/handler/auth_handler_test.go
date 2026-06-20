@@ -298,7 +298,9 @@ func buildRouter(t *testing.T) (*gin.Engine, *jwt.Signer, *fakeUserStore) {
 	r.Use(middleware.Recover())
 	r.Use(middleware.RequestID())
 
-	authH := handler.NewAuthHandler(authSvc, signer)
+	// cookieDomain="" (dev posture: omit Domain attr) + refreshTTLHours=24 (matches
+	// the AuthService TTL above) so the cookie MaxAge is computed exactly as in prod.
+	authH := handler.NewAuthHandler(authSvc, signer, "", 24)
 	auth := r.Group("/v1/auth")
 	auth.POST("/register", authH.Register)
 	auth.POST("/login", authH.Login)
@@ -324,6 +326,57 @@ func postJSON(t *testing.T, r http.Handler, path string, body any) *httptest.Res
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, path, bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	return w
+}
+
+// refreshCookieName mirrors the handler-internal cookie name (which is unexported).
+// Tests live in package handler_test, so the constant cannot be imported directly.
+const refreshCookieName = "refresh_token"
+
+// findRefreshCookie returns the refresh_token cookie from a response recorder, or
+// nil if absent. It parses the Set-Cookie headers via the standard library so
+// attributes (HttpOnly/Secure/SameSite/Path/MaxAge) are populated for assertions.
+func findRefreshCookie(w *httptest.ResponseRecorder) *http.Cookie {
+	resp := http.Response{Header: w.Header()}
+	for _, ck := range resp.Cookies() {
+		if ck.Name == refreshCookieName {
+			return ck
+		}
+	}
+
+	return nil
+}
+
+// refreshTokenFromLogin performs login and returns the recorder plus the refresh
+// token value. The token now lives only in the Set-Cookie header, never the body.
+func refreshTokenFromLogin(t *testing.T, r http.Handler, email, password string) (w *httptest.ResponseRecorder, refreshToken string) {
+	t.Helper()
+
+	w = postJSON(t, r, "/v1/auth/login", map[string]any{
+		"email":    email,
+		"password": password,
+	})
+	require.Equal(t, http.StatusOK, w.Code)
+
+	ck := findRefreshCookie(w)
+	require.NotNil(t, ck, "login must set the refresh_token cookie")
+
+	return w, ck.Value
+}
+
+// postRefreshCookie issues POST /v1/auth/refresh with the refresh token supplied via
+// the HttpOnly cookie (the only supported transport) and an empty JSON body.
+func postRefreshCookie(t *testing.T, r http.Handler, refreshToken string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/auth/refresh", http.NoBody)
+	if refreshToken != "" {
+		req.AddCookie(&http.Cookie{Name: refreshCookieName, Value: refreshToken})
+	}
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -485,8 +538,21 @@ func TestLogin_HappyPath(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	data := resp["data"].(map[string]any)
 	assert.NotEmpty(t, data["accessToken"])
-	assert.NotEmpty(t, data["refreshToken"])
 	assert.Equal(t, "Bearer", data["tokenType"])
+	// The refresh token MUST NOT appear in the body anymore.
+	_, present := data["refreshToken"]
+	assert.False(t, present, "refreshToken must not be in the login response body")
+
+	// It MUST be delivered as a hardened HttpOnly cookie instead.
+	ck := findRefreshCookie(w)
+	require.NotNil(t, ck, "login must set the refresh_token cookie")
+	assert.NotEmpty(t, ck.Value, "refresh cookie must carry the token")
+	assert.True(t, ck.HttpOnly, "refresh cookie must be HttpOnly")
+	assert.True(t, ck.Secure, "refresh cookie must be Secure")
+	assert.Equal(t, http.SameSiteStrictMode, ck.SameSite, "refresh cookie must be SameSite=Strict")
+	assert.Equal(t, "/v1/auth", ck.Path, "refresh cookie must be path-scoped to /v1/auth")
+	assert.Equal(t, 24*3600, ck.MaxAge, "refresh cookie MaxAge must be refreshTTLHours*3600")
+	assert.Empty(t, ck.Domain, "dev posture: no Domain attribute")
 }
 
 func TestLogin_WrongPassword(t *testing.T) {
@@ -543,19 +609,9 @@ func TestRefresh_HappyPath(t *testing.T) {
 		"nationalId":  validTWID,
 	})
 
-	loginW := postJSON(t, r, "/v1/auth/login", map[string]any{
-		"email":    "dave@example.com",
-		"password": "superSecurePassword123",
-	})
+	_, refreshToken := refreshTokenFromLogin(t, r, "dave@example.com", "superSecurePassword123")
 
-	var loginResp map[string]any
-	require.NoError(t, json.Unmarshal(loginW.Body.Bytes(), &loginResp))
-	loginData := loginResp["data"].(map[string]any)
-	refreshToken := loginData["refreshToken"].(string)
-
-	w := postJSON(t, r, "/v1/auth/refresh", map[string]any{
-		"refreshToken": refreshToken,
-	})
+	w := postRefreshCookie(t, r, refreshToken)
 
 	assert.Equal(t, http.StatusOK, w.Code)
 
@@ -563,9 +619,57 @@ func TestRefresh_HappyPath(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	data := resp["data"].(map[string]any)
 	assert.NotEmpty(t, data["accessToken"])
-	assert.NotEmpty(t, data["refreshToken"])
-	// New token must differ from old one.
-	assert.NotEqual(t, refreshToken, data["refreshToken"])
+	// refreshToken must NOT be in the body — it is rotated via the cookie.
+	_, present := data["refreshToken"]
+	assert.False(t, present, "refreshToken must not be in the refresh response body")
+
+	// The rotated cookie must be set and differ from the old token.
+	ck := findRefreshCookie(w)
+	require.NotNil(t, ck, "refresh must rotate (re-set) the refresh_token cookie")
+	assert.NotEmpty(t, ck.Value)
+	assert.NotEqual(t, refreshToken, ck.Value, "rotated refresh token must differ from the old one")
+	assert.True(t, ck.HttpOnly)
+	assert.True(t, ck.Secure)
+}
+
+// TestRefresh_MissingCookie asserts a refresh with no cookie is rejected with 401
+// (the token never falls back to the request body).
+func TestRefresh_MissingCookie(t *testing.T) {
+	r, _, _ := buildRouter(t)
+
+	w := postRefreshCookie(t, r, "")
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody := resp["error"].(map[string]any)
+	assert.Equal(t, "UNAUTHORIZED", errBody["code"])
+}
+
+// TestRefresh_BodyTokenIgnored asserts a refresh token supplied ONLY in the body
+// (no cookie) is rejected — the body is no longer a token transport.
+func TestRefresh_BodyTokenIgnored(t *testing.T) {
+	r, _, _ := buildRouter(t)
+
+	postJSON(t, r, "/v1/auth/register", map[string]any{
+		"email":       "isolated@example.com",
+		"password":    "superSecurePassword123",
+		"displayName": "Iso",
+		"accountType": "PERSONAL",
+		"legalName":   "Iso Wang",
+		"nationalId":  validTWID,
+	})
+
+	_, refreshToken := refreshTokenFromLogin(t, r, "isolated@example.com", "superSecurePassword123")
+
+	// Send the (valid) token in the body instead of the cookie. Because the handler
+	// reads ONLY the cookie, this must be rejected as an unauthenticated refresh.
+	w := postJSON(t, r, "/v1/auth/refresh", map[string]any{
+		"refreshToken": refreshToken,
+	})
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code, "body-supplied refresh token must be ignored")
 }
 
 func TestRefresh_ReuseDetected(t *testing.T) {
@@ -580,25 +684,13 @@ func TestRefresh_ReuseDetected(t *testing.T) {
 		"nationalId":  validTWID,
 	})
 
-	loginW := postJSON(t, r, "/v1/auth/login", map[string]any{
-		"email":    "eve@example.com",
-		"password": "superSecurePassword123",
-	})
-
-	var loginResp map[string]any
-	require.NoError(t, json.Unmarshal(loginW.Body.Bytes(), &loginResp))
-	loginData := loginResp["data"].(map[string]any)
-	refreshToken := loginData["refreshToken"].(string)
+	_, refreshToken := refreshTokenFromLogin(t, r, "eve@example.com", "superSecurePassword123")
 
 	// Use it once.
-	postJSON(t, r, "/v1/auth/refresh", map[string]any{
-		"refreshToken": refreshToken,
-	})
+	postRefreshCookie(t, r, refreshToken)
 
 	// Use same token again — reuse detection must trigger.
-	w := postJSON(t, r, "/v1/auth/refresh", map[string]any{
-		"refreshToken": refreshToken,
-	})
+	w := postRefreshCookie(t, r, refreshToken)
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 
@@ -613,10 +705,109 @@ func TestRefresh_InvalidToken(t *testing.T) {
 
 	const fakeRefreshToken = "not-a-valid-token" //nolint:gosec // G101: test fixture string, not a real credential
 
-	w := postJSON(t, r, "/v1/auth/refresh", map[string]any{
-		"refreshToken": fakeRefreshToken,
+	w := postRefreshCookie(t, r, fakeRefreshToken)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+// postLogout issues POST /v1/auth/logout with an Authorization: Bearer access token
+// (required by the Auth middleware) and, optionally, the refresh cookie. authHeader
+// "" omits the header; refreshToken "" omits the cookie.
+func postLogout(t *testing.T, r http.Handler, authHeader, refreshToken string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/auth/logout", http.NoBody)
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+
+	if refreshToken != "" {
+		req.AddCookie(&http.Cookie{Name: refreshCookieName, Value: refreshToken})
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	return w
+}
+
+// loginAccessToken registers (caller-supplied) + logs in and returns the access
+// token plus the refresh-cookie value.
+func loginAccessToken(t *testing.T, r http.Handler, email, password string) (accessToken, refreshToken string) {
+	t.Helper()
+
+	loginW, refresh := refreshTokenFromLogin(t, r, email, password)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(loginW.Body.Bytes(), &resp))
+	data := resp["data"].(map[string]any)
+	access, ok := data["accessToken"].(string)
+	require.True(t, ok, "login response must carry accessToken")
+
+	return access, refresh
+}
+
+// TestLogout_ClearsCookieAndRevokes asserts logout (a) returns 204, (b) clears the
+// refresh cookie (MaxAge<0), and (c) revokes the family so the cookie token can no
+// longer refresh.
+func TestLogout_ClearsCookieAndRevokes(t *testing.T) {
+	r, _, _ := buildRouter(t)
+
+	postJSON(t, r, "/v1/auth/register", map[string]any{
+		"email":       "grace@example.com",
+		"password":    "superSecurePassword123",
+		"displayName": "Grace",
+		"accountType": "PERSONAL",
+		"legalName":   "Grace Wang",
+		"nationalId":  validTWID,
 	})
 
+	access, refresh := loginAccessToken(t, r, "grace@example.com", "superSecurePassword123")
+
+	w := postLogout(t, r, "Bearer "+access, refresh)
+	assert.Equal(t, http.StatusNoContent, w.Code)
+
+	// The cookie must be cleared (browser deletes it: MaxAge < 0).
+	ck := findRefreshCookie(w)
+	require.NotNil(t, ck, "logout must emit a Set-Cookie that clears refresh_token")
+	assert.Less(t, ck.MaxAge, 0, "cleared cookie must have MaxAge < 0")
+	assert.Empty(t, ck.Value, "cleared cookie must carry an empty value")
+	assert.Equal(t, "/v1/auth", ck.Path, "cleared cookie path must match the original")
+
+	// The revoked token must no longer refresh.
+	refreshW := postRefreshCookie(t, r, refresh)
+	assert.Equal(t, http.StatusUnauthorized, refreshW.Code, "revoked token must not refresh after logout")
+}
+
+// TestLogout_NoCookieStillSucceeds asserts logout is idempotent: with a valid access
+// token but no refresh cookie it still returns 204 and clears the cookie.
+func TestLogout_NoCookieStillSucceeds(t *testing.T) {
+	r, _, _ := buildRouter(t)
+
+	postJSON(t, r, "/v1/auth/register", map[string]any{
+		"email":       "heidi@example.com",
+		"password":    "superSecurePassword123",
+		"displayName": "Heidi",
+		"accountType": "PERSONAL",
+		"legalName":   "Heidi Wang",
+		"nationalId":  validTWID,
+	})
+
+	access, _ := loginAccessToken(t, r, "heidi@example.com", "superSecurePassword123")
+
+	w := postLogout(t, r, "Bearer "+access, "")
+	assert.Equal(t, http.StatusNoContent, w.Code)
+
+	ck := findRefreshCookie(w)
+	require.NotNil(t, ck, "logout must still emit a clearing Set-Cookie even with no incoming cookie")
+	assert.Less(t, ck.MaxAge, 0)
+}
+
+// TestLogout_Unauthorized asserts logout without a valid access token is 401.
+func TestLogout_Unauthorized(t *testing.T) {
+	r, _, _ := buildRouter(t)
+
+	w := postLogout(t, r, "", "")
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 

@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -15,15 +17,32 @@ import (
 
 const maxBodyBytes = 1 << 20 // 1 MB
 
+// secondsPerHour converts the refresh-token TTL (configured in hours) to the
+// cookie MaxAge (seconds).
+const secondsPerHour = 3600
+
 // AuthHandler handles authentication endpoints.
 type AuthHandler struct {
 	auth   *service.AuthService
 	signer *jwt.Signer
+	// cookieDomain is the Domain attribute for the refresh-token cookie. Empty
+	// string omits the attribute (dev: cookie scoped to request host).
+	cookieDomain string
+	// refreshTTLHours is the refresh-token TTL in hours; it drives the cookie
+	// MaxAge (refreshTTLHours * 3600 seconds).
+	refreshTTLHours int
 }
 
-// NewAuthHandler returns an AuthHandler.
-func NewAuthHandler(auth *service.AuthService, signer *jwt.Signer) *AuthHandler {
-	return &AuthHandler{auth: auth, signer: signer}
+// NewAuthHandler returns an AuthHandler. cookieDomain is the refresh-token cookie
+// Domain attribute (empty in dev) and refreshTTLHours is the refresh-token TTL used
+// to compute the cookie MaxAge.
+func NewAuthHandler(auth *service.AuthService, signer *jwt.Signer, cookieDomain string, refreshTTLHours int) *AuthHandler {
+	return &AuthHandler{
+		auth:            auth,
+		signer:          signer,
+		cookieDomain:    cookieDomain,
+		refreshTTLHours: refreshTTLHours,
+	}
 }
 
 // RegisterRequest is the register endpoint request body.
@@ -176,27 +195,45 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
+	// The refresh token is delivered as an HttpOnly cookie (never in the body) so
+	// that JS / an XSS payload can never read it.
+	setRefreshCookie(c, pair.RefreshToken, h.refreshTTLHours*secondsPerHour, h.cookieDomain)
+
 	httpx.OK(c, gin.H{
-		"accessToken":  pair.AccessToken,
-		"refreshToken": pair.RefreshToken,
-		"tokenType":    "Bearer",
-		"expiresIn":    pair.ExpiresIn,
+		"accessToken": pair.AccessToken,
+		"tokenType":   "Bearer",
+		"expiresIn":   pair.ExpiresIn,
 	})
 }
 
-// RefreshRequest is the token refresh endpoint request body.
+// RefreshRequest is the token refresh endpoint request body. The refresh token is
+// read from the HttpOnly cookie, NOT the body, so the body carries only the
+// optional device fingerprint. The body itself is optional (empty body is valid).
 type RefreshRequest struct {
-	RefreshToken      string  `json:"refreshToken" binding:"required"`
 	DeviceFingerprint *string `json:"deviceFingerprint" binding:"omitempty,max=512"`
 }
 
 // Refresh handles POST /v1/auth/refresh.
+//
+// The refresh token is read exclusively from the HttpOnly `refresh_token` cookie.
+// A missing cookie yields 401 UNAUTHORIZED (never falls back to the body — the
+// token never travels in the body anymore).
 func (h *AuthHandler) Refresh(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
 
+	// The body is optional (it carries only an optional deviceFingerprint). An empty
+	// body is valid; only a malformed/oversized body is rejected. c.Cookie below is
+	// the sole source of the refresh token.
 	var req RefreshRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	token, err := c.Cookie(refreshCookieName)
+	if err != nil || token == "" {
+		// No refresh cookie present → not authenticated to refresh.
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "refresh token cookie missing")
 		return
 	}
 
@@ -217,7 +254,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	}
 
 	pair, err := h.auth.Refresh(c.Request.Context(), service.RefreshInput{
-		RawToken:          req.RefreshToken,
+		RawToken:          token,
 		DeviceFingerprint: req.DeviceFingerprint,
 		IPAddr:            ip,
 		UserAgent:         uaPtr,
@@ -227,27 +264,28 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		return
 	}
 
+	// Rotate the cookie to the newly-issued refresh token.
+	setRefreshCookie(c, pair.RefreshToken, h.refreshTTLHours*secondsPerHour, h.cookieDomain)
+
 	httpx.OK(c, gin.H{
-		"accessToken":  pair.AccessToken,
-		"refreshToken": pair.RefreshToken,
-		"tokenType":    "Bearer",
-		"expiresIn":    pair.ExpiresIn,
+		"accessToken": pair.AccessToken,
+		"tokenType":   "Bearer",
+		"expiresIn":   pair.ExpiresIn,
 	})
 }
 
-// LogoutRequest is the logout endpoint request body.
-type LogoutRequest struct {
-	RefreshToken string `json:"refreshToken" binding:"required"`
-}
-
 // Logout handles POST /v1/auth/logout.
+//
+// The refresh token to revoke is read from the HttpOnly `refresh_token` cookie
+// (no request body). The access token is still authenticated via the
+// Authorization: Bearer header by the Auth middleware. On success the cookie is
+// cleared. Logout is idempotent — a missing/invalid cookie still returns 204.
 func (h *AuthHandler) Logout(c *gin.Context) {
+	// Drain and bound any request body so a large/streamed body cannot be used as a
+	// DoS vector; the body is intentionally unused (token comes from the cookie).
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
-
-	var req LogoutRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
-		return
+	if c.Request.Body != nil {
+		_, _ = io.Copy(io.Discard, c.Request.Body)
 	}
 
 	if _, ok := middleware.ClaimsFromCtx(c); !ok {
@@ -255,13 +293,22 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 		return
 	}
 
-	// Logout runs synchronously on the request context: it is a single fast DB
-	// revoke and we want the 204 to confirm the revoke actually happened. The
-	// revoke is idempotent, so a client disconnect mid-write is harmless.
-	if err := h.auth.Logout(c.Request.Context(), req.RefreshToken); err != nil {
-		// Idempotent: even invalid tokens return 204.
-		slog.Warn("logout: could not revoke token", "err", err)
+	// Read the refresh token from the cookie. A missing cookie is fine (idempotent
+	// logout); we still clear the cookie and return 204.
+	token, err := c.Cookie(refreshCookieName)
+	if err == nil && token != "" {
+		// Logout runs synchronously on the request context: it is a single fast DB
+		// revoke and we want the 204 to confirm the revoke actually happened. The
+		// revoke is idempotent, so a client disconnect mid-write is harmless.
+		if revokeErr := h.auth.Logout(c.Request.Context(), token); revokeErr != nil {
+			// Idempotent: even invalid tokens return 204.
+			slog.Warn("logout: could not revoke token", "err", revokeErr)
+		}
 	}
+
+	// Always clear the cookie so the browser drops it even if there was nothing to
+	// revoke server-side.
+	clearRefreshCookie(c, h.cookieDomain)
 
 	httpx.NoContent(c)
 }
