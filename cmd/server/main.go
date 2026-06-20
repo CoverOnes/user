@@ -282,6 +282,8 @@ func run() error {
 		UserRateLimitBurst:        cfg.UserRateLimitBurst,
 		GatewayCIDR:               cfg.GatewayCIDR,
 		OAuthFrontendPostLoginURL: cfg.OAuthFrontendPostLoginURL,
+		RefreshTokenCookieDomain:  cfg.RefreshTokenCookieDomain,
+		RefreshTokenTTLHours:      cfg.RefreshTokenTTLHours,
 		// S2S identity-match endpoint for kyc service (USER_KYC_S2S_TOKEN).
 		// KycUserStore and KycEncryptor reuse the same pool and PII key so there
 		// is no additional credential requirement beyond what is already wired.

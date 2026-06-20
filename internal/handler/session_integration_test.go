@@ -98,7 +98,7 @@ func buildFullRouter(
 	r.Use(middleware.Recover())
 	r.Use(middleware.RequestID())
 
-	authH := handler.NewAuthHandler(authSvc, signer)
+	authH := handler.NewAuthHandler(authSvc, signer, "", 24)
 	auth := r.Group("/v1/auth")
 	auth.POST("/login", authH.Login)
 	auth.POST("/refresh", authH.Refresh)
@@ -158,7 +158,8 @@ func TestRevokeAll_Integration_RefreshFailsAfterRevoke(t *testing.T) {
 
 	userID := out.User.ID
 
-	// Log in to get a refresh token.
+	// Log in to get a refresh token. The token now lives only in the Set-Cookie
+	// header (HttpOnly cookie), never the JSON body.
 	loginResp := postJSON(t, r, "/v1/auth/login", map[string]any{
 		"email":    "revoke-integration@example.test",
 		"password": "SuperSecurePassword999",
@@ -169,21 +170,20 @@ func TestRevokeAll_Integration_RefreshFailsAfterRevoke(t *testing.T) {
 	require.NoError(t, json.Unmarshal(loginResp.Body.Bytes(), &loginBody))
 
 	loginData := loginBody["data"].(map[string]any)
-	refreshToken := loginData["refreshToken"].(string)
 	accessToken := loginData["accessToken"].(string)
 
-	// Verify refresh works before revoke.
-	preRevokeRefresh := postJSON(t, r, "/v1/auth/refresh", map[string]any{
-		"refreshToken": refreshToken,
-	})
+	loginCookie := findRefreshCookie(loginResp)
+	require.NotNil(t, loginCookie, "login must set the refresh_token cookie")
+	refreshToken := loginCookie.Value
 
+	// Verify refresh works before revoke (token supplied via the cookie).
+	preRevokeRefresh := postRefreshCookie(t, r, refreshToken)
 	require.Equal(t, http.StatusOK, preRevokeRefresh.Code)
 
-	var preBody map[string]any
-	require.NoError(t, json.Unmarshal(preRevokeRefresh.Body.Bytes(), &preBody))
-
-	// We now have a second refresh token from the rotation.
-	newRefreshToken := preBody["data"].(map[string]any)["refreshToken"].(string)
+	// The rotation re-sets the cookie with a new refresh token.
+	rotatedCookie := findRefreshCookie(preRevokeRefresh)
+	require.NotNil(t, rotatedCookie, "refresh must rotate the cookie")
+	newRefreshToken := rotatedCookie.Value
 
 	// Revoke all sessions via the endpoint.
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/me/sessions/revoke-all", http.NoBody)
@@ -193,16 +193,11 @@ func TestRevokeAll_Integration_RefreshFailsAfterRevoke(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent, w.Code, "revoke-all should return 204")
 
 	// After revoke: the NEW refresh token from the rotation should fail refresh.
-	postRevokeRefresh := postJSON(t, r, "/v1/auth/refresh", map[string]any{
-		"refreshToken": newRefreshToken,
-	})
-
+	postRevokeRefresh := postRefreshCookie(t, r, newRefreshToken)
 	assert.Equal(t, http.StatusUnauthorized, postRevokeRefresh.Code, "refresh must fail after revoke-all")
 
 	// Also verify: the original (used) token still fails (was revoked via family revoke on rotation).
-	originalRefresh := postJSON(t, r, "/v1/auth/refresh", map[string]any{
-		"refreshToken": refreshToken,
-	})
+	originalRefresh := postRefreshCookie(t, r, refreshToken)
 	assert.Equal(t, http.StatusUnauthorized, originalRefresh.Code, "original token must also fail")
 
 	// Confirm the user's token_version was bumped in DB.

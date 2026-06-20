@@ -1,17 +1,21 @@
 package handler_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/CoverOnes/user/internal/auth/jwt"
+	"github.com/CoverOnes/user/internal/domain"
 	"github.com/CoverOnes/user/internal/handler"
 	"github.com/CoverOnes/user/internal/oauth"
 	"github.com/CoverOnes/user/internal/service"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -85,7 +89,7 @@ func TestOAuthHandler_Start_Redirects(t *testing.T) {
 	})
 
 	r := gin.New()
-	oauthH := handler.NewOAuthHandler(svc, "https://app.example.com")
+	oauthH := handler.NewOAuthHandler(svc, "https://app.example.com", "", 24)
 	r.GET("/v1/auth/oauth/:provider/start", oauthH.Start)
 
 	req := httptest.NewRequestWithContext(
@@ -121,7 +125,7 @@ func TestOAuthHandler_Start_UnknownProvider(t *testing.T) {
 	})
 
 	r := gin.New()
-	oauthH := handler.NewOAuthHandler(svc, "https://app.example.com")
+	oauthH := handler.NewOAuthHandler(svc, "https://app.example.com", "", 24)
 	r.GET("/v1/auth/oauth/:provider/start", oauthH.Start)
 
 	req := httptest.NewRequestWithContext(
@@ -135,4 +139,115 @@ func TestOAuthHandler_Start_UnknownProvider(t *testing.T) {
 	// Must NOT be a 302 and must NOT be 500.
 	assert.NotEqual(t, http.StatusFound, w.Code, "unknown provider must not redirect")
 	assert.NotEqual(t, http.StatusInternalServerError, w.Code)
+}
+
+// buildExchangeRouter wires an OAuthHandler backed by a real Redis container and the
+// in-memory fakes (fakeUserStore / fakeRefreshTokenStore from auth_handler_test.go),
+// then seeds one user + returns the router and that user's ID so the test can mint a
+// one-time exchange code.
+func buildExchangeRouter(t *testing.T) (*gin.Engine, *redis.Client, uuid.UUID) {
+	t.Helper()
+
+	rdb := startHandlerRedis(t)
+
+	signer, err := jwt.NewEphemeralSigner(10 * time.Minute)
+	require.NoError(t, err)
+
+	userStore := newFakeUserStore()
+	rtStore := newFakeRefreshTokenStore()
+
+	now := time.Now().UTC()
+	u := &domain.User{
+		ID:          uuid.New(),
+		Email:       "oauth-exchange@example.com",
+		DisplayName: "OAuth User",
+		AccountType: "PERSONAL",
+		KYCTier:     0,
+		Status:      domain.UserStatusActive,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	require.NoError(t, userStore.Create(context.Background(), u))
+
+	svc := service.NewOAuthService(&service.OAuthServiceConfig{
+		UserStore:         userStore,
+		RefreshTokenStore: rtStore,
+		Redis:             rdb,
+		Signer:            signer,
+		Providers:         map[string]service.OAuthProvider{"google": &stubOAuthProvider{}},
+		StateHMACSecret:   []byte("handler-test-hmac-secret-32bytes"),
+		AccessTTL:         10 * time.Minute,
+		RefreshTTLHours:   24,
+	})
+
+	r := gin.New()
+	// cookieDomain="" (dev), refreshTTLHours=24 — matches the service TTL above.
+	oauthH := handler.NewOAuthHandler(svc, "https://app.example.com", "", 24)
+	r.POST("/v1/auth/oauth/exchange", oauthH.Exchange)
+
+	return r, rdb, u.ID
+}
+
+// seedExchangeCode writes a one-time login code → userID entry into Redis using the
+// exact key/format the OAuthService.Exchange consumes (oauth:code:<code> → {"u":id}).
+func seedExchangeCode(t *testing.T, rdb *redis.Client, code string, userID uuid.UUID) {
+	t.Helper()
+
+	payload, err := json.Marshal(map[string]string{"u": userID.String()})
+	require.NoError(t, err)
+	require.NoError(t, rdb.Set(context.Background(), "oauth:code:"+code, payload, 5*time.Minute).Err())
+}
+
+func postExchange(t *testing.T, r http.Handler, code string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]string{"code": code})
+	require.NoError(t, err)
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/auth/oauth/exchange", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	return w
+}
+
+// TestOAuthExchange_SetsCookieNoBodyToken asserts the OAuth exchange (a) returns the
+// access token in the body, (b) does NOT return the refresh token in the body, and
+// (c) sets the hardened HttpOnly refresh cookie.
+func TestOAuthExchange_SetsCookieNoBodyToken(t *testing.T) {
+	r, rdb, userID := buildExchangeRouter(t)
+
+	const code = "one-time-exchange-code-abc123"
+	seedExchangeCode(t, rdb, code, userID)
+
+	w := postExchange(t, r, code)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	data := resp["data"].(map[string]any)
+	assert.NotEmpty(t, data["accessToken"], "exchange must return an access token in the body")
+	_, present := data["refreshToken"]
+	assert.False(t, present, "refreshToken must NOT appear in the exchange body")
+
+	ck := findRefreshCookie(w)
+	require.NotNil(t, ck, "exchange must set the refresh_token cookie")
+	assert.NotEmpty(t, ck.Value)
+	assert.True(t, ck.HttpOnly, "refresh cookie must be HttpOnly")
+	assert.True(t, ck.Secure, "refresh cookie must be Secure")
+	assert.Equal(t, http.SameSiteStrictMode, ck.SameSite)
+	assert.Equal(t, "/v1/auth", ck.Path)
+	assert.Equal(t, 24*3600, ck.MaxAge)
+}
+
+// TestOAuthExchange_InvalidCode asserts an unknown one-time code is rejected (no
+// cookie set).
+func TestOAuthExchange_InvalidCode(t *testing.T) {
+	r, _, _ := buildExchangeRouter(t)
+
+	w := postExchange(t, r, "no-such-code")
+	assert.NotEqual(t, http.StatusOK, w.Code, "unknown code must not succeed")
+	assert.Nil(t, findRefreshCookie(w), "no cookie on failed exchange")
 }

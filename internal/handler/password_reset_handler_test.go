@@ -207,7 +207,7 @@ func buildResetRouter(
 	r.Use(middleware.Recover())
 	r.Use(middleware.RequestID())
 
-	authH := handler.NewAuthHandler(authSvc, signer)
+	authH := handler.NewAuthHandler(authSvc, signer, "", 24)
 	auth := r.Group("/v1/auth")
 	auth.POST("/forgot-password", authH.ForgotPassword)
 	auth.POST("/reset-password", authH.ResetPassword)
